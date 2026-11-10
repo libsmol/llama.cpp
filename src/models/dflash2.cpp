@@ -76,6 +76,12 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
+    // fused: the tap chain below is ~10 small dependent ops per call
+    static const bool unfused = getenv("LLAMA_DFLASH_CONV_UNFUSED") != nullptr;
+    if (!unfused && base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
+        return ggml_dflash_conv(ctx0, hidden, dynamic, base, side, (int) n_blocks);
+    }
+
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
@@ -117,7 +123,10 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+// cand_ids / cand_logits: when given, [n_cand, n_tokens] candidate token ids and their logits to pick the
+// top-k from (instead of the full-vocabulary logits in res->t_logits)
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+                                   ggml_tensor * cand_ids = nullptr, ggml_tensor * cand_logits = nullptr) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -129,7 +138,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(cand_ids ? cand_logits->ne[1] == n_tokens : res->t_logits->ne[1] == n_tokens);
     if (!tokens) {
         return;
     }
@@ -138,10 +147,20 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    ggml_tensor * candidates = nullptr;
+    ggml_tensor * unary      = nullptr;
+    if (cand_ids) {
+        const int64_t n_cand = cand_ids->ne[0];
+        ggml_tensor * pick = ggml_top_k(ctx0, cand_logits, top_k); // positions within the candidates
+        candidates = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand_ids, 1, n_cand, n_tokens), pick), top_k, n_tokens);
+        unary      = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand_logits, 1, n_cand, n_tokens), pick), top_k, n_tokens);
+    } else {
+        candidates = ggml_top_k(ctx0, res->t_logits, top_k);
+        ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+        unary      = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    }
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -206,6 +225,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     g.cb(packed, "dflash2_lattice", -1);
     res->t_h_nextn = packed;
     ggml_build_forward_expand(g.gf, packed);
+
+    // only the lattice is read back; the full-vocabulary logits stay on the device
+    res->t_logits = nullptr;
 }
 
 llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params) : graph_base(params) {
@@ -217,6 +239,39 @@ llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params
 
     ggml_tensor * inp_tokens = build_inp_tokens();
     ggml_tensor * cur        = build_layers(inp_tokens);
+
+    // approximate head: rank the vocabulary with the Q2_K copy, rescore the best n_cand candidates
+    // with the original weights and let the selector take its top k from those
+    {
+        const auto [output, output_s] = get_lm_head(*this, model);
+        static const bool no_approx = getenv("LLAMA_DFLASH_NO_APPROX_HEAD") != nullptr;
+        const int64_t n_cand = 64;
+        if (!no_approx && model.dflash_output_approx && !model.d2t && output_s == nullptr &&
+                model.dflash_output_approx->ne[1] == output->ne[1] && n_cand < output->ne[1] &&
+                n_cand >= (int64_t) hparams.dflash_selector_top_k) {
+            ggml_tensor * approx = ggml_mul_mat(ctx0, model.dflash_output_approx, cur);    // [n_vocab, n_tokens]
+            cb(approx, "result_output_approx", -1);
+            ggml_tensor * cand   = ggml_top_k(ctx0, approx, n_cand);                         // [n_cand, n_tokens]
+            ggml_tensor * rows   = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand, n_cand * n_tokens));
+            rows = ggml_reshape_3d(ctx0, rows, n_embd, n_cand, n_tokens);
+            ggml_tensor * exact  = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens));
+            exact = ggml_reshape_2d(ctx0, exact, n_cand, n_tokens);
+            if (hparams.f_logit_scale != 0.0f) {
+                exact = ggml_scale(ctx0, exact, hparams.f_logit_scale);
+            }
+            if (hparams.f_final_logit_softcapping > 0.0f) {
+                exact = ggml_scale(ctx0, exact, 1.0f / hparams.f_final_logit_softcapping);
+                exact = ggml_tanh(ctx0, exact);
+                exact = ggml_scale(ctx0, exact, hparams.f_final_logit_softcapping);
+            }
+            cb(exact, "result_output_cand", -1);
+
+            res->t_embd = cur;
+            res->t_logits = nullptr;
+            build_dflash2_selector(*this, model, inp_tokens, cand, exact);
+            return;
+        }
+    }
 
     build_logits(cur);
 

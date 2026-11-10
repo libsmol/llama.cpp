@@ -1,0 +1,52 @@
+#version 450
+
+// Combines the KV splits of flash_attn_pf_rdna4.comp (SPLIT = 1) into O[pos][head][d]:
+//   O = sum_s exp2(M_s - M) O_s / sum_s exp2(M_s - M) L_s,  M = max_s M_s
+// One workgroup per (head, pos, batch), one vec4 of d per invocation (head size up to 256).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint H;       // query heads (dst ne1)
+    uint N;       // query positions (dst ne2)
+    uint BQ;      // query rows per split slot (N rounded up to the kernel's query blocks)
+    uint k_num;   // splits
+    uint ne3;
+    uint D4;      // head size / 4
+} p;
+
+layout (binding = 0) readonly buffer PO {vec4 data_po4[];};
+layout (binding = 0) readonly buffer PL {vec2 data_pml[];};
+layout (binding = 1) writeonly buffer O {vec4 data_ov4[];};
+
+void main() {
+    const uint D4  = p.D4;
+    const uint d4  = gl_LocalInvocationIndex;
+    if (d4 >= D4) {
+        return;
+    }
+    const uint h   = gl_WorkGroupID.x;
+    const uint pos = gl_WorkGroupID.y;
+    const uint b   = gl_WorkGroupID.z;
+    const uint ml_base = (p.ne3 * p.k_num * p.H * p.BQ * D4 * 4) / 2;
+
+    float M = uintBitsToFloat(0xFF800000u);   // -inf
+    for (uint s = 0; s < p.k_num; ++s) {
+        const vec2 ml = data_pml[ml_base + ((b * p.k_num + s) * p.H + h) * p.BQ + pos];
+        if (ml.y > 0.0) {
+            M = max(M, ml.x);
+        }
+    }
+    vec4 acc = vec4(0.0);
+    float L = 0.0;
+    for (uint s = 0; s < p.k_num; ++s) {
+        const vec2 ml = data_pml[ml_base + ((b * p.k_num + s) * p.H + h) * p.BQ + pos];
+        if (ml.y > 0.0) {
+            const float w = exp2(ml.x - M);
+            acc = fma(data_po4[(((b * p.k_num + s) * p.H + h) * p.BQ + pos) * D4 + d4], vec4(w), acc);
+            L = fma(ml.y, w, L);
+        }
+    }
+    const float rcp = L == 0.0 ? 0.0 : 1.0 / L;
+    data_ov4[((b * p.N + pos) * p.H + h) * D4 + d4] = acc * rcp;
+}

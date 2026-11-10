@@ -208,6 +208,9 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // optional, see common_speculative_set_prompt_end
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1030,6 +1033,31 @@ protected:
         bool    dev_features;     // the target features can come from the target's device buffer
         bool    nextn_masked;     // h_nextn is only read at the output rows
     };
+    // If every draft layer is windowed (n_swa_all), drafting after a prompt that ends at E only
+    // attends positions > E - n_swa_all, and an injected row depends only on its own target
+    // features. Earlier prompt rows are not injected, and target feature extraction is turned off
+    // for prompt batches that end before them.
+    int32_t   n_swa_all   = 0;     // 0: not every layer is windowed, inject everything
+    llama_pos prompt_end  = -1;    // seq 0, set by the server per prompt
+    bool      extract_on  = true;  // target layer-input extraction is enabled
+    int32_t   n_batch_tgt = 0;
+
+    llama_pos inject_from() const {
+        // a little slack past the window
+        return prompt_end - n_swa_all - 64;
+    }
+
+    void set_extract(bool on) {
+        // with the device buffer, extraction is a device copy per layer, while toggling it reallocates
+        // the buffer (llama_context::layer_inp_dev_alloc): keep it on, the rows are still skipped below
+        if (use_dev_features || on == extract_on) {
+            return;
+        }
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            llama_set_embeddings_layer_inp(this->params.ctx_tgt, (uint32_t) target_layer_ids[k], on);
+        }
+        extract_on = on;
+    }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type)
@@ -1063,6 +1091,18 @@ protected:
             }
         }
 
+        {
+            const int32_t n_swa = llama_model_n_swa(model_dft);
+            bool all_swa = n_swa > 0 && llama_model_n_layer(model_dft) > 0;
+            for (int32_t il = 0; all_swa && il < llama_model_n_layer(model_dft); ++il) {
+                all_swa = llama_model_layer_is_swa(model_dft, il);
+            }
+            if (all_swa && n_seq == 1 && getenv("LLAMA_DFLASH_NO_PROMPT_SKIP") == nullptr) {
+                n_swa_all = n_swa;
+                LOG_INF("%s: - every draft layer uses a %d-token window: prompt rows before it are not injected\n", __func__, n_swa);
+            }
+            n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
@@ -1177,8 +1217,33 @@ public:
         }
     }
 
+    void set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) override {
+        if (n_swa_all <= 0 || seq_id != 0) {
+            return;
+        }
+        prompt_end = pos_end;
+        // the first prompt batch is decoded before process() can decide anything
+        set_extract(true);
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
+            return true;
+        }
+
+        // windowed draft: this batch was decoded with extraction = extract_on; set it for the next
+        // batch, which holds at most n_batch_tgt rows
+        const bool extracted = extract_on;
+        llama_pos  skip_below = -1;
+        if (n_swa_all > 0 && prompt_end >= 0) {
+            llama_pos pos_last = -1;
+            for (int32_t k = 0; k < batch_in.size(); ++k) {
+                pos_last = std::max(pos_last, batch_in.tokens[k].pos[0]);
+            }
+            skip_below = inject_from();
+            set_extract(pos_last + n_batch_tgt >= skip_below);
+        }
+        if (!extracted) {
             return true;
         }
 
@@ -1216,6 +1281,14 @@ public:
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
+            }
+            if (skip_below >= 0) {
+                while (i_batch_beg[seq_id] <= i_batch_end[seq_id] && batch_in.tokens[i_batch_beg[seq_id]].pos[0] < skip_below) {
+                    i_batch_beg[seq_id]++;
+                }
+                if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                    continue;
+                }
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
@@ -1642,6 +1715,16 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
         selector_top_k = llama_model_dflash_selector_top_k(llama_get_model(this->params.ctx_dft));
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
+
+        // DFlash2 ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
+        // and rescore the best candidates with the original weights
+        if (getenv("LLAMA_DFLASH_NO_APPROX_HEAD") == nullptr) {
+            const int64_t t0 = ggml_time_us();
+            if (llama_model_dflash_build_approx_head(const_cast<llama_model *>(llama_get_model(this->params.ctx_dft)), llama_get_model(this->params.ctx_tgt))) {
+                LOG_INF("%s: - DFlash2 ranks the vocabulary with a 2-bit copy of the target output head (%.1f s)\n",
+                        __func__, (ggml_time_us() - t0) / 1e6);
+            }
+        }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits
         init({
@@ -3573,6 +3656,16 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, pos_end);
+    }
 }
 
 void common_speculative_draft(common_speculative * spec) {

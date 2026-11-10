@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -35,6 +38,22 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+
+    // lazy snapshots: scalar-gated delta nets, one cell, f32 states of [S_v, S_v, H] that have room for
+    // the 3 (n_rs_seq + 1) rows of S_v * H floats of a factor set
+    {
+        const uint32_t s_v = hparams.ssm_d_state;
+        const uint32_t h   = s_v > 0 ? hparams.ssm_d_inner / s_v : 0;
+        const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT;
+        lazy = arch_ok && n_rs_seq > 0 && mem_size == 1 && type_s == GGML_TYPE_F32 && h > 0 &&
+               (uint64_t) s_v * s_v * h == hparams.n_embd_s() && 3 * (n_rs_seq + 1) <= s_v &&
+               // the lazy op targets the v0.9.0 GDN shader: off until it is ported to the current one
+               getenv("LLAMA_RS_LAZY_ENABLE") != nullptr;
+        if (lazy) {
+            lz_s_v = s_v;
+            lz_h   = h;
+        }
+    }
 
     cells.clear();
     cells.resize(mem_size);
@@ -101,7 +120,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), lazy ? 3 * mem_size : n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -127,6 +146,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
+        lazy = false;
+    }
+    if (lazy) {
+        LLAMA_LOG_INFO("%s: lazy recurrent snapshots: base state + factors of the last %u tokens\n", __func__, n_rs_seq + 1);
     }
 
     {
@@ -149,6 +172,10 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
         cells[i].tail = -1;
         cells[i].rs_max = 0;
+        cells[i].lz_par = 0;
+        cells[i].lz_cnt = 0;
+        cells[i].lz_fin = cells[i].lz_fout = -1;
+        cells[i].lz_rep = 0;
     }
 
     head = 0;
@@ -209,7 +236,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
+                // bounded by the snapshots of the last ubatch; lazy: also only into the last ubatch,
+                // whose factors are kept
+                const bool in_reach = !lazy || rollback <= (llama_pos) cell.lz_cnt;
+                if (!pending && in_reach && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -710,6 +740,23 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
             }
+            if (lazy) {
+                // replay the kept tokens of the last ubatch (none for a new state), read its factor set
+                // and write the other one
+                auto & c = cells[i];
+                uint32_t r = 0;
+                if (!c.seq_id.empty()) {
+                    const llama_seq_id seq = *c.seq_id.begin();
+                    if (seq >= 0 && (size_t) seq < rs_idx.size()) {
+                        r = rs_idx[seq];
+                    }
+                }
+                c.lz_rep  = c.src < 0 ? 0 : c.lz_cnt - std::min(r, c.lz_cnt);
+                c.lz_fin  = (int32_t) (size * (1 + c.lz_par) + i);
+                c.lz_par ^= 1;
+                c.lz_fout = (int32_t) (size * (1 + c.lz_par) + i);
+                c.lz_cnt  = std::min<uint32_t>(n_seq_tokens, n_rs_seq + 1);
+            }
             cells[i].src = i; // avoid moving or clearing twice
         }
     }
@@ -785,6 +832,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<std::array<uint32_t, 3>> lazy_cells; // lazy s rows: base row, factor row, tokens to replay
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -817,7 +865,12 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            const uint32_t cell_src = cell.src >= 0 ? cell.src : (int32_t) i;
+            if (lazy) {
+                const auto & c = cells[cell_src];
+                lazy_cells.push_back({ cell_src, size * (1 + c.lz_par) + cell_src, c.lz_cnt - std::min(rs_idx_cur, c.lz_cnt) });
+            }
+            const uint32_t cell_id = rs_idx_cur * size + cell_src;
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -858,7 +911,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, lazy_cells);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -890,6 +943,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
     }
+
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
@@ -911,8 +965,10 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
-    const uint32_t s_trans = 0;
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                                              const std::vector<std::array<uint32_t, 3>> & lazy_cells) const {
+    // 2: lazy s rows (see below)
+    const uint32_t s_trans = lazy ? 2 : 0;
     const uint32_t n_layer = hparams.n_layer();
 
     io.write(&s_trans, sizeof(s_trans));
@@ -952,7 +1008,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         }
     }
 
-    if (!s_trans) {
+    if (s_trans != 1) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
@@ -964,6 +1020,21 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // Write row size of S tensor
             const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             io.write(&s_size_row, sizeof(s_size_row));
+
+            if (lazy) {
+                // per cell: the tokens to replay, the base row and that many factor slots; the state is
+                // replayed by the first ubatch after reading, exactly as it would have been here
+                const size_t slot_size = (size_t) 3 * lz_s_v * lz_h * sizeof(float);
+                for (const auto & lc : lazy_cells) {
+                    const uint32_t n_rep = lc[2];
+                    io.write(&n_rep, sizeof(n_rep));
+                    io.write_tensor(s_l[il], lc[0] * s_size_row, s_size_row);
+                    if (n_rep > 0) {
+                        io.write_tensor(s_l[il], lc[1] * s_size_row, n_rep * slot_size);
+                    }
+                }
+                continue;
+            }
 
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
@@ -1121,8 +1192,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
         return false;
     }
-    if (false != (bool) s_trans) {
-        LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
+    if (s_trans != (lazy ? 2u : 0u)) {
+        LLAMA_LOG_ERROR("%s: incompatible s layout (%u, expected %u)\n", __func__, s_trans, lazy ? 2u : 0u);
         return false;
     }
 
@@ -1169,7 +1240,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
     }
 
-    if (!s_trans) {
+    if (s_trans != 1) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers
             if (s_l[il] == nullptr) continue;
@@ -1191,6 +1262,25 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
+            }
+
+            if (lazy) {
+                // the base rows, and the factors to replay into each cell's current factor set
+                const size_t slot_size = (size_t) 3 * lz_s_v * lz_h * sizeof(float);
+                for (uint32_t i = head; i < head + cell_count; ++i) {
+                    uint32_t n_rep = 0;
+                    io.read(&n_rep, sizeof(n_rep));
+                    if (n_rep > n_rs_seq + 1) {
+                        LLAMA_LOG_ERROR("%s: invalid replay count %u (layer %d)\n", __func__, n_rep, il);
+                        return false;
+                    }
+                    io.read_tensor(s_l[il], i * s_size_row, s_size_row);
+                    if (n_rep > 0) {
+                        io.read_tensor(s_l[il], (size * (1 + cells[i].lz_par) + i) * s_size_row, n_rep * slot_size);
+                    }
+                    cells[i].lz_cnt = n_rep;
+                }
+                continue;
             }
 
             if (cell_count) {
@@ -1378,4 +1468,27 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+bool llama_memory_recurrent_context::is_lazy() const {
+    return mem->lazy;
+}
+
+bool llama_memory_recurrent_context::is_lazy_state(const ggml_tensor * t) const {
+    return mem->lazy && t != nullptr && std::find(mem->s_l.begin(), mem->s_l.end(), t) != mem->s_l.end();
+}
+
+void llama_memory_recurrent_context::lazy_info(int32_t * data, int n_seqs) const {
+    const uint32_t size = mem->size;
+    for (int s = 0; s < n_seqs; ++s) {
+        const uint32_t i = get_head() + s;
+        const auto &   c = mem->cells[i];
+        // a reserve (full) context, or a cell not set up by find_slot: fresh state, nothing to replay
+        const bool set = !is_full && c.lz_fin >= 0 && c.lz_fout >= 0;
+        data[0 * n_seqs + s] = c.src0 >= 0 ? c.src0 : (int32_t) i;
+        data[1 * n_seqs + s] = set ? c.lz_fin  : (int32_t) (size + i);
+        data[2 * n_seqs + s] = set ? c.lz_fout : (int32_t) (2 * size + i);
+        data[3 * n_seqs + s] = (int32_t) i;
+        data[4 * n_seqs + s] = set ? (int32_t) c.lz_rep : 0;
+    }
 }

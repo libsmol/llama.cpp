@@ -44,6 +44,61 @@ struct vk_mat_mat_stream_k_fixup_push_constants {
 };
 
 static_assert(sizeof(vk_mat_mat_push_constants) <= 128);
+// dflash_conv.comp (GGML_OP_DFLASH_CONV)
+struct vk_op_dflash_conv_push_constants {
+    uint32_t C; uint32_t T; uint32_t K; uint32_t G; uint32_t gs; uint32_t bs; uint32_t n_taps; uint32_t side;
+    uint32_t x_off; uint32_t dyn_off; uint32_t base_off; uint32_t d_off;
+    uint32_t dyn_row; uint32_t d_row;
+};
+
+// cpy_multi.comp: up to 8 equally shaped strided f32 copies
+struct vk_op_cpy_multi_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t snb1, snb2, dnb1;
+    uint32_t ncopy, pad;
+    uint32_t soff[8], doff[8];
+};
+
+// rms_norm_fused.comp
+struct vk_op_rms_norm_fused_push_constants {
+    uint32_t ncols;
+    uint32_t ne1, ne2;
+    uint32_t xnb1, xnb2, xnb3;
+    uint32_t x_off, w_off, c_off, d_off;
+    float eps, s, b;
+};
+
+// add_rms_norm_mul.comp
+struct vk_op_add_rms_norm_mul_push_constants {
+    uint32_t ncols;
+    uint32_t a_row; uint32_t b_row; uint32_t s_row; uint32_t d_row;
+    uint32_t a_off; uint32_t b_off; uint32_t s_off; uint32_t d_off; uint32_t w_off;
+    float eps;
+};
+
+// mul_mm_rdna4.comp: n_full whole tiles, then tiles split along K into n_parts of k_part steps
+struct vk_mm_rdna4_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t flags;
+    uint32_t tiles_m;
+    uint32_t n_full;
+    uint32_t n_parts;
+    uint32_t k_part;
+    uint32_t epi;        // SwiGLU epilogue (mul_mm_rdna4.comp)
+    uint32_t o_stride;
+    uint32_t o_off;
+    uint32_t h_off;
+    uint32_t bs_off;     // flags bit 2: the per-row scales of B (b_to_f16_rowscale.comp), in floats
+};
+
+struct vk_mm_rdna4_reduce_push_constants {
+    uint32_t M; uint32_t N; uint32_t stride_d;
+    uint32_t tiles_m;
+    uint32_t n_full;
+    uint32_t n_parts;
+    uint32_t flags;
+};
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;

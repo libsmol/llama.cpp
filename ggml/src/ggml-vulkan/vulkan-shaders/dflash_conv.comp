@@ -1,0 +1,39 @@
+#version 450
+
+// GGML_OP_DFLASH_CONV: per-token grouped causal convolution within each block of bs tokens
+//   d[c, t] = sum_{k < n_taps} (dyn[c / gs + G * (k + K * side), t] + base[c, k, side]) * x[c, t - k]
+// x[c, t - k] is 0 before the start of t's block. One invocation per (c, t). The taps are added in
+// order and nothing is contracted, so the result equals the add / mul / add op chain it replaces.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint C; uint T; uint K; uint G; uint gs; uint bs; uint n_taps; uint side;
+    uint x_off; uint dyn_off; uint base_off; uint d_off;   // misalignment, in elements
+    uint dyn_row; uint d_row;                             // row strides, in elements
+} p;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer DY {float data_dyn[];};
+layout (binding = 2) readonly buffer BA {float data_base[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.C * p.T) {
+        return;
+    }
+    const uint c  = i % p.C;
+    const uint t  = i / p.C;
+    const uint tb = t % p.bs;
+    const uint g  = c / p.gs;
+
+    precise float r = 0.0f;
+    for (uint k = 0; k < p.n_taps; ++k) {
+        precise const float w    = data_dyn[p.dyn_off + t * p.dyn_row + g + p.G * (k + p.K * p.side)] + data_base[p.base_off + c + p.C * (k + p.K * p.side)];
+        const float         v    = tb >= k ? data_x[p.x_off + (t - k) * p.C + c] : 0.0f;
+        precise const float term = w * v;
+        r = k == 0 ? term : r + term;
+    }
+    data_d[p.d_off + t * p.d_row + c] = r;
+}

@@ -1,0 +1,49 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Adds the partial sums of the K-split tiles of mul_mm_rdna4.comp into D (which holds part 0) in a
+// fixed order. One workgroup per split tile.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint M; uint N; uint stride_d;
+    uint tiles_m;
+    uint n_full;
+    uint n_parts;
+    uint flags;      // bit 1: tiles numbered along N first (as in mul_mm_rdna4.comp)
+} p;
+
+layout (binding = 0) readonly buffer S {vec4 data_s4[];};
+layout (binding = 1) buffer D {float data_d[];};
+
+const uint BM = 128;
+const uint BN = 256;
+
+void main() {
+    const uint t    = gl_WorkGroupID.x;   // split tile index, from 0
+    const uint tile = p.n_full + t;
+    const uint tiles_n = (p.N + BN - 1) / BN;
+    const bool n_fast  = (p.flags & 2) != 0;
+    const uint m0   = (n_fast ? tile / tiles_n : tile % p.tiles_m) * BM;
+    const uint n0   = (n_fast ? tile % tiles_n : tile / p.tiles_m) * BN;
+
+    for (uint idx = gl_LocalInvocationIndex; idx < BM * BN / 4; idx += 256) {
+        const uint n = n0 + idx / (BM / 4);
+        const uint m = m0 + (idx % (BM / 4)) * 4;
+        if (n >= p.N || m >= p.M) {
+            continue;
+        }
+        vec4 s = data_s4[t * (p.n_parts - 1) * (BM * BN / 4) + idx];
+        for (uint q = 1; q + 1 < p.n_parts; ++q) {
+            s += data_s4[(t * (p.n_parts - 1) + q) * (BM * BN / 4) + idx];
+        }
+        const uint di = n * p.stride_d + m;
+        [[unroll]] for (uint e = 0; e < 4; ++e) {
+            if (m + e < p.M) {
+                data_d[di + e] += s[e];
+            }
+        }
+    }
+}

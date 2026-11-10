@@ -424,6 +424,7 @@ extern "C" {
         GGML_OP_LOOP_UP,
         GGML_OP_SHORT_CONV_RS,
         GGML_OP_ROT_GATE,
+        GGML_OP_DFLASH_CONV,
 
         GGML_OP_UNARY,
 
@@ -2586,6 +2587,31 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // ggml_gated_delta_net with lazy snapshots, for the scalar gate: instead of K states the output keeps
+    // a base state and the rank-1 factors of the last m = min(n_tokens, K) tokens, from which each of
+    // those states can be replayed exactly:
+    //   s_t = fma(k_t, delta_t, g_t * s_{t-1})   (elementwise over S[i][j]: k_t[i], delta_t[j], g_t = exp(gate))
+    //
+    //   f_in   : [3*K*S_v*H_v, n_seqs] the factors of the previous call
+    //   replay : [n_seqs] I32, 0 <= replay <= K: the state is first advanced over that many tokens of f_in
+    //
+    // output: [S_v*H_v, n_tokens*n_seqs + S_v*n_seqs + 3*K*n_seqs], holding per seq
+    //   the attention scores [S_v, H_v, n_tokens, n_seqs] as in ggml_gated_delta_net,
+    //   then the base [S_v, S_v, H_v, n_seqs]: the state before the last m tokens,
+    //   then the factors [3*K*S_v*H_v, n_seqs]: slot t < m holds token n_tokens - m + t as
+    //   k [S_v, H_v], delta [S_v, H_v], g [H_v] (padded to S_v*H_v)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_lazy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * f_in,
+            struct ggml_tensor  * replay,
+            int64_t               K);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2672,6 +2698,18 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // DFlash2 per-token grouped causal convolution, within each of the n_blocks equal blocks of tokens:
+    //   result[c, t] = sum_{k < min(K, block)} (dynamic[c / (C / G) + G * (k + K * side), t] + base[c, k, side]) * x[c, t - k]
+    // where x[c, t - k] is 0 before the start of t's block. The taps are added in order k = 0, 1, ...
+    //   x: [C, n_tokens], dynamic: [G * K * 2, n_tokens], base: [C, K, 2], all f32; side: 0 or 1
+    GGML_API struct ggml_tensor * ggml_dflash_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * base,
+            int                   side,
+            int                   n_blocks);
 
     // custom operators
 

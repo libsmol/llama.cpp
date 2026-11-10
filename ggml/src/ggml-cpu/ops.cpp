@@ -11366,11 +11366,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // lazy: base state and replay factors instead of K snapshots (see ggml_gated_delta_net_lazy)
+    const bool lazy = ggml_get_op_params_i32(dst, 1) != 0;
+    GGML_ASSERT(!lazy || !kda);
+
+    const int64_t per_thread = S_v + (K > 1 || lazy ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || lazy ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11404,7 +11408,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
+        float * s_out = (K > 1 || lazy)
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
@@ -11412,6 +11416,39 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        // lazy: replay the accepted tokens of the previous call, with the arithmetic of the loop below
+        const int64_t SH = S_v * H;
+        const int64_t m  = lazy ? std::min<int64_t>(n_tokens, K) : 0;
+        float * base_out = lazy ? state_out_base + (iv3 * H + iv1) * S_v * S_v : nullptr;
+        float * f_out    = lazy ? state_out_base + S_v * S_v * H * n_seqs + iv3 * 3 * K * SH : nullptr;
+        if (lazy) {
+            const int32_t n_rep = ((const int32_t *) dst->src[7]->data)[iv3];
+            GGML_ASSERT(n_rep >= 0 && n_rep <= K);
+            const float * f_in = (const float *) dst->src[6]->data + iv3 * 3 * K * SH;
+            for (int32_t t = 0; t < n_rep; ++t) {
+                const float * f_k = f_in + t * 3 * SH + iv1 * S_v;
+                const float * f_d = f_in + t * 3 * SH + SH + iv1 * S_v;
+                ggml_vec_scale_f32(S_v * S_v, s_out, f_in[t * 3 * SH + 2 * SH + iv1]);
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], f_k, f_d[j]);
+                }
+            }
+            if (n_tokens <= K) {
+                memcpy(base_out, s_out, S_v * S_v * sizeof(float));
+            }
+            // unused slots and the g padding are zero
+            for (int64_t t = 0; t < K; ++t) {
+                if (t >= m) {
+                    memset(f_out + t * 3 * SH + iv1 * S_v,      0, S_v * sizeof(float));
+                    memset(f_out + t * 3 * SH + SH + iv1 * S_v, 0, S_v * sizeof(float));
+                    f_out[t * 3 * SH + 2 * SH + iv1] = 0.0f;
+                }
+                if (iv1 == 0) {
+                    memset(f_out + t * 3 * SH + 2 * SH + H, 0, (SH - H) * sizeof(float));
+                }
+            }
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11439,6 +11476,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             } else {
                 ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
             }
+            const int64_t slot = t - (n_tokens - m);
+            if (lazy && slot >= 0) {
+                memcpy(f_out + slot * 3 * SH + iv1 * S_v, k_d, S_v * sizeof(float));
+                f_out[slot * 3 * SH + 2 * SH + iv1] = expf(g_d[0]);
+            }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
             for (int64_t j = 0; j < S_v; ++j) {
@@ -11447,9 +11489,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
+            if (lazy && slot >= 0) {
+                memcpy(f_out + slot * 3 * SH + SH + iv1 * S_v, delta, S_v * sizeof(float));
+            }
+
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
             for (int64_t j = 0; j < S_v; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+            }
+
+            if (lazy && t == n_tokens - m - 1) {
+                memcpy(base_out, s_out, S_v * S_v * sizeof(float));
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
@@ -11461,7 +11511,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
-            if (K > 1) {
+            if (K > 1 && !lazy) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
@@ -13168,6 +13218,53 @@ void ggml_compute_forward_rot_gate(const ggml_compute_params * params, ggml_tens
         }
         for (int64_t i = 0; i < ne0; ++i) {
             dp[i] = x[i]/(1.0f + expf(-gp[i]));
+        }
+    }
+}
+
+// ggml_compute_forward_dflash_conv
+
+void ggml_compute_forward_dflash_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * dyn  = dst->src[1];
+    const ggml_tensor * base = dst->src[2];
+
+    const int side     = ggml_get_op_params_i32(dst, 0);
+    const int n_blocks = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t C  = x->ne[0];
+    const int64_t T  = x->ne[1];
+    const int64_t K  = base->ne[1];
+    const int64_t G  = dyn->ne[0] / (2 * K);
+    const int64_t gs = C / G;
+    const int64_t bs = T / n_blocks;
+    const int64_t n_taps = std::min(K, bs);
+
+    const float * xd = (const float *) x->data;
+    const float * dd = (const float *) dyn->data;
+    const float * bd = (const float *) base->data;
+
+    // one thread per token range
+    const int64_t dt = (T + params->nth - 1) / params->nth;
+    const int64_t t0 = dt * params->ith;
+    const int64_t t1 = std::min(t0 + dt, T);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const int64_t tb = t % bs;
+        float * out = (float *) ((char *) dst->data + t * dst->nb[1]);
+        for (int64_t c = 0; c < C; ++c) {
+            const int64_t g = c / gs;
+            float r = 0.0f;
+            for (int64_t k = 0; k < n_taps; ++k) {
+                // separate statements: the same roundings as the add / mul / add ops this replaces
+                const float w    = dd[t * dyn->ne[0] + g + G * (k + K * side)] + bd[c + C * (k + K * side)];
+                const float v    = tb >= k ? xd[(t - k) * C + c] : 0.0f;
+                const float term = w * v;
+                r = k == 0 ? term : r + term;
+            }
+            out[c] = r;
         }
     }
 }

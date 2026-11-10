@@ -4262,6 +4262,10 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        if (slot.can_speculate()) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, input_tokens.pos_next());
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {

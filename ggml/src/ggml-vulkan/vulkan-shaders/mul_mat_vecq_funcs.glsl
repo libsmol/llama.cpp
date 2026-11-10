@@ -494,6 +494,41 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+// A reuse for Q4_K/Q5_K: each thread takes a whole 32-weight sub-block (one scale/min, and exactly
+// one q8_1 block of B), unpacks it once (mmvq_prepare_a) and dots it against every column
+// (mmvq_apply_a), so each column needs one float combine per sub-block.
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+struct mmvq_a_t {
+    i32vec4 qs0;
+    i32vec4 qs1;
+    vec2    dm;
+};
+
+mmvq_a_t mmvq_prepare_a(const uint ib_a, const uint iqs) {
+    mmvq_a_t a;
+    a.qs0 = repack4(ib_a, 0);
+    a.qs1 = repack4(ib_a, 4);
+    a.dm  = get_dm_scale(ib_a, 0);
+    return a;
+}
+
+FLOAT_TYPE mmvq_apply_a(const mmvq_a_t a, const int32_t b[8], const vec2 b_ds) {
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(a.qs0.x, b[0]);
+    q_sum += dotPacked4x8EXT(a.qs0.y, b[1]);
+    q_sum += dotPacked4x8EXT(a.qs0.z, b[2]);
+    q_sum += dotPacked4x8EXT(a.qs0.w, b[3]);
+    q_sum += dotPacked4x8EXT(a.qs1.x, b[4]);
+    q_sum += dotPacked4x8EXT(a.qs1.y, b[5]);
+    q_sum += dotPacked4x8EXT(a.qs1.z, b[6]);
+    q_sum += dotPacked4x8EXT(a.qs1.w, b[7]);
+
+    return FLOAT_TYPE(float(b_ds.x) * float(a.dm.x) * float(q_sum) - float(a.dm.y) * float(b_ds.y));
+}
+
+#define MMVQ_A_REUSE 1
+#endif
+
 #if defined(DATA_A_IQ1_S)
 void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
     const uint ib32 = iqs / 32;

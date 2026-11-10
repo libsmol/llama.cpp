@@ -35,6 +35,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <thread>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -3756,6 +3757,83 @@ int32_t llama_model_n_swa(const llama_model * model) {
         return 0;
     }
     return model->hparams.n_swa;
+}
+
+bool llama_model_layer_is_swa(const llama_model * model, int32_t il) {
+    return il >= 0 && (uint32_t) il < model->hparams.n_layer() && model->hparams.is_swa((uint32_t) il);
+}
+
+bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_model * model_tgt) {
+    if (model_dft == nullptr || model_tgt == nullptr || model_dft->dflash_selector_hidden == nullptr) {
+        return false;
+    }
+    if (model_dft->dflash_output_approx != nullptr) {
+        return true;
+    }
+    const ggml_tensor * out = model_tgt->output;
+    // 2-bit is enough to rank: the selector only sees candidates rescored with the original weights
+    const ggml_type     type = GGML_TYPE_Q2_K;
+    if (out == nullptr || out->buffer == nullptr || out->type == type || ggml_get_type_traits(out->type)->to_float == nullptr ||
+        out->ne[2] != 1 || out->ne[3] != 1 || out->ne[0] % ggml_blck_size(type) != 0 || !ggml_is_contiguous(out)) {
+        return false;
+    }
+
+    const int64_t t_start  = ggml_time_us();
+    const int64_t n_per_row = out->ne[0];
+    const int64_t n_rows    = out->ne[1];
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, n_per_row, n_rows);
+    ggml_set_name(t, "dflash_output_approx");
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(out->buffer)));
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: could not allocate the approximate head\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // read back, dequantize and requantize in blocks of rows (workers convert, the caller does the copies)
+    const int      n_threads = std::max(1u, std::thread::hardware_concurrency());
+    const int64_t  rows_per  = 512;
+    const int64_t  block     = rows_per * n_threads;
+    const size_t   src_row   = ggml_row_size(out->type, n_per_row);
+    const size_t   dst_row   = ggml_row_size(type, n_per_row);
+    std::vector<uint8_t> src(block * src_row), dst(block * dst_row);
+    std::vector<std::vector<float>> f32(n_threads, std::vector<float>(rows_per * n_per_row));
+    const ggml_to_float_t to_float = ggml_get_type_traits(out->type)->to_float;
+
+    for (int64_t r0 = 0; r0 < n_rows; r0 += block) {
+        const int64_t nr = std::min(block, n_rows - r0);
+        ggml_backend_tensor_get(out, src.data(), r0 * src_row, nr * src_row);
+        std::vector<std::thread> workers;
+        for (int i = 0; i < n_threads; ++i) {
+            const int64_t a = i * rows_per;
+            if (a >= nr) {
+                break;
+            }
+            workers.emplace_back([&, i, a]() {
+                const int64_t n = std::min(rows_per, nr - a);
+                for (int64_t r = 0; r < n; ++r) {
+                    to_float(src.data() + (a + r) * src_row, f32[i].data() + r * n_per_row, n_per_row);
+                }
+                ggml_quantize_chunk(type, f32[i].data(), dst.data() + a * dst_row, 0, n, n_per_row, nullptr);
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        ggml_backend_tensor_set(t, dst.data(), r0 * dst_row, nr * dst_row);
+    }
+
+    model_dft->dflash_output_approx = t;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    model_dft->pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+
+    LLAMA_LOG_INFO("%s: %s copy of %s (%.0f MiB) built in %.1f s\n", __func__, ggml_type_name(type), out->name,
+            n_rows * dst_row / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1e6);
+    return true;
 }
 
 

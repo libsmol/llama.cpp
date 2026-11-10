@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <map>
 #include <set>
 #include <vector>
@@ -77,6 +78,14 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // lazy snapshots (gated delta net, one cell): instead of 1 + n_rs_seq states, s_l keeps per cell a base
+    // state and two sets of the rank-1 factors of the last n_rs_seq + 1 tokens (ggml_gated_delta_net_lazy).
+    // Rows: [0, size) the bases, [size, 2 size) and [2 size, 3 size) the factor sets. A rollback replays
+    // fewer of the factors; the conv states in r_l keep their snapshots.
+    bool     lazy   = false;
+    uint32_t lz_s_v = 0;   // head size
+    uint32_t lz_h   = 0;   // value heads
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
@@ -95,6 +104,14 @@ public:
         // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
         // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
         uint32_t rs_max = 0;
+
+        // lazy: the factor set holding the last ubatch's factors and how many tokens it has; for the
+        // current ubatch (set by find_slot): the factor rows to read and write and the tokens to replay
+        uint32_t  lz_par = 0;
+        uint32_t  lz_cnt = 0;
+        int32_t   lz_fin  = -1;
+        int32_t   lz_fout = -1;
+        uint32_t  lz_rep  = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -138,7 +155,9 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // lazy_cells: per written cell, the base row, the factor row and the tokens to replay
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::array<uint32_t, 3>> & lazy_cells) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -186,6 +205,12 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    bool is_lazy() const;
+    bool is_lazy_state(const ggml_tensor * t) const;   // t is one of the lazy s_l tensors
+    // lazy: for the n_seqs cells of the ubatch, 5 rows of n_seqs: base rows to read, factor rows to read,
+    // factor rows to write, base rows to write, tokens to replay
+    void lazy_info(int32_t * data, int n_seqs) const;
 
 private:
     const llama_memory_status status;

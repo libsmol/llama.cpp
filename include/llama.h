@@ -597,6 +597,14 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
+    // whether layer il uses sliding-window attention
+    LLAMA_API bool    llama_model_layer_is_swa (const struct llama_model * model, int32_t il);
+
+    // DFlash2 draft: build a Q2_K copy of the target's output projection on the same device, used to
+    // rank the vocabulary before the best candidates are rescored with the original weights.
+    // Returns false if not applicable.
+    LLAMA_API bool    llama_model_dflash_build_approx_head(struct llama_model * model_dft, const struct llama_model * model_tgt);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 

@@ -118,6 +118,7 @@ void ggml_compute_forward_loop_down(const struct ggml_compute_params * params, s
 void ggml_compute_forward_loop_up(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_short_conv_rs(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rot_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dflash_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

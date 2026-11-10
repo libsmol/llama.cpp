@@ -1,0 +1,444 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Prefill flash attention for RDNA4 (wave32 WMMA): head size D (128 or 256), f16 K/V, GQA.
+//
+// A workgroup has G * QB waves; wave w handles query head kv_head * G + w % G for the 16 positions of
+// query block w / G. All waves share each 32-key K/V tile through LDS, and the next tile is prefetched
+// into registers while the current one is computed.
+//
+// Everything is computed transposed so the softmax stays in registers:
+//   S^T (keys x queries) = K * Q^T,     O^T (d x queries) += V^T * P^T
+// On RDNA4 the accumulator and B-operand layouts coincide (element e of lane l is row (l/16)*8 + e,
+// column l%16): S^T converts element-wise into P^T, and all elements of a lane belong to query l%16,
+// so the online-softmax rescale is lane-local.
+
+layout (constant_id = 0) const uint G = 6;         // query heads per KV head
+layout (constant_id = 1) const uint WG_SIZE = 384; // G * QB * 32
+layout (constant_id = 2) const uint QB = 2;        // 16-query blocks per workgroup
+// 1: KV split (verification, and few query rows on a long context). Workgroup x is a query block times k_num
+// plus a KV split of split_kv keys; the unnormalized O, M and L of each split go to binding 7 and are combined
+// by flash_attn_pf_rdna4_reduce.comp.
+layout (constant_id = 3) const uint SPLIT = 0;
+layout (constant_id = 4) const uint D = 256;       // head size of K and V, a multiple of 16
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t N;
+    uint32_t KV;
+
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+
+    uint32_t neq2;
+    uint32_t neq3;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nev2;
+    uint32_t nev3;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t nb21;
+    uint32_t nb22;
+    uint32_t nb23;
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+
+    uint32_t mask_n_head_log2;
+    float m0;
+    float m1;
+
+    uint32_t gqa_ratio;
+    uint32_t split_kv;
+    uint32_t k_num;
+} p;
+
+layout (binding = 0) readonly buffer Q   {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer K   {uvec4 data_k8[];};
+layout (binding = 2) readonly buffer V   {uvec4 data_v8[];};
+layout (binding = 3) readonly buffer M   {float16_t data_m[];};
+layout (binding = 5) buffer O  {vec4 data_ov4[];};   // also holds the f32 partial sums (see FLUSH_STEPS)
+layout (binding = 6) readonly buffer MO  {uint32_t data_mask_opt[];};
+layout (binding = 7) buffer PO {vec4 data_po4[];};    // SPLIT: [split][head][R][D] O, then [split][head][R] (M, L)
+layout (binding = 7) buffer PL {vec2 data_pml[];};
+
+#define MASK_OPT_ALL_NEG_INF 1
+#define MASK_OPT_ALL_ZERO 2
+
+#define BQ (16 * QB)     // query positions per workgroup
+const uint BC = 32;          // keys per step
+const uint NT = D / 16;      // 16-wide d tiles
+const uint KT = BC / 16;     // 16-wide key tiles
+const uint NW = WG_SIZE / 32;
+
+// K tile, row-major [key][d] (+8 halves of padding), in 16-byte units
+const uint KS8 = (D + 8) / 8;
+shared uvec4 Ksh[BC * KS8];
+// V tile transposed, row-major [d][key] (+8 halves of padding), as packed half pairs
+const uint VR = (BC + 8) / 2;
+shared uint Vt32[D * VR];
+// mask block [query][key] (+8 halves of padding), as packed half pairs
+const uint MR = (BC + 8) / 2;
+shared uint Msh[BQ * MR];
+
+// O^T accumulates in f16. Every FLUSH_STEPS blocks each lane adds it into an f32 partial in the part
+// of the output buffer it owns and restarts from zero, which bounds the f16 rounding at any context length.
+// 16 blocks (512 keys) measure as accurate as flushing every block; 128 blocks lost measurably.
+#ifndef FLUSH_STEPS
+#define FLUSH_STEPS 16
+#endif
+
+const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+// scores are kept in log2 units (log2(e) is folded into the Q scale), so the softmax uses exp2 directly
+const float LOG2E = 1.4426950408889634f;
+const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f*LOG2E;
+
+void main() {
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint wave = gl_SubgroupID;
+    const uint w    = wave % G;                // query head within the group
+    const uint qsub = wave / G;                // 16-query sub-block
+    const uint lane = gl_SubgroupInvocationID;
+    const uint q    = lane % 16;               // the query this lane owns in S^T / O^T
+    const uint half_ = lane / 16;              // which 8-row half of a 16x16 tile
+
+    const uint iblk = SPLIT != 0 ? gl_WorkGroupID.x / p.k_num : gl_WorkGroupID.x;   // block of BQ query positions
+    const uint isplit = SPLIT != 0 ? gl_WorkGroupID.x % p.k_num : 0;
+    // SPLIT: query rows per (split, head) slot of the partial buffer, N rounded up to whole blocks
+    const uint R = ((p.N + BQ - 1) / BQ) * BQ;
+    const uint ik2  = gl_WorkGroupID.y;        // kv head
+    const uint iq3  = gl_WorkGroupID.z;
+    const uint iq2  = ik2 * G + w;             // query head
+    const uint ik3  = iq3 / (p.neq3 / p.nek3);
+    const uint iv3  = iq3 / (p.neq3 / p.nev3);
+    const uint pos  = iblk * BQ + qsub * 16 + q;
+
+    // ---- Q^T B operands: element e of lane l = Q[pos][t*16 + half*8 + e] * scale * log2(e) -----------
+    // (SPLIT: Q * scale as in the coopmat1 kernel, and log2(e) is applied to S in f32; measurably closer
+    // to f32 on short contexts, where the other errors are small)
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qb[NT];
+    {
+        const uint q_base4 = (iq2 * p.nb02 + iq3 * p.nb03) / 16 + pos * (p.nb01 / 4);
+        const float qscale = SPLIT != 0 ? p.scale : p.scale * LOG2E;
+        [[unroll]] for (uint t = 0; t < NT; ++t) {
+            vec4 a = vec4(0), b = vec4(0);
+            if (pos < p.N) {
+                a = data_qv4[q_base4 + (t * 16 + half_ * 8) / 4] * qscale;
+                b = data_qv4[q_base4 + (t * 16 + half_ * 8) / 4 + 1] * qscale;
+            }
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                Qb[t][e]     = float16_t(a[e]);
+                Qb[t][e + 4] = float16_t(b[e]);
+            }
+        }
+    }
+
+    // f16 as in the coopmat1 kernel (4 VGPRs per tile), but bounded by FLUSH_STEPS; S^T, the softmax
+    // statistics and L are f32
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oacc[NT];
+    [[unroll]] for (uint t = 0; t < NT; ++t) {
+        Oacc[t] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+    float Mf = NEG_FLT_MAX_OVER_2;
+    float Lf = 0.0;   // partial: this lane's key half; combined with lane^16 at the end
+    float Sm = 1.0;   // scale owed by the f32 partial in the output buffer (online-softmax rescales)
+    bool  has_partial = false;
+    const uint keep_bits = floatBitsToUint(p.max_bias);   // 0: this path requires max_bias == 0
+    const uint o_base4 = SPLIT != 0 ? (((iq3 * p.k_num + isplit) * p.ne1 + iq2) * R + pos) * (D / 4)
+                                    : (iq3 * p.ne2 * p.ne1 * D + pos * p.ne1 * D + iq2 * D) / 4;
+
+    // K/V offsets; nb?1 are in elements, nb?2/nb?3 in bytes
+    const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 16;
+    const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 16;
+    const uint k_row8  = p.nb11 / 8;
+    const uint v_row8  = p.nb21 / 8;
+
+    // mask (shared by all heads of the group: nem2 == 1)
+    const uint m_base = (iq3 % p.nem3) * p.nem1 * p.KV;
+    const uint mo_stride = (p.KV + 16 * BC - 1) / (16 * BC);
+    const uint mo_base = (iq3 % p.nem3) * ((p.nem1 + BQ - 1) / BQ) * mo_stride + iblk * mo_stride;
+
+    // this workgroup's key blocks [j_begin, n_blocks); split_kv is a multiple of BC
+    const uint j_begin  = isplit * (p.split_kv / BC);
+    const uint n_blocks = SPLIT != 0 ? min((p.KV + BC - 1) / BC, j_begin + p.split_kv / BC) : (p.KV + BC - 1) / BC;
+    const bool use_mask = p.nem1 != 0;
+
+    // K: thread owns 16-byte chunks tid + i * WG_SIZE of the row-major tile.
+    const uint K_CHUNKS = BC * D / 8;
+    const uint KPT = (K_CHUNKS + WG_SIZE - 1) / WG_SIZE;
+    // V: wave-level 16-key x 16-d blocks; lane = (c, key pair, parity) owns 8 d of one key. Adjacent
+    // lanes hold adjacent keys, so one shuffle turns two rows into packed [d][key, key+1] pairs.
+    const uint V_BLOCKS = (BC / 16) * (D / 16);
+    const uint VPT = (V_BLOCKS + NW - 1) / NW;
+    const uint v_par = lane & 1;
+    const uint v_kp  = (lane >> 1) & 7;
+    const uint v_c   = lane >> 4;
+    uvec4 kpre[KPT];
+    uvec4 vpre[VPT];
+
+    uint mo_cached_idx = ~0u;
+    uint mo_cached = 0;
+
+    // first block >= jstart that is not entirely masked out (n_blocks if none)
+    #define NEXT_BLOCK(jstart, result) { \
+        result = n_blocks; \
+        for (uint jj = (jstart); jj < n_blocks; ++jj) { \
+            if (!use_mask) { result = jj; break; } \
+            if (mo_cached_idx != jj / 16) { mo_cached_idx = jj / 16; mo_cached = data_mask_opt[mo_base + mo_cached_idx]; } \
+            if (((mo_cached >> ((jj % 16) * 2)) & 0x3) != MASK_OPT_ALL_NEG_INF) { result = jj; break; } \
+        } }
+
+    #define FETCH(jb) { \
+        const bool ftail = (jb) * BC + BC > p.KV; \
+        [[unroll]] for (uint i = 0; i < KPT; ++i) { \
+            const uint idx = tid + i * WG_SIZE; \
+            const uint key = idx / (D / 8), c8 = idx % (D / 8); \
+            kpre[i] = uvec4(0); \
+            if (idx < K_CHUNKS && (!ftail || (jb) * BC + key < p.KV)) { kpre[i] = data_k8[k_base8 + ((jb) * BC + key) * k_row8 + c8]; } \
+        } \
+        [[unroll]] for (uint i = 0; i < VPT; ++i) { \
+            const uint blk = wave + i * NW; \
+            const uint key = (blk % (BC / 16)) * 16 + v_kp * 2 + v_par; \
+            const uint d0  = (blk / (BC / 16)) * 16 + v_c * 8; \
+            vpre[i] = uvec4(0); \
+            if (blk < V_BLOCKS && (!ftail || (jb) * BC + key < p.KV)) { vpre[i] = data_v8[v_base8 + ((jb) * BC + key) * v_row8 + d0 / 8]; } \
+        } \
+        }
+
+    uint j;
+    NEXT_BLOCK(j_begin, j);
+    if (j < n_blocks) {
+        FETCH(j);
+    }
+
+    [[dont_unroll]]
+    while (j < n_blocks) {
+        [[dont_unroll]]
+        for (uint step = 0; step < FLUSH_STEPS && j < n_blocks; ++step) {
+            uint mask_opt_bits = MASK_OPT_ALL_ZERO;
+            if (use_mask) {
+                if (mo_cached_idx != j / 16) { mo_cached_idx = j / 16; mo_cached = data_mask_opt[mo_base + mo_cached_idx]; }
+                mask_opt_bits = (mo_cached >> ((j % 16) * 2)) & 0x3;
+            }
+            const bool tail = j * BC + BC > p.KV;
+
+            // ---- registers -> LDS: K row-major, V transposed --------------------------------------------
+            [[unroll]] for (uint i = 0; i < KPT; ++i) {
+                const uint idx = tid + i * WG_SIZE;
+                if (idx < K_CHUNKS) {
+                    Ksh[(idx / (D / 8)) * KS8 + idx % (D / 8)] = kpre[i];
+                }
+            }
+            [[unroll]] for (uint i = 0; i < VPT; ++i) {
+                const uint blk = wave + i * NW;
+                const uvec4 v = vpre[i];
+                // even lane keeps the low halves (even d) and sends the high ones, odd lane the reverse
+                const uint s0 = v_par == 0 ? (v.x >> 16) | (v.y & 0xFFFF0000u) : (v.x & 0xFFFFu) | (v.y << 16);
+                const uint s1 = v_par == 0 ? (v.z >> 16) | (v.w & 0xFFFF0000u) : (v.z & 0xFFFFu) | (v.w << 16);
+                const uint r0 = subgroupShuffleXor(s0, 1);
+                const uint r1 = subgroupShuffleXor(s1, 1);
+                if (blk < V_BLOCKS) {
+                    const uint d0 = (blk / (BC / 16)) * 16 + v_c * 8 + v_par;
+                    const uint kc = (blk % (BC / 16)) * 8 + v_kp;
+                    const uint rh[4] = { r0 & 0xFFFFu, r0 >> 16, r1 & 0xFFFFu, r1 >> 16 };
+                    [[unroll]] for (uint m = 0; m < 4; ++m) {
+                        Vt32[(d0 + 2 * m) * VR + kc] = v_par == 0 ? (v[m] & 0xFFFFu) | (rh[m] << 16) : rh[m] | (v[m] & 0xFFFF0000u);
+                    }
+                }
+            }
+            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+                for (uint idx = tid; idx < BQ * BC / 2; idx += WG_SIZE) {
+                    const uint r = idx / (BC / 2);
+                    const uint c = (idx % (BC / 2)) * 2;
+                    const uint qr = iblk * BQ + r;
+                    float16_t m0 = float16_t(0.0), m1 = float16_t(0.0);
+                    if (qr < p.nem1) {
+                        if (j * BC + c     < p.KV) m0 = data_m[m_base + qr * p.KV + j * BC + c];
+                        if (j * BC + c + 1 < p.KV) m1 = data_m[m_base + qr * p.KV + j * BC + c + 1];
+                    }
+                    Msh[r * MR + c / 2] = packFloat2x16(f16vec2(m0, m1));
+                }
+            }
+            barrier();
+
+            // ---- prefetch the next block while this one is computed -------------------------------------
+            uint jn;
+            NEXT_BLOCK(j + 1, jn);
+            if (jn < n_blocks) {
+                FETCH(jn);
+            }
+
+            // ---- S^T = K * Q^T ------------------------------------------------------------------------
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Sacc[KT];
+            [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                Sacc[kt] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            }
+            [[unroll]] for (uint t = 0; t < NT; ++t) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Ka;
+                    coopMatLoad(Ka, Ksh, (kt * 16) * KS8 + t * 2, KS8, gl_CooperativeMatrixLayoutRowMajor);
+                    Sacc[kt] = coopMatMulAdd(Ka, Qb[t], Sacc[kt]);
+                }
+            }
+
+            if (SPLIT != 0) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    Sacc[kt] = Sacc[kt] * LOG2E;
+                }
+            }
+
+            // ---- mask, online softmax (lane-local per query), P^T ------------------------------------
+            // (real branches: the mask is only needed on the diagonal, the tail only on the last block)
+            [[dont_flatten]] if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    const uint mb = (qsub * 16 + q) * MR + kt * 8 + half_ * 4;
+                    [[unroll]] for (uint c = 0; c < 4; ++c) {
+                        const vec2 m2 = unpackHalf2x16(Msh[mb + c]);
+                        Sacc[kt][2 * c]     = fma(m2.x, LOG2E, Sacc[kt][2 * c]);
+                        Sacc[kt][2 * c + 1] = fma(m2.y, LOG2E, Sacc[kt][2 * c + 1]);
+                    }
+                }
+            }
+            [[dont_flatten]] if (tail) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    [[unroll]] for (uint e = 0; e < 8; ++e) {
+                        if (j * BC + kt * 16 + half_ * 8 + e >= p.KV) {
+                            Sacc[kt][e] = NEG_FLT_MAX_OVER_2;
+                        }
+                    }
+                }
+            }
+            float rowmax = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                [[unroll]] for (uint e = 0; e < 8; ++e) {
+                    rowmax = max(rowmax, Sacc[kt][e]);
+                }
+            }
+            rowmax = max(rowmax, subgroupShuffleXor(rowmax, 16));
+            rowmax += FATTN_KQ_MAX_OFFSET;
+            const float Mold = Mf;
+            Mf = max(rowmax, Mold);
+            const float eM = exp2(Mold - Mf);
+            Lf *= eM;
+            Sm *= eM;
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Pb[KT];
+            [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                [[unroll]] for (uint e = 0; e < 8; ++e) {
+                    // L sums the f16 P that multiplies V, as the coopmat1 kernel does, so weights that
+                    // round to zero or lose bits as f16 subnormals leave numerator and denominator alike.
+                    // The OR with a runtime zero stops NIR from folding the f32 -> f16 -> f32 round trip.
+                    const float16_t ph = float16_t(exp2(Sacc[kt][e] - Mf));
+                    Lf += float(unpackFloat2x16(packFloat2x16(f16vec2(ph, float16_t(0.0))) | keep_bits).x);
+                    Pb[kt][e] = ph;
+                }
+            }
+
+            // ---- O^T = O^T * eM + V^T * P^T --------------------------------------------------------------
+            // unconditional: eM is exactly 1 when the max is unchanged, and a branch would cost a 16-bit
+            // move per packed half on every block
+            {
+                const float16_t eM16 = float16_t(eM);
+                [[unroll]] for (uint t = 0; t < NT; ++t) {
+                    Oacc[t] = Oacc[t] * eM16;
+                }
+            }
+            [[unroll]] for (uint t = 0; t < NT; ++t) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Va;
+                    coopMatLoad(Va, Vt32, (t * 16) * VR + kt * 8, VR, gl_CooperativeMatrixLayoutRowMajor);
+                    Oacc[t] = coopMatMulAdd(Va, Pb[kt], Oacc[t]);
+                }
+            }
+            barrier();
+            j = jn;
+        }
+        // f32 partial: P = P * Sm + O (owned by this lane alone, so plain loads and stores)
+        if (j < n_blocks) {
+            if (pos < p.N) {
+                [[unroll]] for (uint t = 0; t < NT; ++t) {
+                    const uint d0 = t * 16 + half_ * 8;
+                    vec4 a = vec4(float(Oacc[t][0]), float(Oacc[t][1]), float(Oacc[t][2]), float(Oacc[t][3]));
+                    vec4 b = vec4(float(Oacc[t][4]), float(Oacc[t][5]), float(Oacc[t][6]), float(Oacc[t][7]));
+                    if (SPLIT != 0) {
+                        if (has_partial) {
+                            a = fma(data_po4[o_base4 + d0 / 4],     vec4(Sm), a);
+                            b = fma(data_po4[o_base4 + d0 / 4 + 1], vec4(Sm), b);
+                        }
+                        data_po4[o_base4 + d0 / 4]     = a;
+                        data_po4[o_base4 + d0 / 4 + 1] = b;
+                    } else {
+                        if (has_partial) {
+                            a = fma(data_ov4[o_base4 + d0 / 4],     vec4(Sm), a);
+                            b = fma(data_ov4[o_base4 + d0 / 4 + 1], vec4(Sm), b);
+                        }
+                        data_ov4[o_base4 + d0 / 4]     = a;
+                        data_ov4[o_base4 + d0 / 4 + 1] = b;
+                    }
+                }
+            }
+            has_partial = true;
+            Sm = 1.0;
+            [[unroll]] for (uint t = 0; t < NT; ++t) {
+                Oacc[t] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            }
+        }
+    }
+
+    // ---- normalize and store O[pos][iq2][d] ------------------------------------------------------
+    Lf += subgroupShuffleXor(Lf, 16);
+    if (SPLIT != 0) {
+        // unnormalized O relative to Mf, plus (Mf, Lf); empty splits leave Lf == 0
+        if (pos < p.N) {
+            [[unroll]] for (uint t = 0; t < NT; ++t) {
+                const uint d0 = t * 16 + half_ * 8;
+                vec4 a = vec4(float(Oacc[t][0]), float(Oacc[t][1]), float(Oacc[t][2]), float(Oacc[t][3]));
+                vec4 b = vec4(float(Oacc[t][4]), float(Oacc[t][5]), float(Oacc[t][6]), float(Oacc[t][7]));
+                if (has_partial) {
+                    a = fma(data_po4[o_base4 + d0 / 4],     vec4(Sm), a);
+                    b = fma(data_po4[o_base4 + d0 / 4 + 1], vec4(Sm), b);
+                }
+                data_po4[o_base4 + d0 / 4]     = a;
+                data_po4[o_base4 + d0 / 4 + 1] = b;
+            }
+            if (half_ == 0) {
+                data_pml[(p.ne3 * p.k_num * p.ne1 * R * D) / 2 + ((iq3 * p.k_num + isplit) * p.ne1 + iq2) * R + pos] = vec2(Mf, Lf);
+            }
+        }
+        return;
+    }
+    const float rcp = Lf == 0.0 ? 0.0 : 1.0 / Lf;
+    if (pos < p.N) {
+        [[unroll]] for (uint t = 0; t < NT; ++t) {
+            const uint d0 = t * 16 + half_ * 8;
+            vec4 a = vec4(float(Oacc[t][0]), float(Oacc[t][1]), float(Oacc[t][2]), float(Oacc[t][3]));
+            vec4 b = vec4(float(Oacc[t][4]), float(Oacc[t][5]), float(Oacc[t][6]), float(Oacc[t][7]));
+            if (has_partial) {
+                a = fma(data_ov4[o_base4 + d0 / 4],     vec4(Sm), a);
+                b = fma(data_ov4[o_base4 + d0 / 4 + 1], vec4(Sm), b);
+            }
+            data_ov4[o_base4 + d0 / 4]     = a * rcp;
+            data_ov4[o_base4 + d0 / 4 + 1] = b * rcp;
+        }
+    }
+}

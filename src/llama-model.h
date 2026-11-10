@@ -957,6 +957,8 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+    // DFlash2: low-precision copy of the target lm_head, ranks the vocabulary before the exact rescoring
+    struct ggml_tensor * dflash_output_approx = nullptr;
 
     struct ggml_tensor * lilicorr_token_proj          = nullptr;
     struct ggml_tensor * lilicorr_token_proj_b        = nullptr;
@@ -1098,6 +1100,9 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // adds a tensor (and its buffer) the model then owns
+    friend bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_model * model_tgt);
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

@@ -1,0 +1,37 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+// Concat along dim 0 when src1 is transposed (contiguous along dim 1), e.g. the gated-delta-net
+// conv input concat(conv_states, transpose(qkv)). A workgroup moves one 32x32 (i0, i1) tile through
+// LDS: read with consecutive threads along i1, written with consecutive threads along i0.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared D_TYPE tile[32 * 33];
+
+void main() {
+    const uint t   = gl_LocalInvocationIndex;
+    const uint i0b = gl_WorkGroupID.x * 32;
+    const uint i1b = gl_WorkGroupID.y * 32;
+    const uint i2  = gl_WorkGroupID.z % p.ne22;
+    const uint i3  = gl_WorkGroupID.z / p.ne22;
+
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint r = t % 32, c = t / 32 + k * 8;
+        const uint i0 = i0b + c, i1 = i1b + r;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            tile[c * 33 + r] = i0 < p.ne00
+                ? D_TYPE(data_a[get_aoffset() + i3*p.nb03 + i2*p.nb02 + i1*p.nb01 + i0*p.nb00])
+                : D_TYPE(data_b[get_boffset() + i3*p.nb13 + i2*p.nb12 + i1*p.nb11 + (i0 - p.ne00)*p.nb10]);
+        }
+    }
+    barrier();
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint c = t % 32, r = t / 32 + k * 8;
+        const uint i0 = i0b + c, i1 = i1b + r;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            data_d[get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20] = tile[c * 33 + r];
+        }
+    }
+}

@@ -540,6 +540,19 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    set_input_lazy(mctx);
+}
+
+void llm_graph_input_rs::set_input_lazy(const llama_memory_recurrent_context * mctx) {
+    if (lz_info) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lz_info->buffer));
+        mctx->lazy_info((int32_t *) lz_info->data, (int) (lz_info->ne[0] / 5));
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_lazy(const llama_memory_recurrent_context * mctx, int64_t n_seqs) const {
+    return (lz_info != nullptr) == mctx->is_lazy() && (!lz_info || lz_info->ne[0] == 5 * n_seqs);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -555,6 +568,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= can_reuse_lazy(mctx, params.ubatch.n_seqs);
 
     return res;
 }
@@ -1261,6 +1275,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_lazy(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1281,6 +1297,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_lazy(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1307,6 +1324,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_lazy(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1326,6 +1345,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_lazy(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1364,6 +1384,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_lazy(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1397,6 +1419,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_lazy(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -4169,6 +4192,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    if (mctx_cur->is_lazy()) {
+        inp->lz_info = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 5 * n_seqs);
+        ggml_set_input(inp->lz_info);
+        ggml_set_name(inp->lz_info, "rs_lz_info");
+    }
+
     return inp;
 }
 
@@ -4187,6 +4216,19 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   n_seqs,
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
+
+    // lazy snapshots: the states of s_l are read from the base rows. One cell and no extra states, so the
+    // tail gather is empty; the base rows are gathered directly (GET_ROWS(cache, base) is what the Vulkan
+    // GATED_DELTA_NET state fusion matches)
+    if (inp->lz_info && kv_state->is_lazy_state(s)) {
+        GGML_ASSERT(kv_state->get_n_rs() == (uint32_t) n_seqs);
+        static const llm_graph_get_rows_fn get_rows = [](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+            return ggml_get_rows(ctx, states, ids);
+        };
+        return build_rs(s, inp->s_copy_tail, ggml_view_1d(ctx0, inp->lz_info, n_seqs, 0), state_size, n_seqs,
+                        kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                        get_state_rows ? get_state_rows : get_rows);
+    }
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch

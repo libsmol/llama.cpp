@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// RMS_NORM fused with what consumes it, one workgroup per row:
+//   MODE 0, RMS_NORM + SCALE:     d = (x * inversesqrt(mean(x^2) + eps)) * s + b   (the gated-delta-net l2 norm)
+//   MODE 1, RMS_NORM + MUL + MUL: d = (inversesqrt(mean(x^2) + eps) * x * w) * c   (the gated norm)
+// Same per-element expressions and the same reduction tree as rms_norm.comp, so the results are
+// bit-identical: with BLOCK < 512 the tree skips only rms_norm.comp's leading steps, which add zeros.
+
+layout (constant_id = 0) const uint BLOCK = 512;
+layout (constant_id = 1) const uint MODE = 0;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint ne1; uint ne2;                  // rows are (i1, i2, i3)
+    uint xnb1; uint xnb2; uint xnb3;     // x strides in elements
+    uint x_off; uint w_off; uint c_off; uint d_off;   // misalignment in elements
+    float eps; float s; float b;
+} p;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer W {float data_w[];};   // MODE 1: weight row
+layout (binding = 2) readonly buffer C {float data_c[];};   // MODE 1: contiguous like d
+layout (binding = 3) writeonly buffer D {float data_d[];};  // contiguous
+
+shared float sumsh[BLOCK];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i1 = row % p.ne1;
+    const uint i2 = (row / p.ne1) % p.ne2;
+    const uint i3 = row / (p.ne1 * p.ne2);
+    const uint x0 = p.x_off + i1 * p.xnb1 + i2 * p.xnb2 + i3 * p.xnb3;
+    const uint d0 = row * p.ncols;
+
+    float sum = 0.0f;
+    for (uint col = tid; col < p.ncols; col += BLOCK) {
+        const float xi = data_x[x0 + col];
+        sum += xi * xi;
+    }
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (int s = int(BLOCK) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean  = sum / float(p.ncols);
+    const float scale = inversesqrt(mean + p.eps);
+
+    for (uint col = tid; col < p.ncols; col += BLOCK) {
+        if (MODE == 0) {
+            const float v = scale * data_x[x0 + col];
+            data_d[p.d_off + d0 + col] = v * p.s + p.b;
+        } else {
+            const float v = scale * data_x[x0 + col] * data_w[p.w_off + col];
+            data_d[p.d_off + d0 + col] = v * data_c[p.c_off + d0 + col];
+        }
+    }
+}

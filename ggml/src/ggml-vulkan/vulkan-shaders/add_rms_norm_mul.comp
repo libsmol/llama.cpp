@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// ADD + RMS_NORM + MUL in one dispatch, one workgroup per row:
+//   s = a + b,   d = s * inversesqrt(mean(s^2) + eps) * w
+// Writes both s and d. Column striding and reduction tree match rms_norm.comp, so the results are
+// bit-identical to ADD followed by rms_norm.comp. (Upstream sends single rows through
+// rms_norm_partials instead, which sums in another order.)
+
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint a_row; uint b_row; uint s_row; uint d_row;        // row strides, in elements
+    uint a_off; uint b_off; uint s_off; uint d_off; uint w_off; // misalignment, in elements
+    float eps;
+} p;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) readonly buffer W {float data_w[];};
+layout (binding = 3) buffer S {float data_s[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+shared float sumsh[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint a0 = p.a_off + row * p.a_row;
+    const uint b0 = p.b_off + row * p.b_row;
+    const uint s0 = p.s_off + row * p.s_row;
+    const uint d0 = p.d_off + row * p.d_row;
+
+    float sum = 0.0f;
+    for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        const float v = data_a[a0 + col] + data_b[b0 + col];
+        data_s[s0 + col] = v;
+        sum += v * v;
+    }
+
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean  = sum / float(p.ncols);
+    const float scale = inversesqrt(mean + p.eps);
+
+    // each thread re-reads only the sums it wrote
+    for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        data_d[d0 + col] = scale * data_s[s0 + col] * data_w[p.w_off + col];
+    }
+}

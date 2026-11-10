@@ -958,6 +958,22 @@ void process_shaders() {
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4", "flash_attn_pf_rdna4.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4_reduce", "flash_attn_pf_rdna4_reduce.comp", {});
+    string_to_spv("mul_mm_rdna4_q4_k", "mul_mm_rdna4.comp", {{"DATA_A_Q4_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q5_k", "mul_mm_rdna4.comp", {{"DATA_A_Q5_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q6_k", "mul_mm_rdna4.comp", {{"DATA_A_Q6_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq4_xs", "mul_mm_rdna4.comp", {{"DATA_A_IQ4_XS", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq4_nl", "mul_mm_rdna4.comp", {{"DATA_A_IQ4_NL", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q8_0", "mul_mm_rdna4.comp", {{"DATA_A_Q8_0", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q3_k", "mul_mm_rdna4.comp", {{"DATA_A_Q3_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq3_s", "mul_mm_rdna4.comp", {{"DATA_A_IQ3_S", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_bf16", "mul_mm_rdna4.comp", {{"DATA_A_BF16", "1"}}, true, true, false, false);
+    for (const char * t : {"q2_k", "q4_k", "q5_k", "q6_k", "iq4_xs", "iq4_nl", "q8_0"}) {
+        std::string def = std::string("DATA_A_") + t;
+        std::transform(def.begin(), def.end(), def.begin(), ::toupper);
+        string_to_spv(std::string("mul_mmv_rdna4_") + t, "mul_mmv_rdna4.comp", {{def, "1"}}, true, true, false, false);
+    }
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
 #endif
@@ -987,6 +1003,14 @@ void process_shaders() {
     string_to_spv("concat_i8", "concat.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("concat_t_i32", "concat_t.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("mul_mm_rdna4_reduce", "mul_mm_rdna4_reduce.comp", {});
+    string_to_spv("add_rms_norm_mul_f32", "add_rms_norm_mul.comp", {});
+    string_to_spv("swiglu_to_f16", "swiglu_to_f16.comp", {});
+    string_to_spv("b_to_f16_rowscale", "b_to_f16_rowscale.comp", {});
+    string_to_spv("dflash_conv_f32", "dflash_conv.comp", {});
+    string_to_spv("cpy_multi_f32", "cpy_multi.comp", {});
+    string_to_spv("rms_norm_fused_f32", "rms_norm_fused.comp", {});
     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
     string_to_spv("concat_transpose_i8", "concat_transpose.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_transpose_i16", "concat_transpose.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});

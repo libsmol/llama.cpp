@@ -14274,6 +14274,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 2}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // the same kernel on a q8_0 K/V cache (dequantized as it is fetched): prefill, verification and a long KV split
+    for (int64_t hs : {128, 256}) {
+        const int64_t gqa = hs == 128 ? 8 : 6;
+        for (int64_t kv : {512, 1000, 4093}) {
+            for (int64_t nb : {32, 77, 512}) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+        }
+        for (int64_t kv : {2048, 4093, 8192, 16500}) {
+            for (int64_t nb : {1, 5, 8, 16}) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+        }
+        for (int64_t nb : {20, 64, 200}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {gqa, 1}, 16500, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {gqa, 2}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
     // few query rows on a long context (a short prompt after a long one): KV split over workgroups
     for (int64_t hs : {128, 256}) {
         for (int64_t nb : {20, 64, 200}) {
@@ -14791,6 +14809,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64,  8, 1, 8, 7));
     test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 32, 20, 1, 4, 3));
     test_cases.emplace_back(new test_gated_delta_net_lazy_op(8, 128, 8, 1, 8, 6));
+    // DSpine: block of 16, so 16 kept factor sets (rollbacks up to 15); a factor set needs 3 K <= head_size,
+    // as llama_memory_recurrent requires. Qwen3.8-27B head geometry (48 x 128) included
+    for (int64_t n_replay : { 0, 7, 15, 16 }) {
+        test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64, 16, 1, 16, n_replay));
+        test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64, 16, 2, 16, n_replay));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64,  1, 1, 16, 16));
+    test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64,  9, 1, 16, 12));
+    test_cases.emplace_back(new test_gated_delta_net_lazy_op(4, 64, 33, 1, 16, 5));
+    test_cases.emplace_back(new test_gated_delta_net_lazy_op(48, 128, 16, 1, 16, 15));
+    for (bool swap_sets : { false, true }) {
+        test_cases.emplace_back(new test_gated_delta_net_lazy(4, 64, 16, 1, 16, 15, swap_sets));
+        test_cases.emplace_back(new test_gated_delta_net_lazy(4, 64,  1, 1, 16, 16, swap_sets));
+        test_cases.emplace_back(new test_gated_delta_net_lazy(4, 64, 33, 1, 16, 9, swap_sets));
+        test_cases.emplace_back(new test_gated_delta_net_lazy(4, 64, 16, 2, 16, 7, swap_sets));
+        test_cases.emplace_back(new test_gated_delta_net_lazy(48, 128, 16, 1, 16, 15, swap_sets));
+    }
     for (bool swap_sets : { false, true }) {
         test_cases.emplace_back(new test_gated_delta_net_lazy(4, 32,  4, 1, 4, 2, swap_sets));
         test_cases.emplace_back(new test_gated_delta_net_lazy(4, 32,  1, 1, 8, 8, swap_sets));
@@ -14806,6 +14841,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cpy_group(4, 96, n_seqs, 8));
         test_cases.emplace_back(new test_cpy_group(7, 33, n_seqs, 3));
         test_cases.emplace_back(new test_cpy_group(11, 64, n_seqs, 8, true));
+        // DSpine: 16 snapshots
+        test_cases.emplace_back(new test_cpy_group(19, 10240, n_seqs, 16));
+        test_cases.emplace_back(new test_cpy_group(5, 96, n_seqs, 16));
+        test_cases.emplace_back(new test_cpy_group(19, 64, n_seqs, 16, true));
     }
 
     // cache rows -> gdn -> cache, incl. a reordered idx over many short workgroups (Qwen3.8-27B: 48 x 128)
@@ -14815,6 +14854,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_state_fusion(48, 128, 1, 2, 1, rev));
         test_cases.emplace_back(new test_gated_delta_net_state_fusion(48, 128, 1, 16, 1, rev));
         test_cases.emplace_back(new test_gated_delta_net_state_fusion(48, 128, 4, 8, 3, rev));
+        test_cases.emplace_back(new test_gated_delta_net_state_fusion(48, 128, 16, 1, 16, rev));
+        test_cases.emplace_back(new test_gated_delta_net_state_fusion(4, 32, 9, 1, 16, rev));
     }
 
 #if 0
@@ -14977,6 +15018,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // Qwen3.8-27B attention with an f16 vs a q8_0 KV cache: prefill (1024 rows) and a DSpine verify block (16 rows)
+    for (ggml_type kvt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {16, 1024}) {
+            for (int64_t n_kv : {8192, 32768, 131072}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, n_kv, nb, true, false, 0.0f, 0.0f,
+                                                                GGML_PREC_F32, kvt, kvt, {0, 1, 2, 3}, true, false, 0));
+            }
+        }
+    }
+
     // Qwen3.8-27B prefill attention: head size 256, 24 query heads over 4 kv heads, 1024-token ubatch
     for (ggml_type kvt : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
         for (int64_t n_kv : {4096, 16384, 65536}) {

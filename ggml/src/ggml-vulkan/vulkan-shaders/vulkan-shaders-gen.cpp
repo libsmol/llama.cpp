@@ -959,6 +959,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_pf_rdna4", "flash_attn_pf_rdna4.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4_q8_0", "flash_attn_pf_rdna4.comp", {{"KV_Q8_0", "1"}}, true, true, false, false);
     string_to_spv("flash_attn_pf_rdna4_reduce", "flash_attn_pf_rdna4_reduce.comp", {});
     string_to_spv("mul_mm_rdna4_q4_k", "mul_mm_rdna4.comp", {{"DATA_A_Q4_K", "1"}}, true, true, false, false);
     string_to_spv("mul_mm_rdna4_q5_k", "mul_mm_rdna4.comp", {{"DATA_A_Q5_K", "1"}}, true, true, false, false);

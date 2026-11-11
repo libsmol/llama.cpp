@@ -9,8 +9,16 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
+#if defined(KV_Q8_0)
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
 
-// Prefill flash attention for RDNA4 (wave32 WMMA): head size D (128 or 256), f16 K/V, GQA.
+// Prefill flash attention for RDNA4 (wave32 WMMA): head size D (128 or 256), f16 or (KV_Q8_0) q8_0 K/V, GQA.
+//
+// KV_Q8_0: K and V rows are q8_0 blocks (one f16 scale and 32 int8 per 34 bytes). They are dequantized to f16
+// as they are fetched, into the same registers the f16 path loads, so everything from the LDS tiles on is
+// unchanged. d * q is exact in f32 and rounded once to the nearest f16, the value the coopmat1 path's f16
+// dequantization (FA_DEQUANT4_Q8_0) produces, so both kernels multiply the same f16 K and V.
 //
 // A workgroup has G * QB waves; wave w handles query head kv_head * G + w % G for the 16 positions of
 // query block w / G. All waves share each 32-key K/V tile through LDS, and the next tile is prefetched
@@ -74,13 +82,41 @@ layout (push_constant) uniform parameter {
 } p;
 
 layout (binding = 0) readonly buffer Q   {vec4 data_qv4[];};
+#if defined(KV_Q8_0)
+// q8_0 rows: 34-byte blocks, 2-byte aligned; read as 16-bit words
+layout (binding = 1) readonly buffer K   {uint16_t data_k16[];};
+layout (binding = 2) readonly buffer V   {uint16_t data_v16[];};
+#else
 layout (binding = 1) readonly buffer K   {uvec4 data_k8[];};
 layout (binding = 2) readonly buffer V   {uvec4 data_v8[];};
+#endif
 layout (binding = 3) readonly buffer M   {float16_t data_m[];};
 layout (binding = 5) buffer O  {vec4 data_ov4[];};   // also holds the f32 partial sums (see FLUSH_STEPS)
 layout (binding = 6) readonly buffer MO  {uint32_t data_mask_opt[];};
 layout (binding = 7) buffer PO {vec4 data_po4[];};    // SPLIT: [split][head][R][D] O, then [split][head][R] (M, L)
 layout (binding = 7) buffer PL {vec2 data_pml[];};
+
+#if defined(KV_Q8_0)
+// values 8 * c8 .. 8 * c8 + 7 of the q8_0 row starting at 16-bit word `row`, as 8 packed f16 (the f16 layout)
+uvec4 q8_0_chunk(const uint row, const uint c8, const bool is_v) {
+    const uint blk = c8 / 4;                    // 32 values per block, 8 per chunk
+    const uint w0  = row + blk * 17;            // 17 words per block: d, then 16 words of int8 pairs
+    const float d  = float(uint16BitsToFloat16(is_v ? data_v16[w0] : data_k16[w0]));
+    const uint q0  = w0 + 1 + (c8 % 4) * 4;     // 4 words = 8 int8
+    uvec4 r;
+    [[unroll]] for (uint e = 0; e < 4; ++e) {
+        const uint w = uint(is_v ? data_v16[q0 + e] : data_k16[q0 + e]);
+        const int  lo = bitfieldExtract(int(w), 0, 8), hi = bitfieldExtract(int(w), 8, 8);
+        r[e] = packFloat2x16(f16vec2(d * float(lo), d * float(hi)));
+    }
+    return r;
+}
+#define LOAD_K8(row, c8) q8_0_chunk(row, c8, false)
+#define LOAD_V8(row, c8) q8_0_chunk(row, c8, true)
+#else
+#define LOAD_K8(row, c8) data_k8[(row) + (c8)]
+#define LOAD_V8(row, c8) data_v8[(row) + (c8)]
+#endif
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -168,10 +204,18 @@ void main() {
                                     : (iq3 * p.ne2 * p.ne1 * D + pos * p.ne1 * D + iq2 * D) / 4;
 
     // K/V offsets; nb?1 are in elements, nb?2/nb?3 in bytes
+#if defined(KV_Q8_0)
+    // the same names, in 16-bit words of the q8_0 rows (nb?1 are the row strides in bytes here)
+    const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 2;
+    const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 2;
+    const uint k_row8  = p.nb11 / 2;
+    const uint v_row8  = p.nb21 / 2;
+#else
     const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 16;
     const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 16;
     const uint k_row8  = p.nb11 / 8;
     const uint v_row8  = p.nb21 / 8;
+#endif
 
     // mask (shared by all heads of the group: nem2 == 1)
     const uint m_base = (iq3 % p.nem3) * p.nem1 * p.KV;
@@ -214,14 +258,14 @@ void main() {
             const uint idx = tid + i * WG_SIZE; \
             const uint key = idx / (D / 8), c8 = idx % (D / 8); \
             kpre[i] = uvec4(0); \
-            if (idx < K_CHUNKS && (!ftail || (jb) * BC + key < p.KV)) { kpre[i] = data_k8[k_base8 + ((jb) * BC + key) * k_row8 + c8]; } \
+            if (idx < K_CHUNKS && (!ftail || (jb) * BC + key < p.KV)) { kpre[i] = LOAD_K8(k_base8 + ((jb) * BC + key) * k_row8, c8); } \
         } \
         [[unroll]] for (uint i = 0; i < VPT; ++i) { \
             const uint blk = wave + i * NW; \
             const uint key = (blk % (BC / 16)) * 16 + v_kp * 2 + v_par; \
             const uint d0  = (blk / (BC / 16)) * 16 + v_c * 8; \
             vpre[i] = uvec4(0); \
-            if (blk < V_BLOCKS && (!ftail || (jb) * BC + key < p.KV)) { vpre[i] = data_v8[v_base8 + ((jb) * BC + key) * v_row8 + d0 / 8]; } \
+            if (blk < V_BLOCKS && (!ftail || (jb) * BC + key < p.KV)) { vpre[i] = LOAD_V8(v_base8 + ((jb) * BC + key) * v_row8, d0 / 8); } \
         } \
         }
 

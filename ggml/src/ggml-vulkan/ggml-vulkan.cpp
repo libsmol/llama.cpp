@@ -3679,9 +3679,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef CREATE_MMV_RDNA4
     }
     for (auto &it : device->pipeline_fa_pf_rdna4) {
-        // key: G | QB << 8 | SPLIT << 16 | (head size / 64) << 20
+        // key: G | QB << 8 | SPLIT << 16 | (head size / 64) << 20 | q8_0 K/V << 24
         const uint32_t G = it.first & 0xFF, QB = (it.first >> 8) & 0xFF, SPLIT = (it.first >> 16) & 0xF, D = ((it.first >> 20) & 0xF) * 64;
-        ggml_vk_create_pipeline(device, it.second, "flash_attn_pf_rdna4", flash_attn_pf_rdna4_cm1_len, flash_attn_pf_rdna4_cm1_data, "main", 8,
+        const bool q8 = (it.first >> 24) & 1;
+        ggml_vk_create_pipeline(device, it.second, q8 ? "flash_attn_pf_rdna4_q8_0" : "flash_attn_pf_rdna4",
+                                q8 ? flash_attn_pf_rdna4_q8_0_cm1_len : flash_attn_pf_rdna4_cm1_len,
+                                q8 ? flash_attn_pf_rdna4_q8_0_cm1_data : flash_attn_pf_rdna4_cm1_data, "main", 8,
                                 sizeof(vk_flash_attn_push_constants), {1, 1, 1}, {G, G * QB * 32, QB, SPLIT, D}, 1, true, true, 32);
     }
     if (device->architecture == AMD_RDNA4 && device->coopmat_support) {
@@ -9823,12 +9826,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    // RDNA4 (flash_attn_pf_rdna4.comp): head size 128 or 256, f16 K/V. Prefill: one workgroup per KV head and 32
+    // RDNA4 (flash_attn_pf_rdna4.comp): head size 128 or 256, f16 or q8_0 K/V. Prefill: one workgroup per KV head and 32
     // query rows. Speculative verification (<= 16 rows) on a long context: one workgroup per KV head and KV
     // split, combined by flash_attn_pf_rdna4_reduce.comp.
     {
         static const bool disable_pf     = getenv("GGML_VK_DISABLE_FA_PF") != nullptr;
         static const bool disable_verify = getenv("GGML_VK_DISABLE_FA_VERIFY") != nullptr;
+        static const bool disable_pf_q8  = getenv("GGML_VK_DISABLE_FA_PF_Q8_0") != nullptr;
         // below ~6K keys the coopmat1 path is as fast (this one pays a mask pass and a reduce)
         // from 16K keys on: below that the coopmat1 path is measurably (~3e-7 KLD) closer to f32
         static const uint32_t verify_min_kv = getenv("GGML_VK_FA_VERIFY_MIN_KV") ? (uint32_t) atoi(getenv("GGML_VK_FA_VERIFY_MIN_KV")) : 16384;
@@ -9838,19 +9842,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
         const uint32_t G  = qk_ratio;
         const uint32_t NQ = (uint32_t) neq1;   // query rows (N may have been folded into the GQA ratio above)
+        // q8_0 K/V: dequantized to f16 as they are fetched; rows must be whole blocks, 2-byte aligned
+        const bool pf_q8 = !disable_pf_q8 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+            (nbk1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 && (nbv1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 &&
+            ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 2) == 0 &&
+            k->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && v->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
+        const bool pf_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            (nbk1 % 16) == 0 && (nbk2 % 16) == 0 && (nbk3 % 16) == 0 &&
+            (nbv1 % 16) == 0 && (nbv2 % 16) == 0 && (nbv3 % 16) == 0;
         const bool pf_common = !disable_pf &&
             ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA4 &&
             ctx->device->coopmat_support && ctx->device->subgroup_size_control &&
             ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32 &&
-            HSK == HSV && (HSK == 128 || HSK == 256) && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            HSK == HSV && (HSK == 128 || HSK == 256) && q->type == GGML_TYPE_F32 && (pf_f16 || pf_q8) &&
             G >= 1 && G <= 8 && neq2 == nek2 * G && nek2 == nev2 && neq3 % nek3 == 0 && neq3 % nev3 == 0 &&
             mask != nullptr && mask->type == GGML_TYPE_F16 && nem0 == KV && nem2 == 1 && nem1 >= NQ &&
             mask->nb[1] == (size_t) KV * sizeof(ggml_fp16_t) &&
             (nem3 == 1 || (nem3 == neq3 && mask->nb[3] == (size_t) nem1 * mask->nb[1])) &&
             sinks == nullptr && pf_max_bias == 0.0f && pf_softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0 &&
             (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
-            (nbk1 % 16) == 0 && (nbk2 % 16) == 0 && (nbk3 % 16) == 0 &&
-            (nbv1 % 16) == 0 && (nbv2 % 16) == 0 && (nbv3 % 16) == 0 &&
             get_misalign_bytes(ctx, q) == 0 && get_misalign_bytes(ctx, k) == 0 && get_misalign_bytes(ctx, v) == 0 &&
             get_misalign_bytes(ctx, dst) == 0 && get_misalign_bytes(ctx, mask) == 0;
         // Prefill runs one workgroup per KV head and 32 query rows. With fewer of those than half the CUs (a short
@@ -9864,7 +9874,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         if (pf_prefill || pf_verify) {
             const uint32_t QB    = pf_verify ? 1 : fa_pf_qb();
             const uint32_t SPLIT = pf_verify ? 1 : 0;
-            const uint32_t key   = G | (QB << 8) | (SPLIT << 16) | ((HSK / 64) << 20);
+            const uint32_t key   = G | (QB << 8) | (SPLIT << 16) | ((HSK / 64) << 20) | ((pf_q8 ? 1u : 0u) << 24);
             const uint32_t pf_Br = 16 * QB, pf_Bc = fa_pf_bc();
             vk_pipeline pf_pipeline, pf_mask_opt;
             {
@@ -9937,8 +9947,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 (uint32_t)neq2, (uint32_t)neq3, (uint32_t)nek2, (uint32_t)nek3, (uint32_t)nev2, (uint32_t)nev3,
                 nem1, nem2, nem3,
                 (uint32_t)(nbq1 / sizeof(float)), (uint32_t)nbq2, (uint32_t)nbq3,
-                (uint32_t)(nbk1 / sizeof(ggml_fp16_t)), (uint32_t)nbk2, (uint32_t)nbk3,
-                (uint32_t)(nbv1 / sizeof(ggml_fp16_t)), (uint32_t)nbv2, (uint32_t)nbv3,
+                // row strides: in f16 elements for f16 K/V, in bytes for q8_0
+                (uint32_t)(pf_q8 ? nbk1 : nbk1 / sizeof(ggml_fp16_t)), (uint32_t)nbk2, (uint32_t)nbk3,
+                (uint32_t)(pf_q8 ? nbv1 : nbv1 / sizeof(ggml_fp16_t)), (uint32_t)nbv2, (uint32_t)nbv3,
                 pf_scale, 0.0f, 0.0f, 0, 0.0f, 0.0f, G, split_kv, k_num };
             ggml_vk_dispatch_pipeline(ctx, subctx, pf_pipeline,
                                       { q_buf, k_buf, v_buf, mask_buf, q_buf, dst_buf, mo_buf, part_buf },

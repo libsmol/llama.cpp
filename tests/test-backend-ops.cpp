@@ -10110,6 +10110,22 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
         ggml_set_name(out, "out");
 
         return out;
+// speculative verification on a long context: every key is visible (an all-zero mask, as the KQ mask of a draft
+// block over a dense cache), the shape the RDNA4 verify kernel sees in decoding
+struct test_flash_attn_ext_verify : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",mask=open";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        if (m) {
+            std::vector<ggml_fp16_t> zero(ggml_nelements(m), ggml_fp32_to_fp16(0.0f));
+            ggml_backend_tensor_set(m, zero.data(), 0, ggml_nbytes(m));
+        }
     }
 };
 
@@ -14274,6 +14290,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 2}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // verification with every key visible (the decode case), long enough for the KV split
+    for (ggml_type kvt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {128, 256}) {
+            for (int64_t nb : {1, 7, 16}) {
+                test_cases.emplace_back(new test_flash_attn_ext_verify(hs, hs, 4, {hs == 128 ? 8 : 6, 1}, 20000, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+            }
+        }
+    }
     // the same kernel on a q8_0 K/V cache (dequantized as it is fetched): prefill, verification and a long KV split
     for (int64_t hs : {128, 256}) {
         const int64_t gqa = hs == 128 ? 8 : 6;
@@ -15009,12 +15033,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3.8-27B UD-Q4_K_XL decode shapes (q5_K/iq4_xs/q4_K/q6_K are ~97% of the weight bytes),
     // over the batch sizes speculative decoding verifies.
-    for (ggml_type t : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+    for (ggml_type t : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         for (const std::pair<int64_t, int64_t> mk : {std::make_pair<int64_t, int64_t>(17408, 5120),
                                                      {5120, 17408}, {10240, 5120}, {6144, 5120},
-                                                     {5120, 6144}}) {
+                                                     {5120, 6144}, {4096, 5120}, {5120, 4096}, {248320, 5120},
+                                                     {48, 5120}, {96, 5120}, {1024, 5120}}) {
             for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16}) {
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // Qwen3.8-27B verification on a long dense context (all keys visible), f16 and q8_0 KV. permute [0,2,1,3]:
+    // the KV cache layout, the heads of a key side by side in one row, as llama-graph views the cache
+    for (ggml_type kvt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {8, 16}) {
+            for (int64_t n_kv : {32768, 65536, 131072}) {
+                test_cases.emplace_back(new test_flash_attn_ext_verify(256, 256, 4, {6, 1}, n_kv, nb, true, false, 0.0f, 0.0f,
+                                                                       GGML_PREC_F32, kvt, kvt, {0, 1, 2, 3}, true, false, 0));
+                test_cases.emplace_back(new test_flash_attn_ext_verify(256, 256, 4, {6, 1}, n_kv, nb, true, false, 0.0f, 0.0f,
+                                                                       GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false, false, 0));
             }
         }
     }

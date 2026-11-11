@@ -9842,10 +9842,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
         const uint32_t G  = qk_ratio;
         const uint32_t NQ = (uint32_t) neq1;   // query rows (N may have been folded into the GQA ratio above)
-        // q8_0 K/V: dequantized to f16 as they are fetched; rows must be whole blocks, 2-byte aligned
+        // q8_0 K/V: fetched raw and dequantized from LDS; rows must be whole blocks on 8-byte offsets
         const bool pf_q8 = !disable_pf_q8 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
             (nbk1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 && (nbv1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 &&
-            ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 2) == 0 &&
+            ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 8) == 0 &&
             k->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && v->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
         const bool pf_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
             (nbk1 % 16) == 0 && (nbk2 % 16) == 0 && (nbk3 % 16) == 0 &&

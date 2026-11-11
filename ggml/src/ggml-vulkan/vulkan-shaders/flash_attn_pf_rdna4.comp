@@ -9,16 +9,14 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
-#if defined(KV_Q8_0)
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#endif
 
 // Prefill flash attention for RDNA4 (wave32 WMMA): head size D (128 or 256), f16 or (KV_Q8_0) q8_0 K/V, GQA.
 //
-// KV_Q8_0: K and V rows are q8_0 blocks (one f16 scale and 32 int8 per 34 bytes). They are dequantized to f16
-// as they are fetched, into the same registers the f16 path loads, so everything from the LDS tiles on is
-// unchanged. d * q is exact in f32 and rounded once to the nearest f16, the value the coopmat1 path's f16
-// dequantization (FA_DEQUANT4_Q8_0) produces, so both kernels multiply the same f16 K and V.
+// KV_Q8_0: K and V rows are q8_0 blocks (one f16 scale and 32 int8 per 34 bytes). The prefetch loads the raw
+// rows (8-byte loads, so it stays in flight while the current block is computed), stores them to staging tiles
+// in LDS after that block, and the next block dequantizes them from there into the f16 tiles; everything from the
+// f16 tiles on is unchanged. d * q is exact in f32 and rounded once to the nearest f16, the value the coopmat1
+// path's f16 dequantization (FA_DEQUANT4_Q8_0) produces, so both kernels multiply the same f16 K and V.
 //
 // A workgroup has G * QB waves; wave w handles query head kv_head * G + w % G for the 16 positions of
 // query block w / G. All waves share each 32-key K/V tile through LDS, and the next tile is prefetched
@@ -83,9 +81,9 @@ layout (push_constant) uniform parameter {
 
 layout (binding = 0) readonly buffer Q   {vec4 data_qv4[];};
 #if defined(KV_Q8_0)
-// q8_0 rows: 34-byte blocks, 2-byte aligned; read as 16-bit words
-layout (binding = 1) readonly buffer K   {uint16_t data_k16[];};
-layout (binding = 2) readonly buffer V   {uint16_t data_v16[];};
+// q8_0 rows: 34-byte blocks; rows and heads start on 8 bytes (checked by the host), read in 8-byte units
+layout (binding = 1) readonly buffer K   {uvec2 data_k2[];};
+layout (binding = 2) readonly buffer V   {uvec2 data_v2[];};
 #else
 layout (binding = 1) readonly buffer K   {uvec4 data_k8[];};
 layout (binding = 2) readonly buffer V   {uvec4 data_v8[];};
@@ -95,28 +93,6 @@ layout (binding = 5) buffer O  {vec4 data_ov4[];};   // also holds the f32 parti
 layout (binding = 6) readonly buffer MO  {uint32_t data_mask_opt[];};
 layout (binding = 7) buffer PO {vec4 data_po4[];};    // SPLIT: [split][head][R][D] O, then [split][head][R] (M, L)
 layout (binding = 7) buffer PL {vec2 data_pml[];};
-
-#if defined(KV_Q8_0)
-// values 8 * c8 .. 8 * c8 + 7 of the q8_0 row starting at 16-bit word `row`, as 8 packed f16 (the f16 layout)
-uvec4 q8_0_chunk(const uint row, const uint c8, const bool is_v) {
-    const uint blk = c8 / 4;                    // 32 values per block, 8 per chunk
-    const uint w0  = row + blk * 17;            // 17 words per block: d, then 16 words of int8 pairs
-    const float d  = float(uint16BitsToFloat16(is_v ? data_v16[w0] : data_k16[w0]));
-    const uint q0  = w0 + 1 + (c8 % 4) * 4;     // 4 words = 8 int8
-    uvec4 r;
-    [[unroll]] for (uint e = 0; e < 4; ++e) {
-        const uint w = uint(is_v ? data_v16[q0 + e] : data_k16[q0 + e]);
-        const int  lo = bitfieldExtract(int(w), 0, 8), hi = bitfieldExtract(int(w), 8, 8);
-        r[e] = packFloat2x16(f16vec2(d * float(lo), d * float(hi)));
-    }
-    return r;
-}
-#define LOAD_K8(row, c8) q8_0_chunk(row, c8, false)
-#define LOAD_V8(row, c8) q8_0_chunk(row, c8, true)
-#else
-#define LOAD_K8(row, c8) data_k8[(row) + (c8)]
-#define LOAD_V8(row, c8) data_v8[(row) + (c8)]
-#endif
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -133,6 +109,36 @@ shared uvec4 Ksh[BC * KS8];
 // V tile transposed, row-major [d][key] (+8 halves of padding), as packed half pairs
 const uint VR = (BC + 8) / 2;
 shared uint Vt32[D * VR];
+#if defined(KV_Q8_0)
+// raw q8_0 K and V tiles, [key][RW8 8-byte units] as dwords; a row is 34 * D / 32 bytes
+const uint RW8 = D * 17 / 128;
+shared uint Kraw[BC * RW8 * 2];
+shared uint Vraw[BC * RW8 * 2];
+
+// values 8 * c8 .. 8 * c8 + 7 of row r of a raw tile, as 8 packed f16 (the f16 layout)
+uvec4 q8_0_staged(const uint r, const uint c8, const bool is_v) {
+    const uint base = r * (RW8 * 2);
+    const uint ob = 34 * (c8 / 4);              // the block's byte offset in the row; d first, then 32 int8
+    const uint o  = ob + 2 + 8 * (c8 % 4);      // this chunk's 8 int8
+    const uint wd = is_v ? Vraw[base + ob / 4] : Kraw[base + ob / 4];
+    const float d = unpackHalf2x16((ob & 2) != 0 ? wd >> 16 : wd).x;
+    const uint a  = is_v ? Vraw[base + o / 4]     : Kraw[base + o / 4];
+    const uint b  = is_v ? Vraw[base + o / 4 + 1] : Kraw[base + o / 4 + 1];
+    uint q0 = a, q1 = b;
+    if ((o & 2) != 0) {
+        const uint c = is_v ? Vraw[base + o / 4 + 2] : Kraw[base + o / 4 + 2];
+        q0 = (a >> 16) | (b << 16);
+        q1 = (b >> 16) | (c << 16);
+    }
+    uvec4 res;
+    [[unroll]] for (uint e = 0; e < 4; ++e) {
+        const int q = int(e < 2 ? q0 : q1);
+        const int s = int(e & 1) * 16;
+        res[e] = packFloat2x16(f16vec2(d * float(bitfieldExtract(q, s, 8)), d * float(bitfieldExtract(q, s + 8, 8))));
+    }
+    return res;
+}
+#endif
 // mask block [query][key] (+8 halves of padding), as packed half pairs
 const uint MR = (BC + 8) / 2;
 shared uint Msh[BQ * MR];
@@ -205,11 +211,11 @@ void main() {
 
     // K/V offsets; nb?1 are in elements, nb?2/nb?3 in bytes
 #if defined(KV_Q8_0)
-    // the same names, in 16-bit words of the q8_0 rows (nb?1 are the row strides in bytes here)
-    const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 2;
-    const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 2;
-    const uint k_row8  = p.nb11 / 2;
-    const uint v_row8  = p.nb21 / 2;
+    // the same names, in 8-byte units of the q8_0 rows (nb?1 are the row strides in bytes here)
+    const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 8;
+    const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 8;
+    const uint k_row8  = p.nb11 / 8;
+    const uint v_row8  = p.nb21 / 8;
 #else
     const uint k_base8 = (ik2 * p.nb12 + ik3 * p.nb13) / 16;
     const uint v_base8 = (ik2 * p.nb22 + iv3 * p.nb23) / 16;
@@ -237,8 +243,15 @@ void main() {
     const uint v_par = lane & 1;
     const uint v_kp  = (lane >> 1) & 7;
     const uint v_c   = lane >> 4;
+#if defined(KV_Q8_0)
+    // raw prefetch: thread owns 8-byte units tid + i * WG_SIZE of the raw K and V tiles
+    const uint RPT = (BC * RW8 + WG_SIZE - 1) / WG_SIZE;
+    uvec2 kraw[RPT];
+    uvec2 vraw[RPT];
+#else
     uvec4 kpre[KPT];
     uvec4 vpre[VPT];
+#endif
 
     uint mo_cached_idx = ~0u;
     uint mo_cached = 0;
@@ -252,27 +265,57 @@ void main() {
             if (((mo_cached >> ((jj % 16) * 2)) & 0x3) != MASK_OPT_ALL_NEG_INF) { result = jj; break; } \
         } }
 
+#if defined(KV_Q8_0)
+    #define FETCH(jb) { \
+        const bool ftail = (jb) * BC + BC > p.KV; \
+        [[unroll]] for (uint i = 0; i < RPT; ++i) { \
+            const uint u = tid + i * WG_SIZE; \
+            const uint key = u / RW8, col = u % RW8; \
+            kraw[i] = uvec2(0); \
+            vraw[i] = uvec2(0); \
+            if (u < BC * RW8 && (!ftail || (jb) * BC + key < p.KV)) { \
+                kraw[i] = data_k2[k_base8 + ((jb) * BC + key) * k_row8 + col]; \
+                vraw[i] = data_v2[v_base8 + ((jb) * BC + key) * v_row8 + col]; \
+            } \
+        } \
+        }
+    // the prefetched raw block -> the staging tiles (whose last reader was before a barrier)
+    #define STAGE() { \
+        [[unroll]] for (uint i = 0; i < RPT; ++i) { \
+            const uint u = tid + i * WG_SIZE; \
+            if (u < BC * RW8) { \
+                Kraw[2 * u] = kraw[i].x; Kraw[2 * u + 1] = kraw[i].y; \
+                Vraw[2 * u] = vraw[i].x; Vraw[2 * u + 1] = vraw[i].y; \
+            } \
+        } \
+        }
+#else
     #define FETCH(jb) { \
         const bool ftail = (jb) * BC + BC > p.KV; \
         [[unroll]] for (uint i = 0; i < KPT; ++i) { \
             const uint idx = tid + i * WG_SIZE; \
             const uint key = idx / (D / 8), c8 = idx % (D / 8); \
             kpre[i] = uvec4(0); \
-            if (idx < K_CHUNKS && (!ftail || (jb) * BC + key < p.KV)) { kpre[i] = LOAD_K8(k_base8 + ((jb) * BC + key) * k_row8, c8); } \
+            if (idx < K_CHUNKS && (!ftail || (jb) * BC + key < p.KV)) { kpre[i] = data_k8[k_base8 + ((jb) * BC + key) * k_row8 + c8]; } \
         } \
         [[unroll]] for (uint i = 0; i < VPT; ++i) { \
             const uint blk = wave + i * NW; \
             const uint key = (blk % (BC / 16)) * 16 + v_kp * 2 + v_par; \
             const uint d0  = (blk / (BC / 16)) * 16 + v_c * 8; \
             vpre[i] = uvec4(0); \
-            if (blk < V_BLOCKS && (!ftail || (jb) * BC + key < p.KV)) { vpre[i] = LOAD_V8(v_base8 + ((jb) * BC + key) * v_row8, d0 / 8); } \
+            if (blk < V_BLOCKS && (!ftail || (jb) * BC + key < p.KV)) { vpre[i] = data_v8[v_base8 + ((jb) * BC + key) * v_row8 + d0 / 8]; } \
         } \
         }
+#endif
 
     uint j;
     NEXT_BLOCK(j_begin, j);
     if (j < n_blocks) {
         FETCH(j);
+#if defined(KV_Q8_0)
+        STAGE();
+        barrier();
+#endif
     }
 
     [[dont_unroll]]
@@ -290,12 +333,20 @@ void main() {
             [[unroll]] for (uint i = 0; i < KPT; ++i) {
                 const uint idx = tid + i * WG_SIZE;
                 if (idx < K_CHUNKS) {
+#if defined(KV_Q8_0)
+                    Ksh[(idx / (D / 8)) * KS8 + idx % (D / 8)] = q8_0_staged(idx / (D / 8), idx % (D / 8), false);
+#else
                     Ksh[(idx / (D / 8)) * KS8 + idx % (D / 8)] = kpre[i];
+#endif
                 }
             }
             [[unroll]] for (uint i = 0; i < VPT; ++i) {
                 const uint blk = wave + i * NW;
+#if defined(KV_Q8_0)
+                const uvec4 v = blk < V_BLOCKS ? q8_0_staged((blk % (BC / 16)) * 16 + v_kp * 2 + v_par, (blk / (BC / 16)) * 2 + v_c, true) : uvec4(0);
+#else
                 const uvec4 v = vpre[i];
+#endif
                 // even lane keeps the low halves (even d) and sends the high ones, odd lane the reverse
                 const uint s0 = v_par == 0 ? (v.x >> 16) | (v.y & 0xFFFF0000u) : (v.x & 0xFFFFu) | (v.y << 16);
                 const uint s1 = v_par == 0 ? (v.z >> 16) | (v.w & 0xFFFF0000u) : (v.z & 0xFFFFu) | (v.w << 16);
@@ -414,6 +465,11 @@ void main() {
                     Oacc[t] = coopMatMulAdd(Va, Pb[kt], Oacc[t]);
                 }
             }
+#if defined(KV_Q8_0)
+            if (jn < n_blocks) {
+                STAGE();
+            }
+#endif
             barrier();
             j = jn;
         }

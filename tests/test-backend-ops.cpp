@@ -4602,6 +4602,89 @@ struct test_add_rms_norm_mul : public test_case {
     }
 };
 
+// A producer whose result is B of a skinny matmul (2..16 columns, mul_mmv_rdna4 on RDNA4), which may then write
+// that f16 B operand itself: kind 0 RMS_NORM + MUL, 1 ADD + RMS_NORM + MUL, 2 SWIGLU, 3 MUL (through a reshape).
+// big: inputs that make some rows overflow f16, so the B rows are stored scaled. A second matmul reads the same
+// B after an unrelated GET_ROWS, as the FFN gate / up pair does.
+struct test_f16_b_producer : public test_case {
+    const int kind;
+    const int64_t K, N, M;
+    const bool big;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "F16_B_PRODUCER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(kind, K, N, M, big);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_f16_b_producer(int kind = 0, int64_t K = 512, int64_t N = 16, int64_t M = 256, bool big = false)
+        : kind(kind), K(K), N(N), M(M), big(big) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+        ggml_set_name(x, "x");
+        ggml_tensor * b = nullptr;
+        if (kind == 0 || kind == 1) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+            ggml_set_name(w, "w");
+            ggml_tensor * s = x;
+            if (kind == 1) {
+                ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+                ggml_set_name(y, "y");
+                s = ggml_add(ctx, y, x);
+            }
+            b = ggml_mul(ctx, ggml_rms_norm(ctx, s, 1e-6f), w);
+        } else if (kind == 2) {
+            ggml_tensor * u = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+            ggml_set_name(u, "u");
+            b = ggml_swiglu_split(ctx, x, u);
+        } else {
+            // [K / 64, 64, N] * [K / 64, 64, N] -> reshape to [K, N], as the gated norm before the output projection
+            ggml_tensor * x3 = ggml_reshape_3d(ctx, x, K / 64, 64, N);
+            ggml_tensor * u  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K / 64, 64, N);
+            ggml_set_name(u, "u");
+            b = ggml_reshape_2d(ctx, ggml_mul(ctx, x3, u), K, N);
+        }
+        ggml_set_name(b, "b");
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, M);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, M);
+        ggml_set_name(a1, "a1");
+        ggml_set_name(a2, "a2");
+        ggml_tensor * t  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+        ggml_tensor * ix = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_set_name(t, "t");
+        ggml_set_name(ix, "ix");
+        ggml_tensor * d1 = ggml_mul_mat(ctx, a1, b);
+        ggml_tensor * g  = ggml_get_rows(ctx, t, ix);
+        ggml_tensor * d2 = ggml_mul_mat(ctx, a2, b);
+        ggml_tensor * out = ggml_add(ctx, d1, d2);
+        out = ggml_add(ctx, out, ggml_sum(ctx, g));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ix") == 0) {
+                std::vector<int32_t> ids = { 1, 3, 5, 7 };
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else if (big && (strcmp(t->name, "w") == 0 || strcmp(t->name, "u") == 0)) {
+                // rows of B up to ~1e5 (beyond f16): w / u large, so rms_norm * w and the products overflow f16
+                init_tensor_uniform(t, -3e5f, 3e5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // RMS_NORM of a strided view + SCALE (the gated-delta-net l2 norm, mode 1), or
 // RMS_NORM + MUL(weight) + MUL(tensor) (the gated norm, mode 2)
 struct test_rms_norm_ext : public test_case {
@@ -10110,6 +10193,9 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
 // speculative verification on a long context: every key is visible (an all-zero mask, as the KQ mask of a draft
 // block over a dense cache), the shape the RDNA4 verify kernel sees in decoding
 struct test_flash_attn_ext_verify : public test_flash_attn_ext {
@@ -12713,6 +12799,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t rows : {1, 6, 33}) {
             test_cases.emplace_back(new test_add_rms_norm_mul({n, rows, 1, 1}, 1e-6f));
         }
+    }
+    // f16 B operands written by their producers for skinny matmuls (RDNA4), incl. rows that overflow f16
+    for (int kind : {0, 1, 2, 3}) {
+        for (int64_t n : {2, 7, 16}) {
+            // (big: from 7 columns on, the mul_mmv_rdna4 path; below, MMVQ's q8_1 B overflows on such rows anyway)
+            for (bool big : {false, true}) {
+                if (big && n < 7) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_f16_b_producer(kind, 5120, n, 256, big));
+            }
+        }
+        test_cases.emplace_back(new test_f16_b_producer(kind, 512, 16, 64, false));
+        test_cases.emplace_back(new test_f16_b_producer(kind, 17408, 16, 128, false));
     }
     for (int64_t n : {128, 300, 2048}) {
         test_cases.emplace_back(new test_rms_norm_ext(1, {n, 16, 8, 1}));

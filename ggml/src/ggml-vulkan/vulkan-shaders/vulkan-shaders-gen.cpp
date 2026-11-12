@@ -873,6 +873,7 @@ void process_shaders() {
         string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_f32" + suffix, "rms_norm.comp", merge_maps(rms_bf16_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_bf16" + suffix, "rms_norm.comp", merge_maps({{"C_TYPE", "uint16_t"}, {"DATA_C_BF16", "1"}, {"RMS_NORM_ADD_FUSION", "1"}}, rms_bf16_dict));
+        string_to_spv("rms_norm_mul_f16out_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_F16_OUT", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
@@ -1007,6 +1008,8 @@ void process_shaders() {
     string_to_spv("concat_t_i32", "concat_t.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("mul_mm_rdna4_reduce", "mul_mm_rdna4_reduce.comp", {});
     string_to_spv("add_rms_norm_mul_f32", "add_rms_norm_mul.comp", {});
+    string_to_spv("add_rms_norm_mul_f16out_f32", "add_rms_norm_mul.comp", {{"F16_OUT", "1"}});
+    string_to_spv("mul_to_f16", "swiglu_to_f16.comp", {{"OP_MUL", "1"}});
     string_to_spv("swiglu_to_f16", "swiglu_to_f16.comp", {});
     string_to_spv("b_to_f16_rowscale", "b_to_f16_rowscale.comp", {});
     string_to_spv("dflash_conv_f32", "dflash_conv.comp", {});

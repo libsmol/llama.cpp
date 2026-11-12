@@ -50,6 +50,20 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
 #endif
 
+#if RMS_NORM_F16_OUT
+// RMS_NORM + MUL that also writes its result as the f16 B operand of the consuming mul_mmv_rdna4 into binding 4,
+// in the layout of b_to_f16_rowscale.comp for rows_alloc = the rows of this dispatch: rows of ncols halves, then
+// one f32 scale per row. Same values: each f16 is converted from the f32 result as stored, and a row that would
+// overflow f16 is stored times 2^-e with the scale 2^e, e as b_to_f16_rowscale.comp chooses it.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout (binding = 4) writeonly buffer H {float16_t data_h[];};
+layout (binding = 4) writeonly buffer HS {float data_hs[];};
+// the smallest magnitude that rounds to infinity as f16
+const float F16_OVERFLOW = 65520.0;
+// the largest row maximum >= F16_OVERFLOW (as bits, which order non-negative floats), else 0
+shared uint amax_bits;
+#endif
+
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION
 layout (constant_id = 2) const bool do_post_multiply = false;
@@ -74,6 +88,16 @@ void rms_norm(uint num_iters) {
     for (uint samp = gl_WorkGroupID.z; samp < nsamples; samp += gl_NumWorkGroups.z) {
         for (uint channel = gl_WorkGroupID.y; channel < nchannels; channel += gl_NumWorkGroups.y) {
             barrier();
+#if RMS_NORM_F16_OUT
+            // ordered before the atomics below by the barriers of the reduction
+            if (tid == 0) {
+                amax_bits = 0;
+            }
+            // a runtime zero (param3 is the partials count, 0 here): OR-ing it in keeps the f32 result rounded
+            // before the f16 conversion, which the compiler could otherwise fuse with the last multiply
+            const uint f16_zero = uint(p.param3) & 0x80000000u;
+            float amax = 0.0;
+#endif
 
             uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
             uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
@@ -175,8 +199,42 @@ void rms_norm(uint num_iters) {
                         }
 #endif
                         data_d[d_offset + col] = FLOAT_TO_D(value);
+#if RMS_NORM_F16_OUT
+                        const float hv = uintBitsToFloat(floatBitsToUint(float(value)) | f16_zero);
+                        data_h[row * ncols + col] = float16_t(hv);
+                        amax = max(amax, abs(hv));
+#endif
                     }
                 }
+#if RMS_NORM_F16_OUT
+                if (amax >= F16_OVERFLOW) {
+                    atomicMax(amax_bits, floatBitsToUint(amax));
+                }
+                barrier();
+                const float gmax = uintBitsToFloat(amax_bits);
+                float hscale = 1.0;
+                if (gmax >= F16_OVERFLOW) {
+                    // e <= 126 keeps both powers of two normal; an infinite element stays infinite, as it would unscaled
+                    uint e = 0;
+                    for (float m = gmax; m >= F16_OVERFLOW && e < 126; m *= 0.5) {
+                        e++;
+                    }
+                    const float down = uintBitsToFloat((127u - e) << 23);
+                    hscale = uintBitsToFloat((127u + e) << 23);
+                    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                        if (col >= ncols) {
+                            continue;
+                        }
+                        const FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
+                        const float hv = uintBitsToFloat(floatBitsToUint(float(value)) | f16_zero);
+                        data_h[row * ncols + col] = float16_t(hv * down);
+                    }
+                }
+                if (tid == 0) {
+                    // rows_alloc = rows: the scales follow the rows * ncols halves, at a 16-byte boundary
+                    data_hs[(((nrows * ncols * 2) + 15) & ~15u) / 4 + row] = hscale;
+                }
+#endif
             } else {
                 [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                     if (col >= ncols) {

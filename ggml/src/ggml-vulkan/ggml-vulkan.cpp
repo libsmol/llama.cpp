@@ -3751,6 +3751,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add[1][0][pm][i], name + "_bf16_f32" + suffix, RMS_SHADER(rms_norm_mul_add_bf16_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, pm, block_size, rms_unroll}, 1, true, rms_subgroups);
             ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add[1][1][pm][i], name + "_bf16_bf16" + suffix, RMS_SHADER(rms_norm_mul_add_bf16_bf16), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, pm, block_size, rms_unroll}, 1, true, rms_subgroups);
         }
+        ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_f16out_f32[i], "rms_norm_mul_f16out_f32" + suffix, RMS_SHADER(rms_norm_mul_f16out_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
     }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_partials_f32, "rms_norm_mul_add_mul_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
@@ -3897,6 +3898,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_i32, "concat_transpose_i32", concat_transpose_i32_len, concat_transpose_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_t_i32, "concat_t_i32", concat_t_i32_len, concat_t_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add_rms_norm_mul_f32, "add_rms_norm_mul_f32", add_rms_norm_mul_f32_len, add_rms_norm_mul_f32_data, "main", 5, sizeof(vk_op_add_rms_norm_mul_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_add_rms_norm_mul_f16out_f32, "add_rms_norm_mul_f16out_f32", add_rms_norm_mul_f16out_f32_len, add_rms_norm_mul_f16out_f32_data, "main", 6, sizeof(vk_op_add_rms_norm_mul_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dflash_conv_f32, "dflash_conv_f32", dflash_conv_f32_len, dflash_conv_f32_data, "main", 4, sizeof(vk_op_dflash_conv_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_multi_f32, "cpy_multi_f32", cpy_multi_f32_len, cpy_multi_f32_data, "main", 2, sizeof(vk_op_cpy_multi_push_constants), {256, 1, 1}, {}, 1);
     for (uint32_t mode = 0; mode < 2; ++mode) {
@@ -3908,6 +3910,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     if (device->fp16) {
         ggml_vk_create_pipeline(device, device->pipeline_swiglu_to_f16, "swiglu_to_f16", swiglu_to_f16_len, swiglu_to_f16_data, "main", 4, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_mul_to_f16, "mul_to_f16", mul_to_f16_len, mul_to_f16_data, "main", 4, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_b_to_f16_rowscale, "b_to_f16_rowscale", b_to_f16_rowscale_len, b_to_f16_rowscale_data, "main", 2, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
     }
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -7413,6 +7416,27 @@ static void ggml_vk_rdna4_b_to_f16(ggml_backend_vk_context * ctx, vk_context& su
     ctx->prealloc_y_last_k_padded      = false;
 }
 
+// prealloc_y as the f16 B operand of the skinny matmul on `out` (ggml_vk_find_norm_to_f16), and tag it: the
+// producer writing it is dispatched right after this
+static vk_subbuffer ggml_vk_norm_f16_begin(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * out) {
+    const uint32_t K = (uint32_t) out->ne[0], rows = (uint32_t) out->ne[1];
+    const uint64_t size = ggml_vk_rdna4_b_size(K, rows);
+    // the shaders place the scales at rows * K halves rounded up to 16 bytes
+    GGML_ASSERT(ggml_vk_rdna4_b_scale_off(K, rows) * sizeof(float) == ((uint64_t) rows * K * 2 + 15) / 16 * 16);
+    if (ctx->prealloc_size_y < size) {
+        ctx->prealloc_size_y = size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_b_to_f16_rowscale.get();
+    ctx->prealloc_y_last_tensor_used   = out;
+    ctx->prealloc_y_last_k_padded      = false;
+    ctx->prealloc_y_need_sync          = true;
+    return vk_subbuffer{ ctx->prealloc_y, 0, size };
+}
+
 // The mul_mm_rdna4 pipeline if ggml_vk_mul_mat_q_f16 would use it for this matmul, else nullptr.
 // src1 is then read as f16 from prealloc_y.
 static vk_pipeline ggml_vk_mul_mat_rdna4_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -7895,10 +7919,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 // mul_mmv_rdna4: WMMA GEMM for 2..16 columns (speculative verification), one wave per 16 rows. A is
 // streamed once, B is staged as f16 in prealloc_y. With few rows K is split over z and reduced by
 // matmul_split_k_reduce.
-static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// the mul_mmv_rdna4 pipeline ggml_vk_mul_mat_skinny_rdna4 would run this matmul with, else nullptr
+static vk_pipeline ggml_vk_mul_mat_skinny_rdna4_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const bool disable = getenv("GGML_VK_DISABLE_RDNA4_MMV") != nullptr;
     if (disable) {
-        return false;
+        return nullptr;
     }
     vk_pipeline pipeline = src0->type == GGML_TYPE_Q2_K   ? ctx->device->pipeline_mmv_rdna4_q2_k :
                            src0->type == GGML_TYPE_Q4_K   ? ctx->device->pipeline_mmv_rdna4_q4_k :
@@ -7908,7 +7933,7 @@ static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_conte
                            src0->type == GGML_TYPE_IQ4_NL ? ctx->device->pipeline_mmv_rdna4_iq4_nl :
                            src0->type == GGML_TYPE_Q8_0   ? ctx->device->pipeline_mmv_rdna4_q8_0 : nullptr;
     if (!pipeline || ctx->device->pipeline_b_to_f16_rowscale == nullptr || !ggml_vk_src1_prec_allows_f16(dst)) {
-        return false;
+        return nullptr;
     }
     const uint32_t M = (uint32_t) src0->ne[1], K = (uint32_t) src0->ne[0], N = (uint32_t) src1->ne[1];
     // At the board power limit, which decode reaches on gfx1201, speed follows energy per weight byte:
@@ -7916,7 +7941,7 @@ static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_conte
     // faster here at any width.
     static const uint32_t min_n = getenv("GGML_VK_RDNA4_MMV_MIN_N") ? atoi(getenv("GGML_VK_RDNA4_MMV_MIN_N")) : 7;
     if (N < 2 || (N < min_n && M < 65536 && src0->type != GGML_TYPE_IQ4_NL)) {
-        return false;
+        return nullptr;
     }
     const size_t a_align = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) ? 16 : src0->type == GGML_TYPE_IQ4_XS ? 8 : 4;
     const size_t row_size = ggml_row_size(src0->type, K);
@@ -7926,8 +7951,17 @@ static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_conte
         src0->nb[1] != row_size || ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
         (uint64_t) M * row_size >= (1ull << 32) ||
         ((vk_tensor_offset(src0) + src0->view_offs) % a_align) != 0) {
+        return nullptr;
+    }
+    return pipeline;
+}
+
+static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    vk_pipeline pipeline = ggml_vk_mul_mat_skinny_rdna4_pipeline(ctx, src0, src1, dst);
+    if (!pipeline) {
         return false;
     }
+    const uint32_t M = (uint32_t) src0->ne[1], K = (uint32_t) src0->ne[0], N = (uint32_t) src1->ne[1];
 
     // split K until there are ~640 16-row waves: fewer leave the long per-wave K loops latency bound
     const uint32_t n_sb   = K / 256;
@@ -12007,7 +12041,8 @@ static void ggml_vk_add_rms_norm_mul(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_tensor * mul  = cgraph->nodes[node_idx + 2];
     const ggml_tensor * w    = mul->src[0] == norm ? mul->src[1] : mul->src[0];
 
-    vk_pipeline pipeline = ctx->device->pipeline_add_rms_norm_mul_f32;
+    const bool f16_out = ctx->norm_to_f16.count(mul) != 0;
+    vk_pipeline pipeline = f16_out ? ctx->device->pipeline_add_rms_norm_mul_f16out_f32 : ctx->device->pipeline_add_rms_norm_mul_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     float eps;
@@ -12022,6 +12057,15 @@ static void ggml_vk_add_rms_norm_mul(ggml_backend_vk_context * ctx, vk_context& 
         get_misalign_bytes(ctx, w) / (uint32_t) sizeof(float),
         eps,
     };
+    if (f16_out) {
+        GGML_ASSERT(eps > 0.0f);   // the shader takes a runtime zero from its sign bit
+        const vk_subbuffer hb = ggml_vk_norm_f16_begin(ctx, subctx, mul);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, add->src[0], true), ggml_vk_tensor_subbuffer(ctx, add->src[1], true),
+              ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, add, true), ggml_vk_tensor_subbuffer(ctx, mul, true), hb },
+            pc, { (uint32_t) add->ne[1], 1, 1 });
+        return;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, add->src[0], true), ggml_vk_tensor_subbuffer(ctx, add->src[1], true),
           ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, add, true), ggml_vk_tensor_subbuffer(ctx, mul, true) },
@@ -13172,6 +13216,17 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[5], offset[5]),
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
+    } else if (ctx->fused_rms_norm_mode == RMS_NORM_MUL && !ctx->do_add_rms_partials && ctx->norm_to_f16.count(dst) &&
+               ggml_are_same_shape(src0, dst) && src1->ne[0] == src0->ne[0] && src0->ne[2] == 1 && src0->ne[3] == 1) {
+        // also the f16 B operand of the next (skinny) matmul (ggml_vk_find_norm_to_f16); rows of src0 are the rows of dst
+        vk_pipeline pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_mul_f16out_f32, src0->ne[0]);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        init_pushconst_tensor_offsets(ctx, bin, src0, src1, nullptr, nullptr, dst);
+        const vk_subbuffer hb = ggml_vk_norm_f16_begin(ctx, subctx, dst);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+              ggml_vk_tensor_subbuffer(ctx, src0, true), hb },
+            bin, { (uint32_t) src0->ne[1], 1, 1 });
     } else {
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
@@ -14657,6 +14712,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_MUL:
         if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else if (!ctx->glu_to_f16.empty() && ctx->glu_to_f16.count(node)) {
+            ggml_vk_swiglu_to_f16(ctx, compute_ctx, node, true);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
         }
@@ -16682,15 +16739,21 @@ static constexpr int32_t GGML_VK_GDN_GATES_TAG = 0x52344747;
 
 // A split SWIGLU whose next compute node is a mul_mm_rdna4 matmul taking it as B writes that f16 B
 // operand straight into prealloc_y. Its f32 result is skipped when nothing else reads it.
+static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * out, const ggml_tensor * mm);
 static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph,
                                     const std::unordered_map<const ggml_tensor *, int> & uses) {
     if (ctx->device->pipeline_swiglu_to_f16 == nullptr) {
         return;
     }
+    // skinny (mul_mmv_rdna4) consumers, and a plain MUL of two same-shape tensors as the producer (Qwen3.5 / 3.8:
+    // the gated attention output and the gated delta-net norm, before the output projection)
+    static const bool skinny_disabled = getenv("GGML_VK_DISABLE_NORM_F16") != nullptr;
+    const bool skinny_ok = !skinny_disabled && ctx->device->pipeline_mul_to_f16 != nullptr;
     auto const aligned16 = [](const ggml_tensor * t) { return ((vk_tensor_offset(t) + t->view_offs) % 16) == 0; };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * glu = cgraph->nodes[i];
-        if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr) {
+        const bool is_mul = glu->op == GGML_OP_MUL;
+        if (!(is_mul && skinny_ok) && (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr)) {
             continue;
         }
         const ggml_tensor * g = glu->src[0];
@@ -16707,9 +16770,37 @@ static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph *
         while (j < cgraph->n_nodes && ggml_vk_is_empty(cgraph->nodes[j])) {
             j++;
         }
-        if (j >= cgraph->n_nodes) {
+        // a skinny consumer may also come after nodes that are not run, and after GET_ROWS nodes (they do not use
+        // prealloc_y) that neither read nor write glu (the f16 copy is of glu as written)
+        int js = i + 1;
+        while (skinny_ok && js < cgraph->n_nodes) {
+            ggml_tensor * n = cgraph->nodes[js];
+            const bool passive = ggml_vk_is_empty(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ctx->gdn_fused_skip.count(n);
+            const bool get_rows_ok = n->op == GGML_OP_GET_ROWS && n->src[0] != glu && n->src[1] != glu && n->buffer && n->src[0]->buffer &&
+                !ggml_vk_tensors_overlap(n, glu, false) && !ggml_vk_tensors_overlap(n->src[0], glu, false);
+            if (!passive && !get_rows_ok) {
+                break;
+            }
+            js++;
+        }
+        if (skinny_ok && js < cgraph->n_nodes) {
+            const ggml_tensor * mm = cgraph->nodes[js];
+            const ggml_tensor * b  = mm->op == GGML_OP_MUL_MAT ? mm->src[1] : nullptr;
+            while (b && b != glu && b->op == GGML_OP_RESHAPE && b->view_src == glu) {
+                b = b->src[0];
+            }
+            if (b == glu && ggml_vk_norm_f16_eligible(ctx, mm->src[1], mm) && ggml_nelements(mm->src[1]) == ggml_nelements(glu) &&
+                (mm->src[1]->ne[0] % 4) == 0) {
+                // the f32 result is always written: a skinny matmul converts B itself when its reuse check fails
+                ctx->glu_to_f16[glu]   = true;
+                ctx->glu_to_f16_b[glu] = mm->src[1];
+                continue;
+            }
+        }
+        if (is_mul || j >= cgraph->n_nodes) {
             continue;
         }
+        // mul_mm_rdna4 consumer (as before)
         const ggml_tensor * mm = cgraph->nodes[j];
         if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
             ggml_vk_mul_mat_rdna4_pipeline(ctx, mm->src[0], glu, mm) == nullptr) {
@@ -16722,12 +16813,16 @@ static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph *
 }
 
 static void ggml_vk_swiglu_to_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * glu, bool write_f32) {
-    // the layout of ggml_vk_rdna4_b_to_f16, with ne1 padded to the 256-row tile as the GEMM's own conversion
-    const uint32_t ncols      = (uint32_t) glu->ne[0];
-    const uint32_t rows       = (uint32_t) glu->ne[1];
-    const uint32_t rows_alloc = ROUNDUP_POW2(rows, 256);
+    // the layout of ggml_vk_rdna4_b_to_f16, with ne1 padded to the 256-row tile as the GEMM's own conversion; for a
+    // skinny consumer, rows_alloc = its rows of its B (a reshape of glu: ggml_vk_find_glu_to_f16)
+    const auto bit = ctx->glu_to_f16_b.find(glu);
+    const ggml_tensor * b     = bit != ctx->glu_to_f16_b.end() ? bit->second : glu;
+    const bool skinny         = b != glu || bit != ctx->glu_to_f16_b.end();
+    const uint32_t ncols      = (uint32_t) b->ne[0];
+    const uint32_t rows       = (uint32_t) b->ne[1];
+    const uint32_t rows_alloc = skinny ? rows : ROUNDUP_POW2(rows, 256);
     const uint64_t y_sz       = ggml_vk_rdna4_b_size(ncols, rows_alloc);
-    GGML_ASSERT(glu->ne[2] == 1 && glu->ne[3] == 1 && (ncols % 4) == 0);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1 && (ncols % 4) == 0 && ggml_nelements(b) == ggml_nelements(glu));
     if (ctx->prealloc_size_y < y_sz) {
         ctx->prealloc_size_y = y_sz;
         ggml_vk_preallocate_buffers(ctx, subctx);
@@ -16735,7 +16830,7 @@ static void ggml_vk_swiglu_to_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (ctx->prealloc_y_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    vk_pipeline pipeline = ctx->device->pipeline_swiglu_to_f16;
+    vk_pipeline pipeline = glu->op == GGML_OP_MUL ? ctx->device->pipeline_mul_to_f16 : ctx->device->pipeline_swiglu_to_f16;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const std::array<uint32_t, 3> pc = { ncols, write_f32 ? 1u : 0u, (uint32_t) ggml_vk_rdna4_b_scale_off(ncols, rows_alloc) };
@@ -16744,11 +16839,50 @@ static void ggml_vk_swiglu_to_f16(ggml_backend_vk_context * ctx, vk_context& sub
           vk_subbuffer{ ctx->prealloc_y, 0, y_sz } },
         pc, { rows, 1, 1 });
 
-    // tag prealloc_y as holding glu converted by ggml_vk_rdna4_b_to_f16
+    // tag prealloc_y as holding glu (the consumer's B) converted by ggml_vk_rdna4_b_to_f16
     ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_b_to_f16_rowscale.get();
-    ctx->prealloc_y_last_tensor_used   = glu;
+    ctx->prealloc_y_last_tensor_used   = b;
     ctx->prealloc_y_last_k_padded      = false;
     ctx->prealloc_y_need_sync          = true;
+}
+
+// RMS_NORM + MUL (and ADD + RMS_NORM + MUL) whose result is B of the very next compute node, a mul_mmv_rdna4
+// matmul (2..16 columns): the norm writes that f16 B operand into prealloc_y as well, in the layout
+// ggml_vk_rdna4_b_to_f16 would produce for rows_alloc = the rows (which is what the skinny matmul asks for),
+// and tags prealloc_y with it, so the matmul's conversion is skipped. Bit-exact: the f16 values and the scales
+// are the conversion of the stored f32 result, by the same rules. Later matmuls on the same B reuse it as before.
+// The f32 result is still written, so a matmul whose reuse check fails converts B itself. The set holds the MUL;
+// ggml_vk_rms_norm (RMS_NORM + MUL) and ggml_vk_add_rms_norm_mul use the f16 variant when their result is in it.
+static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * out, const ggml_tensor * mm) {
+    return mm->op == GGML_OP_MUL_MAT && mm->src[1] == out && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+           !ctx->gdn_fused_skip.count(mm) && out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) &&
+           out->ne[2] == 1 && out->ne[3] == 1 && out->ne[1] >= 2 && out->ne[1] <= 16 &&
+           out->buffer && ggml_backend_buffer_is_vk(out->buffer) &&
+           ggml_vk_mul_mat_skinny_rdna4_pipeline(ctx, mm->src[0], out, mm) != nullptr;
+}
+
+static void ggml_vk_find_norm_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
+    ctx->norm_to_f16.clear();
+    static const bool disabled = getenv("GGML_VK_DISABLE_NORM_F16") != nullptr;
+    if (disabled || ctx->device->pipeline_add_rms_norm_mul_f16out_f32 == nullptr || ctx->device->pipeline_rms_norm_mul_f16out_f32[2] == nullptr) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * mul = cgraph->nodes[i];
+        if (mul->op != GGML_OP_MUL || mul->src[0] == nullptr || mul->src[1] == nullptr ||
+            (mul->src[0]->op != GGML_OP_RMS_NORM && mul->src[1]->op != GGML_OP_RMS_NORM)) {
+            continue;
+        }
+        // the very next compute node (nothing else can touch prealloc_y in between)
+        int j = i + 1;
+        while (j < cgraph->n_nodes && (ggml_vk_is_empty(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                                       ctx->gdn_fused_skip.count(cgraph->nodes[j]))) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && ggml_vk_norm_f16_eligible(ctx, mul, cgraph->nodes[j])) {
+            ctx->norm_to_f16.insert(mul);
+        }
+    }
 }
 
 // Fuse into GATED_DELTA_NET the GET_ROWS that loads s0 from the recurrent cache and the CPY that
@@ -16758,6 +16892,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     ctx->gdn_fusions.clear();
     ctx->gdn_fused_skip.clear();
     ctx->glu_to_f16.clear();
+    ctx->glu_to_f16_b.clear();
 
     // the fusion targets the v0.9.0 GDN shader: off until it is ported to the current one
     static const bool disabled     = true;
@@ -16766,7 +16901,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     bool any = false, any_glu = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         any     |= !disabled && cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
-        any_glu |= !glu_disabled && cgraph->nodes[i]->op == GGML_OP_GLU;
+        any_glu |= !glu_disabled && (cgraph->nodes[i]->op == GGML_OP_GLU || cgraph->nodes[i]->op == GGML_OP_MUL);
     }
     if (!any && !any_glu) {
         return;
@@ -17246,6 +17381,7 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
     ggml_vk_find_gdn_fusions(ctx, cgraph);
     ggml_vk_find_swiglu_epi(ctx, cgraph);
     ggml_vk_find_cpy_groups(ctx, cgraph);
+    ggml_vk_find_norm_to_f16(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 

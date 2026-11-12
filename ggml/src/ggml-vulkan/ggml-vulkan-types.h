@@ -1061,7 +1061,11 @@ struct vk_device_struct {
                 pipeline_mm_rdna4_bf16;
     vk_pipeline pipeline_mm_rdna4_reduce;
     vk_pipeline pipeline_add_rms_norm_mul_f32;
+    // the same, also writing the f16 B operand of mul_mmv_rdna4 (rms_norm: by block size)
+    vk_pipeline pipeline_add_rms_norm_mul_f16out_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f16out_f32;
     vk_pipeline pipeline_swiglu_to_f16;
+    vk_pipeline pipeline_mul_to_f16;
     // f32 -> the f16 B operand of the RDNA4 GEMMs, with a power-of-two scale per row against f16 overflow
     vk_pipeline pipeline_b_to_f16_rowscale;
     vk_pipeline pipeline_dflash_conv_f32;
@@ -1383,6 +1387,11 @@ struct ggml_backend_vk_context {
     // SWIGLU nodes writing the f16 B operand of the following mul_mm_rdna4 into prealloc_y;
     // value: whether the f32 result is written too
     std::unordered_map<const ggml_tensor *, bool> glu_to_f16;
+    // ... whose consumer is a mul_mmv_rdna4 matmul (always writing the f32 result): its B (glu or a reshape of it)
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> glu_to_f16_b;
+    // the last node of an RMS_NORM + MUL / ADD + RMS_NORM + MUL whose next compute node is a mul_mmv_rdna4 matmul
+    // reading its result (ggml_vk_find_norm_to_f16): it also writes the matmul's f16 B operand into prealloc_y
+    std::unordered_set<const ggml_tensor *> norm_to_f16;
     // SWIGLU done in the epilogue of the later of its two mul_mm_rdna4 inputs (key), which writes the f16
     // result into the GLU tensor's own buffer; the consuming matmul reads its B from there
     struct vk_swiglu_epi {

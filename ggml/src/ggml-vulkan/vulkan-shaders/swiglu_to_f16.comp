@@ -4,8 +4,9 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// SwiGLU of two contiguous f32 tensors, written as f16 into the B staging buffer of the consuming
-// mul_mm_rdna4 matmul, and as f32 unless nothing else reads it. Same expression as swiglu.comp. One
+// SwiGLU (OP_MUL: the product) of two contiguous f32 tensors, written as f16 into the B staging buffer of the
+// consuming mul_mm_rdna4 / mul_mmv_rdna4 matmul, and as f32 unless nothing else reads it. Same expression as
+// swiglu.comp (mul.comp). One
 // workgroup per row; the f16 rows are followed by a scale per row, as b_to_f16_rowscale.comp writes them
 // (a row that would overflow f16 is stored times 2^-e and gets the scale 2^e, every other row the scale 1).
 
@@ -28,9 +29,16 @@ const float F16_OVERFLOW = 65520.0;
 
 shared float smax[256];
 
+#if OP_MUL
+// mul.comp's expression (mul_to_f16: the B operand of a skinny matmul on the product of two tensors)
+float op(float a, float b) {
+    return a * b;
+}
+#else
 float op(float a, float b) {
     return a / (1.0f + exp(-a)) * b;
 }
+#endif
 
 vec4 op4(const uint i) {
     const vec4 g = data_g[i];

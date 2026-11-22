@@ -1929,6 +1929,20 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                  bool   cached) const {
     ggml_tensor * w_s = model.get_w_scale(w);
 
+    // the per-expert scale of the selected experts, gathered before the matmul so that the scaling MUL
+    // directly follows it in the graph (the backends fuse MUL_MAT_ID + MUL)
+    ggml_tensor * s = nullptr;
+    if (w_s) {
+        const int64_t n_expert = w_s->ne[0];
+        const int64_t n_tokens = cur->ne[2];
+        s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+        if (n_tokens > 1) {
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        }
+        s = ggml_get_rows(ctx0, s, ids);
+        ggml_build_forward_expand(gf, s);
+    }
+
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
@@ -1943,14 +1957,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // after the NVFP4 default, so that the policy can request a higher precision
     prec_policy.apply(res);
 
-    if (w_s) {
-        const int64_t n_expert = w_s->ne[0];
-        const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        if (n_tokens > 1) {
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        }
-        s = ggml_get_rows(ctx0, s, ids);
+    if (s) {
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {

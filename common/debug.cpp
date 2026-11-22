@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstring>
+#include <cctype>
 #include <regex>
 #include <string>
 #include <vector>
@@ -184,6 +186,36 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+
+        // LLAMA_DEBUG_DUMP_DIR=dir: also write each named tensor as f32 [ne0, ne1, ne2, ne3] to dir/<n>_<name>.f32
+        static const char * dump_dir = getenv("LLAMA_DEBUG_DUMP_DIR");
+        static int          dump_idx = 0;
+        if (dump_dir && strncmp(t->name, "node_", 5) != 0) {
+            std::string name = t->name;
+            for (char & c : name) {
+                if (!isalnum((unsigned char) c) && c != '-' && c != '_') {
+                    c = '_';
+                }
+            }
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%06d_%s.f32", dump_dir, dump_idx++, name.c_str());
+            FILE * f = fopen(path, "wb");
+            if (f) {
+                const int32_t ne32[4] = { (int32_t) t->ne[0], (int32_t) t->ne[1], (int32_t) t->ne[2], (int32_t) t->ne[3] };
+                fwrite(ne32, sizeof(ne32), 1, f);
+                for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+                    for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                        for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                            for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
+                                const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
+                                fwrite(&v, sizeof(v), 1, f);
+                            }
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
     }
 
     return true;

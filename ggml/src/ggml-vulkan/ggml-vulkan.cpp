@@ -16901,21 +16901,24 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     static const bool disabled     = true;
     static const bool glu_disabled = getenv("GGML_VK_DISABLE_GLU_F16") != nullptr;
 
-    bool any = false, any_glu = false;
+    // this runs before the first submit of every graph: the use counts below are only built when a node needs them
+    bool any = false, any_glu = false, any_swiglu = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        any     |= !disabled && cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
-        any_glu |= !glu_disabled && (cgraph->nodes[i]->op == GGML_OP_GLU || cgraph->nodes[i]->op == GGML_OP_MUL);
+        const ggml_tensor * n = cgraph->nodes[i];
+        any        |= !disabled && n->op == GGML_OP_GATED_DELTA_NET;
+        any_glu    |= !glu_disabled && (n->op == GGML_OP_GLU || n->op == GGML_OP_MUL);
+        any_swiglu |= !glu_disabled && n->op == GGML_OP_GLU && ggml_get_glu_op(n) == GGML_GLU_OP_SWIGLU;
     }
     if (!any && !any_glu) {
         return;
     }
 
     // use counts (only for the op types checked below) and the (node, src slot) uses of each GDN
-    // result and its views, in graph order
+    // result and its views, in graph order; the SwiGLU of ggml_vk_find_glu_to_f16 needs the counts of GLU results
     std::unordered_map<const ggml_tensor *, int> uses;
     std::unordered_map<const ggml_tensor *, int> all_uses;   // every consumer (gate fusion)
     std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, int>>> gdn_uses;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
+    for (int i = 0; (any || any_swiglu) && i < cgraph->n_nodes; i++) {
         const ggml_tensor * n = cgraph->nodes[i];
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             const ggml_tensor * s = n->src[j];
@@ -19250,7 +19253,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                if (ggml_get_op_params_i32(op, 1) != 0 && (op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32)) {
+                // the lazy variant (ggml_gated_delta_net_lazy) is not ported to the current GDN shader yet
+                if (ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
                 return op->type == GGML_TYPE_F32;

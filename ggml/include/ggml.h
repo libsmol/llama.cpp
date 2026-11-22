@@ -415,6 +415,15 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_CLIP_NORM,
+        GGML_OP_SHORT_CONV,
+        GGML_OP_RES_MIX,
+        GGML_OP_LOOP_GATE,
+        GGML_OP_REL_BIAS_MASK,
+        GGML_OP_LOOP_DOWN,
+        GGML_OP_LOOP_UP,
+        GGML_OP_SHORT_CONV_RS,
+        GGML_OP_ROT_GATE,
 
         GGML_OP_UNARY,
 
@@ -473,6 +482,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1212,6 +1222,142 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 limit);
+
+    // situ(g, u) = beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
+    // b == NULL: g is the first half of a's rows and u the second half
+    GGML_API struct ggml_tensor * ggml_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 lb);
+
+    // row-wise (ne0) norm clip: x = a*s, out = x * min(1, max_norm/(||x|| + eps)) * c
+    // s: NULL or a per-channel scale broadcastable to a
+    // c: NULL or a per-row multiplier (c->ne[0] == 1) broadcastable to a
+    GGML_API struct ggml_tensor * ggml_clip_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * c,
+            float                 max_norm,
+            float                 eps);
+
+    // ggml_clip_norm (rms = false) or an RMS norm x/sqrt(mean(x^2) + eps) (rms = true), followed by the
+    // orthonormal Walsh-Hadamard rotation of each n_rot block of the row (n_rot = 0: none, else a power of 2)
+    GGML_API struct ggml_tensor * ggml_norm_rot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * c,
+            bool                  rms,
+            float                 max_norm,
+            float                 eps,
+            int                   n_rot);
+
+    // attention output gate: out = H(a)*sigmoid(g), H the Walsh-Hadamard rotation of each n_rot block (n_rot = 0: none)
+    GGML_API struct ggml_tensor * ggml_rot_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * g,
+            int                   n_rot);
+
+    // causal short convolution with a residual
+    // x: [n_conv - 1 + n_t, C, n_s] (the past n_conv - 1 inputs, then the n_t current ones), w: [n_conv, C]
+    // d: NULL or input-dependent taps [n_conv*H, n_t*n_s], C/H channels per head
+    // out: [C, n_t, n_s] = scale*(x[t + n_conv - 1] + sum_k x[t + k]*w[k] + sum_l x[t + n_conv - 1 - l]*d[l, h])
+    GGML_API struct ggml_tensor * ggml_short_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * d,
+            float                 scale);
+
+    // block attention residual mix, per token t and query q (q: [n_embd, n_q], states: n_states x [n_embd, n_tokens]):
+    // r_s = rms_norm(s, eps), w_qs = softmax_s(scale*(q . r_s)), out: [n_embd, n_tokens, n_q] = sum_s w_qs*r_s
+    GGML_API struct ggml_tensor * ggml_res_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor ** states,
+            int                   n_states,
+            float                 eps,
+            float                 scale);
+
+    // per-head attention mask with a relative-position bias and a per-query sink:
+    //   mask: [n_kv, n_rows] (F16/F32), bias: [n_rel, extent], r: [n_rel, n_head, n_rows], sinks: NULL or [n_head, n_rows],
+    //   q_pos: I32 [n_rows], kv_pos: I32 [n_kv]; d = q_pos[i] - kv_pos[j]
+    //   out: F16 [n_kv, n_rows, n_head] = mask[j, i] + (0 <= d < extent ? bias[:, d] . r[:, h, i] : 0) - sinks[h, i], in F32
+    GGML_API struct ggml_tensor * ggml_rel_bias_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * kv_pos);
+
+    // ggml_rel_bias_mask with r first clipped as ggml_clip_norm(r, rs, tau, max_norm, 1e-6)
+    // rs: [n_rel, n_head] or NULL, tau: [1, 1, n_rows] or NULL
+    GGML_API struct ggml_tensor * ggml_rel_bias_mask_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * rs,
+            struct ggml_tensor  * tau,
+            float                 max_norm,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * kv_pos);
+
+    // loop message controller, matrix-vector form for short batches:
+    //   ggml_loop_down: h = w_down*[rms_norm(a); rms_norm(m)], a, m: [n_embd, n_t], w_down: [2*n_embd, n_rank] -> h: [n_rank, n_t]
+    //   ggml_loop_up:   out = (1 - tanh(w_f*h))*a + tanh(w_g*h)*m, w_g, w_f: [n_rank, n_embd]
+    GGML_API struct ggml_tensor * ggml_loop_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * w_down,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_loop_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * h,
+            struct ggml_tensor  * w_g,
+            struct ggml_tensor  * w_f);
+
+    // ggml_short_conv reading the past inputs from the recurrent state and storing the new ones:
+    //   cur: [C, n_t*n_s], past: [n_conv - 1, C, n_s], state: [(n_conv - 1)*C, n_s] (written, may alias past's source)
+    //   out: [C, n_t, n_s]; state[k + c*(n_conv - 1), s] = the k-th of the last n_conv - 1 inputs of channel c
+    GGML_API struct ggml_tensor * ggml_short_conv_rs(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * d,
+            struct ggml_tensor  * state,
+            float                 scale);
+
+    // ggml_short_conv_rs(...) + res, res: [C, n_t*n_s]
+    GGML_API struct ggml_tensor * ggml_short_conv_rs_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * d,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * res,
+            float                 scale);
+
+    // loop message controller: out = (1 - tanh(f))*a + tanh(g)*m, all of the same shape
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * f);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

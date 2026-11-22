@@ -1,0 +1,61 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// out = H(a)*sigmoid(g), H the orthonormal Walsh-Hadamard rotation of each n_rot block
+// one workgroup per (block, row); without a rotation a block is 1024 elements
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_BLOCK 1024
+
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer G {float data_g[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne0, ne1, nba1, nbg1;
+    uint a_offset, g_offset, d_offset, n_rot;
+} p;
+
+shared float blk[MAX_BLOCK];
+
+void main() {
+    const uint ib  = gl_WorkGroupID.x;
+    const uint ir  = gl_WorkGroupID.y + gl_WorkGroupID.z*65535u;
+    const uint tid = gl_LocalInvocationID.x;
+    if (ir >= p.ne1) {
+        return;
+    }
+    const uint bs = p.n_rot > 0 ? p.n_rot : MAX_BLOCK;
+    const uint i0 = ib*bs;
+    const uint n  = min(bs, p.ne0 - i0);
+    const uint ab = p.a_offset + ir*p.nba1 + i0;
+    const uint gb = p.g_offset + ir*p.nbg1 + i0;
+    const uint db = p.d_offset + ir*p.ne0 + i0;
+
+    if (p.n_rot == 0) {
+        for (uint k = tid; k < n; k += 64) {
+            data_d[db + k] = data_a[ab + k]/(1.0 + exp(-data_g[gb + k]));
+        }
+        return;
+    }
+
+    for (uint k = tid; k < n; k += 64) {
+        blk[k] = data_a[ab + k];
+    }
+    barrier();
+    for (uint len = 1; len < n; len <<= 1) {
+        for (uint q = tid; q < n/2; q += 64) {
+            const uint j = (q/len)*2*len + (q % len);
+            const float u = blk[j];
+            const float v = blk[j + len];
+            blk[j]       = u + v;
+            blk[j + len] = u - v;
+        }
+        barrier();
+    }
+    const float sc = inversesqrt(float(n));
+    for (uint k = tid; k < n; k += 64) {
+        data_d[db + k] = blk[k]*sc/(1.0 + exp(-data_g[gb + k]));
+    }
+}

@@ -1,0 +1,44 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// causal short convolution with a residual and optional input-dependent taps, one invocation per output
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X {float data_x[];};
+layout (binding = 1) readonly  buffer W {float data_w[];};
+layout (binding = 2) readonly  buffer T {float data_t[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n_conv, n_ch, n_t, n_s;
+    uint nbx1, nbx2, nbw1, nbd1;
+    uint ch_per_head, has_d;
+    uint x_offset, w_offset, d_offset, dst_offset;
+    float scale;
+} p;
+
+void main() {
+    const uint ic = gl_GlobalInvocationID.x;
+    const uint it = gl_GlobalInvocationID.y;
+    const uint is = gl_GlobalInvocationID.z;
+    if (ic >= p.n_ch || it >= p.n_t || is >= p.n_s) {
+        return;
+    }
+
+    const uint xb = p.x_offset + ic*p.nbx1 + is*p.nbx2 + it;
+    const uint wb = p.w_offset + ic*p.nbw1;
+
+    float acc = data_x[xb + p.n_conv - 1];
+    for (uint k = 0; k < p.n_conv; ++k) {
+        acc += data_x[xb + k]*data_w[wb + k];
+    }
+    if (p.has_d != 0) {
+        const uint tb = p.d_offset + (is*p.n_t + it)*p.nbd1 + (ic/p.ch_per_head)*p.n_conv;
+        for (uint l = 0; l < p.n_conv; ++l) {
+            acc += data_x[xb + p.n_conv - 1 - l]*data_t[tb + l];
+        }
+    }
+
+    data_d[p.dst_offset + ic + (it + is*p.n_t)*p.n_ch] = acc*p.scale;
+}

@@ -233,6 +233,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #endif // GGML_VULKAN_DEBUG
 
 #define MAX_PARAMETER_COUNT 12
+#define VK_RES_MIX_MAX_STATES 9
+#define VK_RES_MIX_MAX_Q 4
 
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
 
@@ -994,6 +996,15 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
+    vk_pipeline pipeline_clip_norm_f32;
+    vk_pipeline pipeline_short_conv_f32;
+    vk_pipeline pipeline_res_mix_f32[VK_RES_MIX_MAX_STATES][VK_RES_MIX_MAX_Q];
+    vk_pipeline pipeline_loop_gate_f32;
+    vk_pipeline pipeline_rel_bias_mask[2]; // mask F16, F32
+    vk_pipeline pipeline_loop_down_f32;
+    vk_pipeline pipeline_loop_up_f32;
+    vk_pipeline pipeline_rot_gate_f32;
+    vk_pipeline pipeline_short_conv_rs_f32[9]; // by n_conv
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;

@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// short convolution over [past; cur], one invocation per (channel, token, sequence); the invocations of the last
+// n_conv - 1 tokens store them as the new past (past must not alias state)
+layout (constant_id = 0) const uint N_CONV = 4;
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer C  {float data_c[];};
+layout (binding = 1) readonly  buffer P  {float data_p[];};
+layout (binding = 2) readonly  buffer W  {float data_w[];};
+layout (binding = 3) readonly  buffer T  {float data_t[];};
+layout (binding = 4) writeonly buffer S  {float data_s[];};
+layout (binding = 5) writeonly buffer D  {float data_d[];};
+layout (binding = 6) readonly  buffer RS {float data_r[];};
+
+layout (push_constant) uniform parameter {
+    uint n_conv, n_ch, n_t, n_s;
+    uint nbc1, nbp1, nbp2, nbw1, nbd1, nbs1;
+    uint ch_per_head, has_d;
+    uint c_offset, p_offset, w_offset, t_offset, s_offset, d_offset;
+    float scale;
+    uint has_r, nbr1, r_offset;
+} p;
+
+void main() {
+    const uint ic = gl_GlobalInvocationID.x;
+    const uint it = gl_GlobalInvocationID.y;
+    const uint is = gl_GlobalInvocationID.z;
+    if (ic >= p.n_ch) {
+        return;
+    }
+
+    const uint nc1 = N_CONV - 1;
+    const uint pb  = p.p_offset + ic*p.nbp1 + is*p.nbp2;
+    const uint tok = is*p.n_t + it;
+
+    // xs[k] = input at t - nc1 + k
+    float xs[N_CONV];
+    [[unroll]] for (uint k = 0; k < N_CONV; ++k) {
+        const int tt = int(it) - int(nc1) + int(k);
+        xs[k] = tt >= 0 ? data_c[p.c_offset + (is*p.n_t + uint(tt))*p.nbc1 + ic] : data_p[pb + uint(int(nc1) + tt)];
+    }
+
+    float acc = xs[nc1];
+    [[unroll]] for (uint k = 0; k < N_CONV; ++k) {
+        acc += xs[k]*data_w[p.w_offset + ic*p.nbw1 + k];
+    }
+    if (p.has_d != 0) {
+        const uint tb = p.t_offset + tok*p.nbd1 + (ic/p.ch_per_head)*N_CONV;
+        [[unroll]] for (uint l = 0; l < N_CONV; ++l) {
+            acc += xs[nc1 - l]*data_t[tb + l];
+        }
+    }
+    data_d[p.d_offset + ic + tok*p.n_ch] = acc*p.scale + (p.has_r != 0 ? data_r[p.r_offset + tok*p.nbr1 + ic] : 0.0);
+
+    // the new past: the last nc1 inputs of [past; cur]
+    const uint sb = p.s_offset + is*p.nbs1 + ic*nc1;
+    if (it + nc1 >= p.n_t) {
+        data_s[sb + (it + nc1 - p.n_t)] = xs[nc1];
+    }
+    if (it == 0 && p.n_t < nc1) {
+        for (uint k = 0; k < nc1 - p.n_t; ++k) {
+            data_s[sb + k] = data_p[pb + p.n_t + k];
+        }
+    }
+}

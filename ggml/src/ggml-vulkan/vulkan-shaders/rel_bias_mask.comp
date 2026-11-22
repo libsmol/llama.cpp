@@ -1,0 +1,97 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// per-head attention mask with a relative-position bias and a per-query sink, one invocation per (cell, row, HB heads)
+// the bias of distance d is bias[:, d] . r[:, h, i], in F32; r is optionally clipped first (as ggml_clip_norm, with a
+// per-channel scale rs and a per-row multiplier tau)
+#define MAX_REL 16
+#define HB 4
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer M  {MASK_TYPE data_m[];};
+layout (binding = 1) readonly  buffer B  {float data_b[];};
+layout (binding = 2) readonly  buffer S  {float data_s[];};
+layout (binding = 3) readonly  buffer QP {int data_qp[];};
+layout (binding = 4) readonly  buffer KP {int data_kp[];};
+layout (binding = 5) readonly  buffer R  {float data_r[];};
+layout (binding = 6) writeonly buffer D  {float16_t data_d[];};
+layout (binding = 7) readonly  buffer RS {float data_rs[];};
+layout (binding = 8) readonly  buffer TU {float data_tau[];};
+
+layout (push_constant) uniform parameter {
+    uint n_kv, n_rows, n_head, extent, n_rel;
+    uint nbm1, nbr1, nbr2, nbs0, nbs1, has_s;
+    uint m_offset, b_offset, s_offset, qp_offset, kp_offset, r_offset, d_offset;
+    uint clip, nbrs1, rs_offset, has_tau, tau_offset;
+    float max_norm;
+} p;
+
+shared float rsh[HB*MAX_REL];
+shared float ssh[HB];
+shared float fsh[HB];
+
+void main() {
+    const uint j  = gl_GlobalInvocationID.x;
+    const uint i  = gl_GlobalInvocationID.y;
+    const uint h0 = gl_WorkGroupID.z*HB;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nh = min(HB, p.n_head - h0);
+
+    if (tid < nh*p.n_rel) {
+        const uint hh = tid/p.n_rel;
+        const uint k  = tid - hh*p.n_rel;
+        float x = data_r[p.r_offset + (h0 + hh)*p.nbr1 + i*p.nbr2 + k];
+        if (p.clip != 0) {
+            x *= data_rs[p.rs_offset + (h0 + hh)*p.nbrs1 + k];
+        }
+        rsh[tid] = x;
+    }
+    barrier();
+    if (tid < nh) {
+        float f = 1.0;
+        if (p.clip != 0) {
+            float ss = 0.0;
+            for (uint k = 0; k < p.n_rel; ++k) {
+                ss += rsh[tid*p.n_rel + k]*rsh[tid*p.n_rel + k];
+            }
+            f = min(p.max_norm/(sqrt(ss) + 1e-6), 1.0);
+            if (p.has_tau != 0) {
+                f *= data_tau[p.tau_offset + i];
+            }
+        }
+        fsh[tid] = f;
+        ssh[tid] = p.has_s != 0 ? data_s[p.s_offset + (h0 + tid)*p.nbs0 + i*p.nbs1] : 0.0;
+    }
+    barrier();
+
+    if (j >= p.n_kv) {
+        return;
+    }
+
+    const float m = float(data_m[p.m_offset + i*p.nbm1 + j]);
+    const int d = data_qp[p.qp_offset + i] - data_kp[p.kp_offset + j];
+    const bool in_band = d >= 0 && uint(d) < p.extent;
+
+    float bv[MAX_REL];
+    [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
+        bv[k] = in_band && k < p.n_rel ? data_b[p.b_offset + uint(d)*p.n_rel + k] : 0.0;
+    }
+
+    const uint hs = p.n_kv*p.n_rows;
+    const uint db = p.d_offset + j + p.n_kv*i + h0*hs;
+    [[unroll]] for (uint hh = 0; hh < HB; ++hh) {
+        if (hh < nh) {
+            float t = 0.0;
+            if (in_band) {
+                [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
+                    if (k < p.n_rel) {
+                        t += bv[k]*rsh[hh*p.n_rel + k];
+                    }
+                }
+            }
+            data_d[db + hh*hs] = float16_t(m + t*fsh[hh] - ssh[hh]);
+        }
+    }
+}

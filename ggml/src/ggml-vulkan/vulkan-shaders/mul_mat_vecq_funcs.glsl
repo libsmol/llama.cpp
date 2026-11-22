@@ -192,6 +192,30 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_NVFP4)
+// ib: 32-element unit (half of an nvfp4 block), iqs: 8-element group of it
+// a 16-element sub-block keeps elements 0..7 in the low and 8..15 in the high nibbles of its 8 bytes
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib    = ib_a >> 1;
+    const uint sub   = ((ib_a & 1u) << 1) | (iqs >> 1);
+    const uint shift = (iqs & 1u) << 2;
+
+    const uint32_t q0 = (data_a_packed32[ib].qs[sub*2u    ] >> shift) & 0x0F0F0F0Fu;
+    const uint32_t q1 = (data_a_packed32[ib].qs[sub*2u + 1u] >> shift) & 0x0F0F0F0Fu;
+
+    const u8vec4 i0 = unpack8(q0);
+    const u8vec4 i1 = unpack8(q1);
+
+    const int32_t a0 = pack32(i8vec4(kvalues_mxfp4[i0.x], kvalues_mxfp4[i0.y], kvalues_mxfp4[i0.z], kvalues_mxfp4[i0.w]));
+    const int32_t a1 = pack32(i8vec4(kvalues_mxfp4[i1.x], kvalues_mxfp4[i1.y], kvalues_mxfp4[i1.z], kvalues_mxfp4[i1.w]));
+
+    const int32_t q_sum = dotPacked4x8EXT(a0, cache_b_qs[0]) + dotPacked4x8EXT(a1, cache_b_qs[1]);
+
+    // kvalues are twice the e2m1 values
+    return FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].d[sub]) * cache_b_ds.x * float(q_sum) * 0.5);
+}
+#endif
+
 #if defined(DATA_A_Q2_K)
 // 4-byte loads for Q2_K blocks (84 bytes)
 i32vec4 repack4(uint ib, uint iqs) {

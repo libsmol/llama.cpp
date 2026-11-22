@@ -1,0 +1,65 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// h[r, t] = w[:, r] . [rms_norm(a[:, t]); rms_norm(m[:, t])], one workgroup per (r, t)
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer M {float data_m[];};
+layout (binding = 2) readonly  buffer W {float data_w[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n_embd, n_rank, n_t;
+    uint nba1, nbm1, nbw1, nbd1;
+    uint a_offset, m_offset, w_offset, d_offset;
+    float eps;
+} p;
+
+shared float red[4*32];
+
+void main() {
+    const uint r   = gl_WorkGroupID.x;
+    const uint it  = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint ab = p.a_offset + it*p.nba1;
+    const uint mb = p.m_offset + it*p.nbm1;
+    const uint wb = p.w_offset + r*p.nbw1;
+
+    float sa = 0.0, sm = 0.0, da = 0.0, dm = 0.0;
+    for (uint i = tid; i < p.n_embd; i += BLOCK_SIZE) {
+        const float av = data_a[ab + i];
+        const float mv = data_m[mb + i];
+        sa += av*av;
+        sm += mv*mv;
+        da += data_w[wb + i]*av;
+        dm += data_w[wb + p.n_embd + i]*mv;
+    }
+    sa = subgroupAdd(sa);
+    sm = subgroupAdd(sm);
+    da = subgroupAdd(da);
+    dm = subgroupAdd(dm);
+    if (subgroupElect()) {
+        red[0*32 + gl_SubgroupID] = sa;
+        red[1*32 + gl_SubgroupID] = sm;
+        red[2*32 + gl_SubgroupID] = da;
+        red[3*32 + gl_SubgroupID] = dm;
+    }
+    barrier();
+    if (tid == 0) {
+        float v[4] = {0.0, 0.0, 0.0, 0.0};
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                v[k] += red[k*32 + g];
+            }
+        }
+        const float ia = inversesqrt(v[0]/float(p.n_embd) + p.eps);
+        const float im = inversesqrt(v[1]/float(p.n_embd) + p.eps);
+        data_d[p.d_offset + it*p.nbd1 + r] = v[2]*ia + v[3]*im;
+    }
+}

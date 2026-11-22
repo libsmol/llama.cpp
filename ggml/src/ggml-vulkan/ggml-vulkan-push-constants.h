@@ -232,6 +232,74 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_clip_norm_push_constants {
+    uint32_t ne0, ne1, ne2, ne3;
+    uint32_t nba1, nba2, nba3;
+    uint32_t nes1, nes2, nes3, nbs1, nbs2, nbs3;
+    uint32_t nec1, nec2, nec3, nbc1, nbc2, nbc3;
+    uint32_t has_s, has_c;
+    uint32_t a_offset, s_offset, c_offset, d_offset;
+    float max_norm, eps;
+    uint32_t n_rot, rms;
+};
+
+struct vk_op_rot_gate_push_constants {
+    uint32_t ne0, ne1, nba1, nbg1;
+    uint32_t a_offset, g_offset, d_offset, n_rot;
+};
+
+struct vk_op_short_conv_push_constants {
+    uint32_t n_conv, n_ch, n_t, n_s;
+    uint32_t nbx1, nbx2, nbw1, nbd1;
+    uint32_t ch_per_head, has_d;
+    uint32_t x_offset, w_offset, d_offset, dst_offset;
+    float scale;
+};
+
+struct vk_op_res_mix_push_constants {
+    uint32_t n_embd, n_q, n_states, n_tokens;
+    uint32_t nbq1, q_offset, d_offset;
+    uint32_t nbs1[VK_RES_MIX_MAX_STATES];
+    uint32_t s_offset[VK_RES_MIX_MAX_STATES];
+    float eps, scale;
+};
+
+struct vk_op_rel_bias_mask_push_constants {
+    uint32_t n_kv, n_rows, n_head, extent, n_rel;
+    uint32_t nbm1, nbr1, nbr2, nbs0, nbs1, has_s;
+    uint32_t m_offset, b_offset, s_offset, qp_offset, kp_offset, r_offset, d_offset;
+    uint32_t clip, nbrs1, rs_offset, has_tau, tau_offset;
+    float max_norm;
+};
+
+struct vk_op_loop_down_push_constants {
+    uint32_t n_embd, n_rank, n_t;
+    uint32_t nba1, nbm1, nbw1, nbd1;
+    uint32_t a_offset, m_offset, w_offset, d_offset;
+    float eps;
+};
+
+struct vk_op_loop_up_push_constants {
+    uint32_t n_embd, n_rank, n_t;
+    uint32_t nba1, nbm1, nbh1, nbw1;
+    uint32_t a_offset, m_offset, h_offset, wg_offset, wf_offset, d_offset;
+};
+
+struct vk_op_short_conv_rs_push_constants {
+    uint32_t n_conv, n_ch, n_t, n_s;
+    uint32_t nbc1, nbp1, nbp2, nbw1, nbd1, nbs1;
+    uint32_t ch_per_head, has_d;
+    uint32_t c_offset, p_offset, w_offset, t_offset, s_offset, d_offset;
+    float scale;
+    uint32_t has_r, nbr1, r_offset;
+};
+
+struct vk_op_loop_gate_push_constants {
+    uint32_t ne0, ne1;
+    uint32_t nba1, nbm1, nbg1, nbf1;
+    uint32_t a_offset, m_offset, g_offset, f_offset, d_offset;
+};
+
 struct vk_op_dsv4_hc_post_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

@@ -2151,6 +2151,42 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_CLIP_NORM:
+            {
+                ggml_compute_forward_clip_norm(params, tensor);
+            } break;
+        case GGML_OP_SHORT_CONV:
+            {
+                ggml_compute_forward_short_conv(params, tensor);
+            } break;
+        case GGML_OP_RES_MIX:
+            {
+                ggml_compute_forward_res_mix(params, tensor);
+            } break;
+        case GGML_OP_LOOP_GATE:
+            {
+                ggml_compute_forward_loop_gate(params, tensor);
+            } break;
+        case GGML_OP_REL_BIAS_MASK:
+            {
+                ggml_compute_forward_rel_bias_mask(params, tensor);
+            } break;
+        case GGML_OP_LOOP_DOWN:
+            {
+                ggml_compute_forward_loop_down(params, tensor);
+            } break;
+        case GGML_OP_LOOP_UP:
+            {
+                ggml_compute_forward_loop_up(params, tensor);
+            } break;
+        case GGML_OP_SHORT_CONV_RS:
+            {
+                ggml_compute_forward_short_conv_rs(params, tensor);
+            } break;
+        case GGML_OP_ROT_GATE:
+            {
+                ggml_compute_forward_rot_gate(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2334,6 +2370,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_CLIP_NORM:
+        case GGML_OP_SHORT_CONV:
+        case GGML_OP_RES_MIX:
+        case GGML_OP_LOOP_GATE:
+        case GGML_OP_REL_BIAS_MASK:
+        case GGML_OP_LOOP_DOWN:
+        case GGML_OP_LOOP_UP:
+        case GGML_OP_SHORT_CONV_RS:
+        case GGML_OP_ROT_GATE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2388,6 +2433,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;

@@ -1,0 +1,100 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// row-wise norm: x = a*s, then clip (x*min(1, max_norm/(|x| + eps))) or rms (x/sqrt(mean(x^2) + eps)),
+// times c, after an optional orthonormal Walsh-Hadamard rotation of each n_rot block; one workgroup per row
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_ROW 1024
+
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer S {float data_s[];};
+layout (binding = 2) readonly  buffer C {float data_c[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne0, ne1, ne2, ne3;
+    uint nba1, nba2, nba3;
+    uint nes1, nes2, nes3, nbs1, nbs2, nbs3;
+    uint nec1, nec2, nec3, nbc1, nbc2, nbc3;
+    uint has_s, has_c;
+    uint a_offset, s_offset, c_offset, d_offset;
+    float max_norm, eps;
+    uint n_rot, rms;
+} p;
+
+shared float sumsh[BLOCK_SIZE];
+shared float row[MAX_ROW];
+
+void main() {
+    const uint ir = gl_WorkGroupID.z*262144u + gl_WorkGroupID.y*512u + gl_WorkGroupID.x;
+    if (ir >= p.ne1*p.ne2*p.ne3) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint i1 = ir % p.ne1;
+    const uint i2 = (ir/p.ne1) % p.ne2;
+    const uint i3 = ir/(p.ne1*p.ne2);
+
+    const uint ab = p.a_offset + i1*p.nba1 + i2*p.nba2 + i3*p.nba3;
+    const uint sb = p.s_offset + (i1 % p.nes1)*p.nbs1 + (i2 % p.nes2)*p.nbs2 + (i3 % p.nes3)*p.nbs3;
+
+    const bool rot = p.n_rot > 0;
+
+    float sum = 0.0;
+    for (uint i0 = tid; i0 < p.ne0; i0 += BLOCK_SIZE) {
+        float x = data_a[ab + i0];
+        if (p.has_s != 0) {
+            x *= data_s[sb + i0];
+        }
+        sum += x*x;
+        if (rot) {
+            row[i0] = x;
+        }
+    }
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sumsh[tid] += sumsh[tid + s];
+        }
+        barrier();
+    }
+
+    float factor = p.rms != 0 ? inversesqrt(sumsh[0]/float(p.ne0) + p.eps) : min(p.max_norm/(sqrt(sumsh[0]) + p.eps), 1.0);
+    if (p.has_c != 0) {
+        factor *= data_c[p.c_offset + (i1 % p.nec1)*p.nbc1 + (i2 % p.nec2)*p.nbc2 + (i3 % p.nec3)*p.nbc3];
+    }
+
+    const uint db = p.d_offset + ir*p.ne0;
+    if (rot) {
+        // butterflies of the blocks of n_rot, Sylvester order
+        for (uint len = 1; len < p.n_rot; len <<= 1) {
+            for (uint k = tid; k < p.ne0/2; k += BLOCK_SIZE) {
+                const uint blk = k/(p.n_rot/2);
+                const uint q   = k % (p.n_rot/2);
+                const uint j   = blk*p.n_rot + (q/len)*2*len + (q % len);
+                const float u = row[j];
+                const float v = row[j + len];
+                row[j]       = u + v;
+                row[j + len] = u - v;
+            }
+            barrier();
+        }
+        factor *= inversesqrt(float(p.n_rot));
+        for (uint i0 = tid; i0 < p.ne0; i0 += BLOCK_SIZE) {
+            data_d[db + i0] = row[i0]*factor;
+        }
+    } else {
+        for (uint i0 = tid; i0 < p.ne0; i0 += BLOCK_SIZE) {
+            float x = data_a[ab + i0];
+            if (p.has_s != 0) {
+                x *= data_s[sb + i0];
+            }
+            data_d[db + i0] = x*factor;
+        }
+    }
+}

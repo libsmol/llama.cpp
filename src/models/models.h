@@ -2519,8 +2519,12 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
+        // fused: [n_embd, n_tokens, n_query], else [n_embd, n_query, n_tokens]; mix_row(mixed, j) is query j as [n_embd, n_tokens]
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * mix_row(ggml_tensor * mixed, int64_t j);
+        // post: optional per-row multiplier after the clip
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * post = nullptr);
+        // residual: optional input added to the output
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
@@ -2528,8 +2532,13 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
+                int64_t offset,
+                ggml_tensor * residual = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+
+        // LLAMA_INKLING_LEGACY: the plain op chains; LLAMA_INKLING_FUSE_OFF=a,b,...: single fusions off (A/B checks)
+        const bool fused = getenv("LLAMA_INKLING_LEGACY") == nullptr;
+        bool fuse(const char * name) const;
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2548,6 +2557,7 @@ struct llama_model_inkling2 : public llama_model_base {
         llm_graph_input_rs                  * recr = nullptr;
 
         ggml_tensor * inp_out_ids = nullptr;
+        ggml_tensor * inp_pos     = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
     };
 

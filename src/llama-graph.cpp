@@ -1418,6 +1418,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    if (self_kv_pos && self_kv_pos->buffer) {
+        attn_ctx->get_base()->set_input_kv_pos(self_kv_pos, ubatch);
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1430,6 +1434,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (self_kv_pos_swa && self_kv_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_kv_pos(self_kv_pos_swa, ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1475,6 +1483,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    res &= self_kv_pos->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= self_kv_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1913,7 +1924,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        if (n_tokens > 1) {
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        }
         s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
@@ -2473,6 +2486,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (arch == LLM_ARCH_DEEPSEEK41) {
             // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else if ((arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) && hparams.expert_weights_norm_eps > 0.0f) {
+            // sum + eps == max(sum, eps) in F32 for any sum the sigmoid router reaches; the clamp form matches the fused top-k MoE
+            weights_sum = ggml_clamp(ctx0, weights_sum, hparams.expert_weights_norm_eps, INFINITY);
         } else if (hparams.expert_weights_norm_eps > 0.0f) {
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
         } else {
@@ -2607,12 +2623,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    ggml_tensor * gu = cur->view_src;
+                    const bool merged = gu != nullptr && up->view_src == gu && cur->view_offs == 0 &&
+                        up->view_offs == (size_t) cur->ne[0]*ggml_element_size(cur) && gu->ne[0] == 2*cur->ne[0] &&
+                        ggml_are_same_shape(cur, up) && cur->ne[1] == gu->ne[1] && cur->ne[2] == gu->ne[2];
+                    cur = merged ? ggml_situ(ctx0, gu, nullptr, beta, lb) : ggml_situ(ctx0, ggml_cont(ctx0, cur), ggml_cont(ctx0, up), beta, lb);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -3691,7 +3706,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) {
+            int       il,
+           bool       pre_rotated = false) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3700,8 +3716,8 @@ static ggml_tensor * build_attn_iswa_impl(
 
     const bool is_swa = hparams.is_swa(il);
 
-    auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
-    auto * v_rot = is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il];
+    auto * k_rot = pre_rotated ? nullptr : (is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il]);
+    auto * v_rot = pre_rotated ? nullptr : (is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il]);
 
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
@@ -4382,6 +4398,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+    ggml_set_input(inp->self_kv_pos);
+    ggml_set_name(inp->self_kv_pos, "attn_inp_kv_pos");
+
+    inp->self_kv_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+    ggml_set_input(inp->self_kv_pos_swa);
+    ggml_set_name(inp->self_kv_pos_swa, "attn_inp_kv_pos_swa");
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4419,6 +4443,19 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+}
+
+ggml_tensor * llm_graph_context::build_attn_masked(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+               bool   pre_rotated) const {
+    return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il, pre_rotated);
 }
 
 void llm_graph_context::build_dense_out(

@@ -250,6 +250,8 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // position of each K/V cell of the stream of the ubatch, INT32_MIN for the empty cells
+    void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -419,6 +421,7 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
+    uint32_t get_size() const; // the cells of the cache
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -455,6 +458,8 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // position of each K/V cell of the stream of the ubatch, INT32_MIN for the empty cells
+    void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

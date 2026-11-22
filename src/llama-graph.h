@@ -807,6 +807,13 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // position of each cell, INT32_MIN for the empty ones (the fused rel-bias mask path)
+    ggml_tensor * self_kv_pos     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa]
+
+    // all-zero sinks of the fused rel-bias mask path, made once per graph
+    ggml_tensor * zero_sinks = nullptr;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1547,6 +1554,18 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il) const;
+
+    // kq_mask is the final per-head mask (see ggml_rel_bias_mask)
+    ggml_tensor * build_attn_masked(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_mask, // F16 [n_kv, n_rows, n_head_q]
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+                   bool   pre_rotated = false) const; // q, k, v are already rotated for the KV cache, the output is returned rotated
 
     //
     // pooling

@@ -580,6 +580,8 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_INP_NORM,
     LLM_TENSOR_ATTN_K_CONV,
     LLM_TENSOR_ATTN_V_CONV,
+    LLM_TENSOR_ATTN_QGRKV,   // inkling2 (r9700 GGUF): rows of attn_q, attn_gate, attn_rel, attn_k, attn_v
+    LLM_TENSOR_ATTN_KV_CONV, // inkling2 (r9700 GGUF): rows of attn_k_conv, attn_v_conv
     LLM_TENSOR_ATTN_K_CONV_PROJ,
     LLM_TENSOR_ATTN_V_CONV_PROJ,
     LLM_TENSOR_ATTN_POST_CONV,

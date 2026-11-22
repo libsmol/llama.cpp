@@ -905,7 +905,17 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
+// GGML_VK_CPU_TIMING state (see ggml_backend_vk_graph_compute)
+static bool vk_cpu_timing = false;
+static bool vk_cpu_timing_first_submit = false;
+static std::chrono::high_resolution_clock::time_point vk_cpu_timing_sync_done, vk_cpu_timing_submit;
+static bool vk_cpu_timing_have_sync = false;
+
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+    if (vk_cpu_timing_first_submit) {
+        vk_cpu_timing_submit = std::chrono::high_resolution_clock::now();
+        vk_cpu_timing_first_submit = false;
+    }
     if (ctx->seqs.empty()) {
         if (fence) {
             ctx->p->q->handle->submit({}, fence);
@@ -15910,6 +15920,10 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ggml_vk_synchronize(ctx);
+    if (vk_cpu_timing) {
+        vk_cpu_timing_sync_done = std::chrono::high_resolution_clock::now();
+        vk_cpu_timing_have_sync = true;
+    }
 
     ggml_vk_graph_cleanup(ctx);
 }
@@ -17344,22 +17358,35 @@ static void ggml_vk_find_cpy_groups(ggml_backend_vk_context * ctx, ggml_cgraph *
 
 static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
 
-// GGML_VK_CPU_TIMING=1: mean host time per graph_compute call, every 100 calls
+// GGML_VK_CPU_TIMING=1, every 100 graph_compute calls: the mean host time of the call, the host time between the
+// previous synchronize returning and the call (the GPU is idle then), and from the call to its first submit
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     static const bool timing = getenv("GGML_VK_CPU_TIMING") != nullptr;
     if (!timing) {
         return ggml_backend_vk_graph_compute_impl(backend, cgraph);
     }
-    static double acc_us = 0.0;
-    static int    n_calls = 0;
+    vk_cpu_timing = true;
+    static double acc_us = 0.0, acc_gap = 0.0, acc_first = 0.0;
+    static int    n_calls = 0, n_gap = 0;
     static int    n_nodes = 0;
     const auto t0 = std::chrono::high_resolution_clock::now();
+    if (vk_cpu_timing_have_sync) {
+        acc_gap += std::chrono::duration<double, std::micro>(t0 - vk_cpu_timing_sync_done).count();
+        n_gap++;
+        vk_cpu_timing_have_sync = false;
+    }
+    vk_cpu_timing_first_submit = true;
     const ggml_status st = ggml_backend_vk_graph_compute_impl(backend, cgraph);
     acc_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+    if (!vk_cpu_timing_first_submit) {
+        acc_first += std::chrono::duration<double, std::micro>(vk_cpu_timing_submit - t0).count();
+    }
     n_nodes += cgraph->n_nodes;
     if (++n_calls == 100) {
-        fprintf(stderr, "ggml_vulkan: graph_compute host time %.1f us/call, %d nodes/call\n", acc_us/n_calls, n_nodes/n_calls);
-        acc_us = 0.0; n_calls = 0; n_nodes = 0;
+        fprintf(stderr, "ggml_vulkan: graph_compute host time %.1f us/call, %d nodes/call, sync-to-call %.1f us, call-to-first-submit %.1f us\n",
+                acc_us/n_calls, n_nodes/n_calls, n_gap ? acc_gap/n_gap : 0.0, acc_first/n_calls);
+        acc_us = 0.0; acc_gap = 0.0; acc_first = 0.0; n_calls = 0; n_gap = 0; n_nodes = 0;
     }
     return st;
 }

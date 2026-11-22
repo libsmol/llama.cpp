@@ -89,7 +89,7 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+void llama_model_inkling2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     if (hparams.n_vocab_unpadded != vocab.n_tokens()) {
@@ -118,24 +118,36 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         const int64_t n_ff_exp    = hparams.n_ff_exp(i);
         const int64_t n_extent    = hparams.is_swa(i) ? hparams.n_swa : hparams.n_relative_extent;
 
-        // attention
-        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head*n_head}, 0);
-        layer.wk        = create_tensor(tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_head*n_head_kv}, 0);
-        layer.wv        = create_tensor(tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_head*n_head_kv}, 0);
+        // attention; the r9700 GGUF keeps the rows of q, gate, rel, k and v in one weight, and of the k and v convolutions in another
+        const bool merged = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_QGRKV, "weight", i).str().c_str()) != nullptr;
+        if (merged) {
+            layer.attn_qgrkv = create_tensor(tn(LLM_TENSOR_ATTN_QGRKV, "weight", i),
+                    {n_embd, 2*n_embd_head*n_head + n_rel*n_head + 2*n_embd_head*n_head_kv}, 0);
+        } else {
+            layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head*n_head}, 0);
+            layer.wk        = create_tensor(tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_head*n_head_kv}, 0);
+            layer.wv        = create_tensor(tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_head*n_head_kv}, 0);
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head*n_head}, 0);
+        }
         layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head*n_head, n_embd}, 0);
-        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head*n_head}, 0);
 
         layer.attn_q_clip    = create_tensor(tn(LLM_TENSOR_ATTN_Q_CLIP,    "weight", i), {n_embd_head, n_head}, 0);
         layer.attn_sink_proj = create_tensor(tn(LLM_TENSOR_ATTN_SINK_PROJ, "weight", i), {n_embd, n_head}, 0);
 
         // relative-position bias
-        layer.attn_rel      = create_tensor(tn(LLM_TENSOR_ATTN_REL,      "weight", i), {n_embd, n_rel*n_head}, 0);
+        if (!merged) {
+            layer.attn_rel  = create_tensor(tn(LLM_TENSOR_ATTN_REL,      "weight", i), {n_embd, n_rel*n_head}, 0);
+        }
         layer.attn_rel_bias = create_tensor(tn(LLM_TENSOR_ATTN_REL_BIAS, "weight", i), {n_rel, n_extent}, 0);
         layer.attn_rel_clip = create_tensor(tn(LLM_TENSOR_ATTN_REL_CLIP, "weight", i), {n_rel, n_head}, 0);
 
         // short convolutions
-        layer.attn_k_conv    = create_tensor(tn(LLM_TENSOR_ATTN_K_CONV,    "weight", i), {n_conv, n_embd_head*n_head_kv}, 0);
-        layer.attn_v_conv    = create_tensor(tn(LLM_TENSOR_ATTN_V_CONV,    "weight", i), {n_conv, n_embd_head*n_head_kv}, 0);
+        if (merged) {
+            layer.attn_kv_conv = create_tensor(tn(LLM_TENSOR_ATTN_KV_CONV, "weight", i), {n_conv, 2*n_embd_head*n_head_kv}, 0);
+        } else {
+            layer.attn_k_conv  = create_tensor(tn(LLM_TENSOR_ATTN_K_CONV,  "weight", i), {n_conv, n_embd_head*n_head_kv}, 0);
+            layer.attn_v_conv  = create_tensor(tn(LLM_TENSOR_ATTN_V_CONV,  "weight", i), {n_conv, n_embd_head*n_head_kv}, 0);
+        }
         layer.attn_post_conv = create_tensor(tn(LLM_TENSOR_ATTN_POST_CONV, "weight", i), {n_conv, n_embd}, 0);
         layer.ffn_post_conv  = create_tensor(tn(LLM_TENSOR_FFN_POST_CONV,  "weight", i), {n_conv, n_embd}, 0);
 
@@ -253,13 +265,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         const size_t row_size = state->nb[1];
         ggml_tensor * cell = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, n_seqs, row_size,
                 inp->mctx->get_head()*row_size + offset*(n_conv - 1)*ggml_element_size(state));
-        ggml_tensor * out = ggml_short_conv_rs_add(ctx0, ggml_reshape_2d(ctx0, cur, n_channels, n_tokens), past, weight, dynamic, cell,
+        ggml_tensor * out = ggml_short_conv_rs_add(ctx0, ggml_is_matrix(cur) ? cur : ggml_reshape_2d(ctx0, cur, n_channels, n_tokens), past, weight, dynamic, cell,
                 fuse("res") ? residual : nullptr, scale);
         out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
         return residual && !fuse("res") ? ggml_add(ctx0, residual, out) : out;
     }
 
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
+    ggml_tensor * x = ggml_transpose(ctx0, ggml_view_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs, cur->nb[1], n_seq_tokens*cur->nb[1], 0));
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
@@ -344,6 +356,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     const auto & layer = model.layers[il];
 
+    // [ne0*ne1, n_tokens] as [ne0, ne1, n_tokens]; t may be a row view of a wider matmul result
+    auto heads = [&](ggml_tensor * t, int64_t ne0, int64_t ne1) {
+        return ggml_is_contiguous(t) ? ggml_reshape_3d(ctx0, t, ne0, ne1, n_tokens) :
+            ggml_view_3d(ctx0, t, ne0, ne1, n_tokens, ne0*ggml_element_size(t), t->nb[1], 0);
+    };
+    auto n_conv_k = [&]() { return (int64_t) hparams.n_shortconv_l_cache; };
+
     const bool    is_swa       = hparams.is_swa(il);
     const int64_t n_head       = hparams.n_head(il);
     const int64_t n_head_kv    = hparams.n_head_kv(il);
@@ -392,12 +411,62 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // self-attention
     {
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        // the projections; with the r9700 GGUF the weights of one input are one matmul
+        const int64_t n_q_rows = n_embd_head*n_head;
+        const int64_t n_r_rows = hparams.n_relative*n_head;
+
+        ggml_tensor * Qcur = nullptr;
+        ggml_tensor * Gcur = nullptr; // the output gate
+        ggml_tensor * Rcur = nullptr;
+        ggml_tensor * Kcur = nullptr;
+        ggml_tensor * Vcur = nullptr;
+        ggml_tensor * KVcur = nullptr; // K and V rows next to each other, when one matmul computes both
+
+        // rows [r0, r0 + nr) of a matmul result, as [nr, n_tokens]
+        auto out_rows = [&](ggml_tensor * t, int64_t r0, int64_t nr) {
+            return ggml_view_2d(ctx0, t, nr, n_tokens, t->nb[1], r0*ggml_element_size(t));
+        };
+        if (layer.attn_qgrkv) {
+            ggml_tensor * w = layer.attn_qgrkv;
+            auto w_rows = [&](int64_t r0, int64_t nr) {
+                return ggml_view_2d(ctx0, w, w->ne[0], nr, w->nb[1], r0*w->nb[1]);
+            };
+            const int64_t o_k = 2*n_q_rows + n_r_rows;
+            const int64_t o_v = o_k + n_embd_k_gqa;
+            ggml_tensor * qgr = nullptr;
+            if (inputs[1] == inputs[0] && inputs[2] == inputs[0] && fuse("qkv")) {
+                qgr   = build_lora_mm(w, inputs[0]);
+                Kcur  = out_rows(qgr, o_k, n_embd_k_gqa);
+                Vcur  = out_rows(qgr, o_v, n_embd_k_gqa);
+                KVcur = out_rows(qgr, o_k, 2*n_embd_k_gqa);
+            } else {
+                qgr  = build_lora_mm(w_rows(0, o_k), inputs[0]);
+                Kcur = build_lora_mm(w_rows(o_k, n_embd_k_gqa), inputs[1]);
+                Vcur = build_lora_mm(w_rows(o_v, n_embd_k_gqa), inputs[2]);
+            }
+            Qcur = out_rows(qgr, 0,          n_q_rows);
+            Gcur = out_rows(qgr, n_q_rows,   n_q_rows);
+            Rcur = out_rows(qgr, 2*n_q_rows, n_r_rows);
+        } else {
+            Qcur = build_lora_mm(layer.wq,        inputs[0]);
+            Gcur = build_lora_mm(layer.wqkv_gate, inputs[0]);
+            Rcur = build_lora_mm(layer.attn_rel,  inputs[0]);
+            Kcur = build_lora_mm(layer.wk,        inputs[1]);
+            Vcur = build_lora_mm(layer.wv,        inputs[2]);
+        }
+
+        // the short convolutions of K and V, in one call over both when their rows are next to each other (no dynamic taps)
+        ggml_tensor * k_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1], 0) : layer.attn_k_conv;
+        ggml_tensor * v_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1],
+                n_embd_k_gqa*layer.attn_kv_conv->nb[1]) : layer.attn_v_conv;
+        if (KVcur && is_swa && fuse("kvconv")) {
+            ggml_tensor * kv = convolve(KVcur, layer.attn_kv_conv, nullptr, state, history, recr, 0);
+            Kcur = out_rows(kv, 0,            n_embd_k_gqa);
+            Vcur = out_rows(kv, n_embd_k_gqa, n_embd_k_gqa);
+        } else {
+            Kcur = convolve(Kcur, k_conv, is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+            Vcur = convolve(Vcur, v_conv, is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+        }
 
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
 
@@ -415,21 +484,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * tau_l = is_swa ? nullptr : tau;
 
         if (pre_rot) {
-            Qcur = ggml_norm_rot(ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip, tau_l,
+            Qcur = ggml_norm_rot(ctx0, heads(Qcur, n_embd_head, n_head), layer.attn_q_clip, tau_l,
                     false, hparams.f_qk_clip, 1e-6f, n_rot_k);
-            Kcur = ggml_norm_rot(ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr, nullptr,
+            Kcur = ggml_norm_rot(ctx0, heads(Kcur, n_embd_head, n_head_kv), nullptr, nullptr,
                     false, hparams.f_qk_clip, 1e-6f, n_rot_k);
-            Vcur = ggml_norm_rot(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), nullptr, nullptr,
+            Vcur = ggml_norm_rot(ctx0, heads(Vcur, n_embd_head, n_head_kv), nullptr, nullptr,
                     true, 0.0f, hparams.f_norm_rms_eps, n_rot_v);
         } else {
-            Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip, tau_l);
-            Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
-            Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+            Qcur = clip(heads(Qcur, n_embd_head, n_head),    layer.attn_q_clip, hparams.f_qk_clip, tau_l);
+            Kcur = clip(heads(Kcur, n_embd_head, n_head_kv), nullptr,           hparams.f_qk_clip);
+            Vcur = ggml_rms_norm(ctx0, heads(Vcur, n_embd_head, n_head_kv), hparams.f_norm_rms_eps);
         }
 
         // the fused-mask attention clips R itself
         const bool clip_r_in_mask = fused_attn && fuse("rclip");
-        Rcur = ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens);
+        Rcur = heads(Rcur, hparams.n_relative, n_head);
         if (!clip_r_in_mask) {
             Rcur = clip(Rcur, layer.attn_rel_clip, hparams.f_relative_clip, tau_l);
         }
@@ -520,9 +589,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         if (pre_rot || fuse("gate")) {
             // the output gate, with the inverse V rotation of the fused-mask attention
-            cur = ggml_rot_gate(ctx0, ggml_reshape_2d(ctx0, cur, n_embd_head*n_head, n_tokens), build_lora_mm(layer.wqkv_gate, inputs[0]), n_rot_v);
+            cur = ggml_rot_gate(ctx0, ggml_reshape_2d(ctx0, cur, n_embd_head*n_head, n_tokens), Gcur, n_rot_v);
         } else {
-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, ggml_cont(ctx0, Gcur)));
         }
 
         // the first layer of each block starts a new residual stream, the others add the attention output to it

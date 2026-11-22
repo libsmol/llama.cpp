@@ -710,6 +710,8 @@ struct llama_layer {
     struct ggml_tensor * attn_v_inp_norm  = nullptr;
     struct ggml_tensor * attn_k_conv      = nullptr;
     struct ggml_tensor * attn_v_conv      = nullptr;
+    struct ggml_tensor * attn_qgrkv       = nullptr; // inkling2: [attn_q; attn_gate; attn_rel; attn_k; attn_v] rows in one weight
+    struct ggml_tensor * attn_kv_conv     = nullptr; // inkling2: [attn_k_conv; attn_v_conv] rows in one weight
     struct ggml_tensor * attn_k_conv_proj = nullptr;
     struct ggml_tensor * attn_v_conv_proj = nullptr;
     struct ggml_tensor * attn_post_conv   = nullptr;

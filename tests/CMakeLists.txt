@@ -366,6 +366,7 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 llama_build(test-inkling-fused.cpp LINK ggml Threads::Threads)
+llama_build(bench-vk-chain.cpp LINK ggml Threads::Threads)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)

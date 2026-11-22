@@ -4,7 +4,7 @@
 #            blk.N.attn_kv_conv.weight = rows of attn_k_conv, attn_v_conv
 # the bytes of every row are copied unchanged; the separate tensors are dropped
 import sys, numpy as np
-sys.path.insert(0, "/home/hxcliff/src/llama.cpp-r9700/gguf-py")
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "../../gguf-py"))
 import gguf
 from gguf import GGUFReader, GGUFWriter, GGUFValueType
 

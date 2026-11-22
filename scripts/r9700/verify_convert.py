@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import sys, json, numpy as np
-sys.path.insert(0, "/home/hxcliff/src/llama.cpp-r9700/gguf-py")
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "../../gguf-py"))
 from gguf import GGUFReader
 a = GGUFReader(sys.argv[1]); b = GGUFReader(sys.argv[2])
 ta = {t.name: t for t in a.tensors}; tb = {t.name: t for t in b.tensors}

@@ -5,7 +5,7 @@
 # Tensor data is copied byte for byte; the two query tables are re-laid out exactly:
 #   blk.{s+i}.loop_msg_query[:, q, k, v, ffn] = res[2i], kv[2i], kv[2i+1], res[2i+1]   (i = 0 .. core_end - core_start - 1)
 import sys, numpy as np
-sys.path.insert(0, "" + __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "../../gguf-py") + "")
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "../../gguf-py"))
 import gguf
 from gguf import GGUFReader, GGUFWriter, GGUFValueType
 

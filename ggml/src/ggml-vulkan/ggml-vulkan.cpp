@@ -9877,6 +9877,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t G  = qk_ratio;
         const uint32_t NQ = (uint32_t) neq1;   // query rows (N may have been folded into the GQA ratio above)
         // q8_0 K/V: fetched raw and dequantized from LDS; rows must be whole blocks on 8-byte offsets
+        // (the shader indexes 8-byte units from the bound offset of K / V, so only the strides need 8-byte multiples)
         const bool pf_q8 = !disable_pf_q8 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
             (nbk1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 && (nbv1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 &&
             ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 8) == 0 &&
@@ -12041,12 +12042,13 @@ static void ggml_vk_add_rms_norm_mul(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_tensor * mul  = cgraph->nodes[node_idx + 2];
     const ggml_tensor * w    = mul->src[0] == norm ? mul->src[1] : mul->src[0];
 
-    const bool f16_out = ctx->norm_to_f16.count(mul) != 0;
-    vk_pipeline pipeline = f16_out ? ctx->device->pipeline_add_rms_norm_mul_f16out_f32 : ctx->device->pipeline_add_rms_norm_mul_f32;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
+
+    // (the f16 variant takes a runtime zero from the sign bit of eps; with eps <= 0 the matmul converts B itself)
+    const bool f16_out = ctx->norm_to_f16.count(mul) != 0 && eps > 0.0f;
+    vk_pipeline pipeline = f16_out ? ctx->device->pipeline_add_rms_norm_mul_f16out_f32 : ctx->device->pipeline_add_rms_norm_mul_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_op_add_rms_norm_mul_push_constants pc = {
         (uint32_t) add->ne[0],
@@ -12058,7 +12060,6 @@ static void ggml_vk_add_rms_norm_mul(ggml_backend_vk_context * ctx, vk_context& 
         eps,
     };
     if (f16_out) {
-        GGML_ASSERT(eps > 0.0f);   // the shader takes a runtime zero from its sign bit
         const vk_subbuffer hb = ggml_vk_norm_f16_begin(ctx, subctx, mul);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { ggml_vk_tensor_subbuffer(ctx, add->src[0], true), ggml_vk_tensor_subbuffer(ctx, add->src[1], true),
@@ -16776,7 +16777,9 @@ static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph *
         while (skinny_ok && js < cgraph->n_nodes) {
             ggml_tensor * n = cgraph->nodes[js];
             const bool passive = ggml_vk_is_empty(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ctx->gdn_fused_skip.count(n);
-            const bool get_rows_ok = n->op == GGML_OP_GET_ROWS && n->src[0] != glu && n->src[1] != glu && n->buffer && n->src[0]->buffer &&
+            // a GET_ROWS (neither ggml_vk_get_rows nor the TOPK_QSA fusion that may start at it use prealloc_y)
+            const bool get_rows_ok = n->op == GGML_OP_GET_ROWS &&
+                n->src[0] != glu && n->src[1] != glu && n->buffer && n->src[0]->buffer && n->src[1]->buffer &&
                 !ggml_vk_tensors_overlap(n, glu, false) && !ggml_vk_tensors_overlap(n->src[0], glu, false);
             if (!passive && !get_rows_ok) {
                 break;
@@ -17213,6 +17216,7 @@ static void ggml_vk_find_swiglu_epi(ggml_backend_vk_context * ctx, ggml_cgraph *
         ctx->swiglu_epi_glu.insert(glu);
         ctx->gdn_fused_skip.insert(glu);
         ctx->glu_to_f16.erase(glu);
+        ctx->glu_to_f16_b.erase(glu);
     }
 }
 

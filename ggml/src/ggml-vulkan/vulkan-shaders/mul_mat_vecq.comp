@@ -164,6 +164,80 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
+#if defined(DATA_A_NVFP4) && defined(MUL_MAT_ID) && !defined(MMVQ_NVFP4_PER_COL)
+// one 16-element sub-block of one row (its e4m3 scale and 8 bytes) per thread and step, the (row, sub-block) pairs of
+// the workgroup's rows spread evenly over its threads: the two halves of a sub-block share their loads, scale and
+// float math, and no thread idles at the end of a row
+void compute_outputs_flat(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    // a_offset in nvfp4 blocks, b_offset in q8_1 blocks
+    b_offset /= QUANT_K_Q8_1;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[0][n] = FLOAT_TYPE(0.0f);
+    }
+
+    const uint spr   = p.ncols / 16;            // sub-blocks per row
+    const uint bpr   = p.ncols / QUANT_K;       // nvfp4 blocks per row
+    const uint total = num_rows * spr;
+
+    uint r = 0;
+    uint s = tid;
+    while (s >= spr) {
+        s -= spr;
+        r++;
+    }
+
+    for (uint i = tid; i < total; i += BLOCK_SIZE) {
+        const uint ib  = (first_row + r) * bpr + (s >> 2) + a_offset;
+        const uint sub = s & 3u;
+
+        const uint32_t w0 = data_a_packed32[ib].qs[sub*2u    ];
+        const uint32_t w1 = data_a_packed32[ib].qs[sub*2u + 1u];
+
+        const uint qb = (s >> 1) + b_offset;
+        const uint qo = qb / 4u;
+        const uint qi = qb % 4u;
+        const uint bq = qi*8u + (s & 1u)*4u;
+
+        // the low nibbles are elements 0..7 of the sub-block, the high ones 8..15
+        const u8vec4 l0 = unpack8( w0       & 0x0F0F0F0Fu);
+        const u8vec4 l1 = unpack8( w1       & 0x0F0F0F0Fu);
+        const u8vec4 h0 = unpack8((w0 >> 4) & 0x0F0F0F0Fu);
+        const u8vec4 h1 = unpack8((w1 >> 4) & 0x0F0F0F0Fu);
+
+        const int32_t q_sum =
+            dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[l0.x], kvalues_mxfp4[l0.y], kvalues_mxfp4[l0.z], kvalues_mxfp4[l0.w])), data_b[qo].qs[bq     ]) +
+            dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[l1.x], kvalues_mxfp4[l1.y], kvalues_mxfp4[l1.z], kvalues_mxfp4[l1.w])), data_b[qo].qs[bq + 1u]) +
+            dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[h0.x], kvalues_mxfp4[h0.y], kvalues_mxfp4[h0.z], kvalues_mxfp4[h0.w])), data_b[qo].qs[bq + 2u]) +
+            dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[h1.x], kvalues_mxfp4[h1.y], kvalues_mxfp4[h1.z], kvalues_mxfp4[h1.w])), data_b[qo].qs[bq + 3u]);
+
+        // kvalues are twice the e2m1 values
+        const FLOAT_TYPE v = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].d[sub]) * float(data_b[qo].ds[qi].x) * float(q_sum) * 0.5);
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n == r) {
+                temp[0][n] += v;
+            }
+        }
+
+        s += BLOCK_SIZE;
+        while (s >= spr) {
+            s -= spr;
+            r++;
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#define COMPUTE_OUTPUTS compute_outputs_flat
+#else
+#define COMPUTE_OUTPUTS compute_outputs
+#endif
+
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
@@ -173,11 +247,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        COMPUTE_OUTPUTS(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, p.stride_d - first_row);
+        COMPUTE_OUTPUTS(first_row, p.stride_d - first_row);
     }
 }

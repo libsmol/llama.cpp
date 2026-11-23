@@ -313,6 +313,7 @@ struct server_spec_adaptive {
         }
         std::fill(n_used.begin(), n_used.end(), 0);
         t_begin = -1;
+        L_prev  = -1;
     }
 
     std::string summary() const {

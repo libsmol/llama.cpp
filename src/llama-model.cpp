@@ -37,8 +37,8 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {

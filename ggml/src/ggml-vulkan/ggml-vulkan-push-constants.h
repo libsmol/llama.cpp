@@ -94,6 +94,30 @@ struct vk_mm_rdna4_reduce_push_constants {
     uint32_t n_parts;
 };
 
+// mul_mmv_rdna4.comp
+struct vk_mmv_rdna4_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t k_slice;    // k per z-slice, a multiple of 256
+    uint32_t d_slice;    // floats between the outputs of consecutive z-slices (scratch), 0 when unsplit
+    uint32_t bs_off;     // the per-row scales of B, in floats
+};
+
+// b_to_f16_rowscale.comp
+struct vk_b_to_f16_rowscale_push_constants {
+    uint32_t K; uint32_t src_row; uint32_t src_off; uint32_t scale_off;
+};
+
+// swiglu_to_f16.comp
+struct vk_swiglu_to_f16_push_constants {
+    uint32_t ncols; uint32_t write_f32; uint32_t scale_off;
+};
+
+// flash_attn_pf_rdna4_reduce.comp
+struct vk_flash_attn_pf_reduce_push_constants {
+    uint32_t H; uint32_t N; uint32_t BQ; uint32_t k_num; uint32_t ne3; uint32_t D4;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;

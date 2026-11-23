@@ -913,7 +913,7 @@ llama_model_dflash::graph_dspine::graph_dspine(const llm_graph_params & params) 
     // the refinement needs a whole block per sequence, within the trained block size
     const bool lattice = stash.raw && block <= (int64_t) hparams.dflash_block_size;
 
-    const auto [output, output_s] = get_lm_head(*this, model);
+    ggml_tensor * output = get_lm_head(*this, model).first;
 
     // the approximate head picks the candidates of the lattice (the walk only reads the lattice). 128: on Qwen3.8-27B
     // the exact top 16 fall outside the approximate top 128 for 0.05% of the candidates (only exact ranks 9..16;
@@ -923,7 +923,6 @@ llama_model_dflash::graph_dspine::graph_dspine(const llm_graph_params & params) 
     ggml_tensor * exact = nullptr;
     if (lattice && n_cand >= (int64_t) hparams.dspine_head_top_k && hparams.f_logit_scale == 0.0f &&
             hparams.f_final_logit_softcapping <= 0.0f && build_approx_candidates(*this, model, cur, n_cand, cand, exact)) {
-        res->t_logits = nullptr;
         build_dspine_lattice(*this, model, inp_tokens, output, stash, block, n_blocks, cand, exact);
         return;
     }

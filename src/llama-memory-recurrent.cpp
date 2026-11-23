@@ -37,13 +37,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
 
     // lazy snapshots: scalar-gated delta nets, one cell, f32 states of [S_v, S_v, H] that have room for
-    // the 3 (n_rs_seq + 1) rows of S_v * H floats of a factor set
+    // the 3 (n_rs_seq + 1) rows of S_v * H floats of a factor set; not with the states split by heads (-sm tensor),
+    // the factor rows do not split that way
     {
         const uint32_t s_v = hparams.ssm_d_state;
         const uint32_t h   = s_v > 0 ? hparams.ssm_d_inner / s_v : 0;
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT;
         lazy = arch_ok && n_rs_seq > 0 && mem_size == 1 && type_s == GGML_TYPE_F32 && h > 0 &&
-               (uint64_t) s_v * s_v * h == hparams.n_embd_s() && 3 * (n_rs_seq + 1) <= s_v;
+               (uint64_t) s_v * s_v * h == hparams.n_embd_s() && 3 * (n_rs_seq + 1) <= s_v &&
+               model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
         if (lazy) {
             lz_s_v = s_v;
             lz_h   = h;
@@ -938,7 +940,6 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
     }
-
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {

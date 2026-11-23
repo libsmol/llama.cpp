@@ -10,7 +10,8 @@
 
 // Prefill GEMM for RDNA4 (wave32 WMMA): D[n][m] = sum_k A[m][k] * B[n][k]
 // A: Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS/IQ4_NL/Q8_0, dequantized to f16 (round to nearest) into LDS, or BF16, converted to
-// f16 (exact unless |w| < 2^-14, which becomes an f16 subnormal). B: f16. f32 accumulation.
+// f16 (exact for 2^-14 <= |w| < 65520: smaller weights become f16 subnormals, BF16 weights past the f16 range are not
+// supported). B: f16. f32 accumulation.
 // Row n of B was stored times 1 / scale[n] to keep it finite as f16 (b_to_f16_rowscale.comp), and output column n
 // is multiplied by scale[n].
 //

@@ -2,7 +2,6 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
-#include <string>
 #include <vector>
 
 // the fused-mask attention: about the max elements of its per-head F16 mask per call (2 GiB; chunks are whole multiples
@@ -275,7 +274,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
                 inp->mctx->get_head()*row_size + offset*(n_conv - 1)*ggml_element_size(state));
         ggml_tensor * out = ggml_short_conv_rs_add(ctx0, ggml_is_matrix(cur) ? cur : ggml_reshape_2d(ctx0, cur, n_channels, n_tokens), past, weight, dynamic, cell,
                 residual, scale);
-        return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        // (on a backend without the op the scheduler would run it on a copy of the state)
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(s_root->buffer));
+        if (dev == nullptr || ggml_backend_dev_supports_op(dev, out)) {
+            return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        }
     }
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_view_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs, cur->nb[1], n_seq_tokens*cur->nb[1], 0));

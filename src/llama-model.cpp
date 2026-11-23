@@ -3733,13 +3733,15 @@ llama_dflash_variant llama_model_dflash_variant(const llama_model * model) {
         case llama_model_dflash::VARIANT_DFLASH2:  return LLAMA_DFLASH_VARIANT_DFLASH2;
         case llama_model_dflash::VARIANT_DSPARK:   return LLAMA_DFLASH_VARIANT_DSPARK;
         case llama_model_dflash::VARIANT_LILICORR: return LLAMA_DFLASH_VARIANT_LILICORR;
+        case llama_model_dflash::VARIANT_DSPINE:   return LLAMA_DFLASH_VARIANT_DSPINE;
     }
 
     return LLAMA_DFLASH_VARIANT_NONE;
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
-    return model->hparams.dflash_selector_top_k;
+    // DSpine packs its lattice like DFlash2's, with its refinement width as the candidate count
+    return model->hparams.dspine_head_top_k > 0 ? (int32_t) model->hparams.dspine_head_top_k : (int32_t) model->hparams.dflash_selector_top_k;
 }
 
 int32_t llama_model_n_head(const llama_model * model) {
@@ -3764,7 +3766,7 @@ bool llama_model_layer_is_swa(const llama_model * model, int32_t il) {
 }
 
 bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_model * model_tgt) {
-    if (model_dft == nullptr || model_tgt == nullptr || model_dft->dflash_selector_hidden == nullptr) {
+    if (model_dft == nullptr || model_tgt == nullptr || (model_dft->dflash_selector_hidden == nullptr && model_dft->dspine_codebook == nullptr)) {
         return false;
     }
     if (model_dft->dflash_output_approx != nullptr) {

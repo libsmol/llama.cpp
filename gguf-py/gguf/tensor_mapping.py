@@ -1887,6 +1887,31 @@ class TensorNameMap:
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN: (
             "model.candidate_selector.hidden_projection",
         ),
+
+        # DSpine code bridge (selected_prefix_bridge.*); the stacked read/write weights are split per layer
+        MODEL_TENSOR.DSPINE_CODEBOOK: (
+            "model.selected_prefix_bridge.codebook",
+        ),
+
+        MODEL_TENSOR.DSPINE_BRIDGE_GATE: (
+            "model.selected_prefix_bridge.gate",
+        ),
+
+        MODEL_TENSOR.DSPINE_BRIDGE_PGATE: (
+            "model.selected_prefix_bridge.predecessor_gate",
+        ),
+
+        MODEL_TENSOR.DSPINE_BRIDGE_PREV: (
+            "model.selected_prefix_bridge.prev",
+        ),
+
+        MODEL_TENSOR.DSPINE_BRIDGE_READ: (
+            "model.layers.{bid}.selected_prefix_bridge.read",
+        ),
+
+        MODEL_TENSOR.DSPINE_BRIDGE_WRITE: (
+            "model.layers.{bid}.selected_prefix_bridge.write",
+        ),
         MODEL_TENSOR.LILICORR_ATTN_IN_PROJ: (
             "model.lilicorr.layers.{bid}.attn.in_proj",
         ),

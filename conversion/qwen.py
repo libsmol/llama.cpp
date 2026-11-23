@@ -966,6 +966,71 @@ class DFlashModel(Qwen3Model):
             head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
             self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
 
+        if self._is_dspine():
+            top_k, eps = self._dspine_validate()
+            self.gguf_writer.add_dspine_head_top_k(top_k)
+            self.gguf_writer.add_dspine_bridge_eps(eps)
+
+    # DSpine (tencent/DSpine) = DFlash with causal block attention, a code bridge write after every
+    # layer and the serial refinement of the last write over the top-k candidates. The checks mirror
+    # the reference loaders (dspine_mlx/config.py, sglang_dspine/models/dspine.py): anything they
+    # refuse is refused here, so a checkpoint that converts is one the graph computes exactly.
+    def _is_dspine(self) -> bool:
+        return "selected_prefix_code_bridge" in self.hparams.get("dflash_config", {})
+
+    def _dspine_validate(self) -> tuple[int, float]:
+        cfg = self.hparams["dflash_config"]
+        n_layer = int(self.hparams["num_hidden_layers"])
+        bridge = cfg["selected_prefix_code_bridge"]
+
+        def need(cond: bool, msg: str) -> None:
+            if not cond:
+                raise ValueError(f"DSpine: {msg}")
+
+        need(cfg.get("selected_prefix_terminal", True) is False, "only terminal-disabled code bridges are supported")
+        need(cfg.get("selected_prefix_decode_mode", "serial") == "serial", "only the serial decode mode is supported")
+        need(not self.hparams.get("attention_bias", False), "draft attention_bias must be false")
+        need(self.hparams.get("hidden_act", "silu") == "silu", "only silu drafts are supported")
+        need(not self.hparams.get("tie_word_embeddings", False), "the draft shares the target head, tie_word_embeddings must be false")
+        need(int(self.hparams.get("draft_vocab_size", self.hparams["vocab_size"])) == int(self.hparams["vocab_size"]),
+             "a reduced draft vocabulary is not supported")
+        rope = self.hparams.get("rope_parameters") or {}
+        need(rope.get("rope_type", rope.get("type", "default")) == "default" and self.hparams.get("rope_scaling") is None,
+             "only default RoPE is supported")
+        need(int(cfg.get("selected_prefix_terminal_residual_rank", 0) or 0) == 0, "a terminal token residual is not supported")
+        need(cfg.get("selected_prefix_feature_write_mode") == "independent", "only independent feature writes are supported")
+        need(cfg.get("selected_prefix_feature_writes") is True, "selected_prefix_feature_writes must be true")
+        need(cfg.get("draft_block_causal") is True and self.hparams.get("is_causal", True) is not False,
+             "the draft block must be causal")
+        need(cfg.get("selected_prefix_feature_reliability") is None, "reliability probes are not supported")
+        need(not cfg.get("selected_prefix_feature_next_token_rows", False), "next-token rows (DSpark layout) are not supported")
+        need(not cfg.get("conv_kernel_size"), "grouped draft convolutions are not part of DSpine")
+        for key in ("selector_rank", "selector_top_k", "projector_type", "attention_sink_bias", "attention_value_scale"):
+            need(not cfg.get(key), f"unsupported dflash_config key {key}")
+        need(list(cfg.get("selected_prefix_feature_layers", [])) == list(range(1, n_layer + 1)),
+             "every draft layer must carry a bridge write")
+        need(int(bridge["code_size"]) > 0 and int(bridge["rank"]) > 0 and float(bridge["eps"]) > 0, "invalid code bridge geometry")
+
+        # the refinement width K, stated consistently by the checkpoint
+        widths = {}
+        second = self.hparams.get("code_bridge_second_pass")
+        if second is not None:
+            need(set(second) <= {"mode", "first_exact", "head_topk"}, f"unknown code_bridge_second_pass keys {sorted(second)}")
+            need(second.get("mode") == "serial_table", "only the serial_table refinement is supported")
+            need(int(second.get("first_exact", -1)) == n_layer - 1, "serial_table must redo the last write only")
+            widths["second_pass"] = int(second["head_topk"])
+        refine = cfg.get("selected_prefix_last_write_refine")
+        if refine is not None:
+            need(refine.get("kind") == "exact_sender" and int(refine.get("version", 1)) == 1 and float(refine.get("weight", 1.0)) >= 0,
+                 "unsupported last-write refinement")
+            widths["last_write_refine"] = int(refine["head_topk"])
+        need(len(widths) > 0, "the checkpoint names no refinement width")
+        need(len(set(widths.values())) == 1, f"refinement widths disagree: {widths}")
+        top_k = next(iter(widths.values()))
+        need(top_k & (top_k - 1) == 0 and 2 <= top_k <= 64, f"head_topk must be a power of two in [2, 64], got {top_k}")
+        need(top_k * (top_k + 1) <= int(self.hparams["hidden_size"]), "head_topk does not fit the lattice rows")
+        return top_k, float(bridge["eps"])
+
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         yield from super().generate_extra_tensors()
 
@@ -1063,7 +1128,53 @@ class DFlashModel(Qwen3Model):
         ):
             name += ".weight"
 
+        if self._is_dspine() and (name.startswith("model.selected_prefix_bridge.") or name.endswith("_version")):
+            yield from self._modify_dspine_tensor(data_torch, name)
+            return
+
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def _modify_dspine_tensor(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        bridge  = "model.selected_prefix_bridge."
+        n_layer = int(self.hparams["num_hidden_layers"])
+        short   = name[len(bridge):] if name.startswith(bridge) else name[len("model."):]
+
+        # format markers: the reference loaders accept version 1 only
+        if short in ("draft_block_causal_version", "last_write_refine_version",
+                     "independent_write_version", "terminal_disabled_version"):
+            if int(LazyTorchTensor.to_eager(data_torch).item()) != 1:
+                raise ValueError(f"DSpine: unsupported {short}")
+            return
+        # the terminal projection of a terminal-disabled bridge must be all zero (DSpineCodeBridge.prepare)
+        if short == "out.weight":
+            if torch.count_nonzero(LazyTorchTensor.to_eager(data_torch)).item() != 0:
+                raise ValueError("DSpine: terminal-disabled checkpoint has a nonzero terminal projection")
+            return
+        # per-layer read: layers 0..L-2 read with early_read_weights[l], the last layer with read_weight
+        if short == "early_read_weights":
+            if tuple(data_torch.shape)[0] != n_layer - 1:
+                raise ValueError("DSpine: early_read_weights does not hold one read per early layer")
+            for il in range(n_layer - 1):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_BRIDGE_READ, il), data_torch[il])
+            return
+        if short == "read_weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_BRIDGE_READ, n_layer - 1), data_torch)
+            return
+        if short == "feature_write_weights":
+            if tuple(data_torch.shape)[0] != n_layer:
+                raise ValueError("DSpine: feature_write_weights does not hold one write per layer")
+            for il in range(n_layer):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_BRIDGE_WRITE, il), data_torch[il])
+            return
+        if short == "codebook":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_CODEBOOK), data_torch)
+            return
+        if short in ("gate.weight", "gate.bias", "predecessor_gate.weight", "prev.weight"):
+            key = {"gate": gguf.MODEL_TENSOR.DSPINE_BRIDGE_GATE, "predecessor_gate": gguf.MODEL_TENSOR.DSPINE_BRIDGE_PGATE,
+                   "prev": gguf.MODEL_TENSOR.DSPINE_BRIDGE_PREV}[short.rsplit(".", 1)[0]]
+            yield (self.format_tensor_name(key, suffix="." + short.rsplit(".", 1)[1]), data_torch)
+            return
+        raise ValueError(f"DSpine: unexpected code bridge tensor {name}")
 
 
 @ModelBase.register(

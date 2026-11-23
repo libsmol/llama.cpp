@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <functional>
 #include <map>
 
 class llama_memory_hybrid_idx_context;
@@ -1599,6 +1600,7 @@ struct llama_model_dflash : public llama_model_base {
         VARIANT_DFLASH2,
         VARIANT_DSPARK,
         VARIANT_LILICORR,
+        VARIANT_DSPINE,
     };
 
     enum backbone_type {
@@ -1618,6 +1620,7 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_dflash2_conv();
     void load_tensors_dspark(int64_t n_vocab_draft);
     void load_tensors_lilicorr();
+    void load_tensors_dspine();
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
@@ -1650,6 +1653,9 @@ struct llama_model_dflash : public llama_model_base {
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
+
+        // optional, applied to the output of every layer of build_layers (DSpine code bridge)
+        std::function<ggml_tensor * (ggml_tensor * cur, int il)> post_layer;
     };
 
     struct graph_dflash : public graph_base {
@@ -1666,6 +1672,10 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_lilicorr : public graph_base {
         graph_lilicorr(const llm_graph_params & params);
+    };
+
+    struct graph_dspine : public graph_base {
+        graph_dspine(const llm_graph_params & params);
     };
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {

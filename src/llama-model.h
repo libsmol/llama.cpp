@@ -431,6 +431,10 @@ struct llama_layer {
     struct ggml_tensor * dflash_wv_ctx          = nullptr;
     struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
 
+    // DSpine code bridge, per layer: code read [n_embd -> code] and feature write [rank -> n_embd]
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -951,6 +955,13 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2_b      = nullptr;
     struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
     struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
+
+    // DSpine code bridge (shared by every layer)
+    struct ggml_tensor * dspine_codebook  = nullptr; // [code, n_vocab]
+    struct ggml_tensor * dspine_gate      = nullptr; // [code, rank] own-code gate
+    struct ggml_tensor * dspine_gate_b    = nullptr; // [rank]
+    struct ggml_tensor * dspine_pred_gate = nullptr; // [code, rank] predecessor gate
+    struct ggml_tensor * dspine_prev      = nullptr; // [code, rank] predecessor value
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

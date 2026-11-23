@@ -304,6 +304,9 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    // DSpine: width K of the serial last-write refinement (0 = not a DSpine draft) and the code bridge eps
+    uint32_t dspine_head_top_k       = 0;
+    float    dspine_bridge_eps       = 0.0f;
     bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;

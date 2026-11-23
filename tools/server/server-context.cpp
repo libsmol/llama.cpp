@@ -3860,6 +3860,9 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .top_k    = */ slot.task->params.sampling.top_k,
+                            /* .top_p    = */ slot.task->params.sampling.top_p,
+                            /* .min_p    = */ slot.task->params.sampling.min_p,
                         };
 
                         drafting.push_back(&slot);

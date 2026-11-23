@@ -983,6 +983,47 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// DSpine draft sampling filter over the K candidates of one lattice row (dspine_mlx/propose.py filter_probs):
+// a candidate is kept if fewer than top_k candidates rank ahead of it and the mass ranked ahead of it is at
+// most top_p (ties rank by id), and if p >= min_p * max(p); the kept probabilities are renormalized in place.
+// lane[r] is the candidate with the r-th smallest token id (the reference's lane order).
+static void dspine_filter(std::vector<float> & p, const std::vector<int32_t> & lane, int32_t top_k, float top_p, float min_p) {
+    const int32_t K = (int32_t) p.size();
+    const int32_t k_eff = top_k <= 0 ? K : std::min(std::max(top_k, 1), K);
+
+    std::vector<int32_t> pos(K);
+    for (int32_t r = 0; r < K; ++r) {
+        pos[lane[r]] = r;
+    }
+    const float p_max = *std::max_element(p.begin(), p.end());
+
+    std::vector<float> w(K, 0.0f);
+    float sum = 0.0f;
+    for (int32_t c = 0; c < K; ++c) {
+        int32_t rank   = 0;
+        float   before = 0.0f;
+        // the mass ahead is summed in lane order, as the reference does, so ties with top_p resolve the same way
+        for (int32_t r = 0; r < K; ++r) {
+            const int32_t d = lane[r];
+            if (p[d] > p[c] || (p[d] == p[c] && pos[d] < pos[c])) {
+                rank   += 1;
+                before += p[d];
+            }
+        }
+        // the top candidate (rank 0) is always kept, whatever the request asks (top_p <= 0 or NaN, min_p > 1), as
+        // the target's samplers keep at least one token; so sum > 0
+        const bool keep = rank == 0 ||
+            (rank < k_eff && before <= top_p && (!(min_p > 0.0f) || p[c] >= min_p * p_max));
+        if (keep) {
+            w[c] = p[c];
+            sum += p[c];
+        }
+    }
+    for (int32_t c = 0; c < K; ++c) {
+        p[c] = w[c] / sum;
+    }
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1702,8 +1743,12 @@ public:
 };
 
 // DFlash2: walks the lattice of the selector over the top-k candidates of the block
+// DFlash2, and DSpine (whose refined last write is packed as the same candidate lattice)
 struct common_speculative_impl_draft_dflash2 final : public common_speculative_impl_draft_dflash {
     int32_t selector_top_k = 0;
+
+    // DSpine: samples under the request's top-k / top-p / min-p (dspine_filter)
+    bool is_dspine = false;
 
     // probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
     std::vector<std::mt19937> dflash2_rng;
@@ -1712,17 +1757,30 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
     common_speculative_impl_draft_dflash2(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2)
     {
-        selector_top_k = llama_model_dflash_selector_top_k(llama_get_model(this->params.ctx_dft));
+        const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
+        const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
+
+        selector_top_k = llama_model_dflash_selector_top_k(model_dft);
+        is_dspine      = llama_model_dflash_variant(model_dft) == LLAMA_DFLASH_VARIANT_DSPINE;
+        if (is_dspine) {
+            if (!causal_attn) {
+                throw std::runtime_error("DSpine draft requires causal block attention (dflash.attention.causal)");
+            }
+            // the lattice candidates are target-head rows and index the draft's codebook (one row per token)
+            if (llama_vocab_n_tokens(llama_model_get_vocab(model_dft)) < llama_vocab_n_tokens(llama_model_get_vocab(model_tgt))) {
+                throw std::runtime_error("DSpine draft vocabulary is smaller than the target's");
+            }
+        }
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
 
-        // DFlash2 ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
+        // the lattice ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
         // and rescore the best candidates with the original weights
         if (getenv("LLAMA_DFLASH_NO_APPROX_HEAD") == nullptr) {
             const int64_t t0 = ggml_time_us();
-            if (llama_model_dflash_build_approx_head(const_cast<llama_model *>(llama_get_model(this->params.ctx_dft)), llama_get_model(this->params.ctx_tgt))) {
-                LOG_INF("%s: - DFlash2 ranks the vocabulary with a 2-bit copy of the target output head (%.1f s)\n",
-                        __func__, (ggml_time_us() - t0) / 1e6);
+            if (llama_model_dflash_build_approx_head(const_cast<llama_model *>(model_dft), model_tgt)) {
+                LOG_INF("%s: - %s ranks the vocabulary with a 2-bit copy of the target output head (%.1f s)\n",
+                        __func__, is_dspine ? "DSpine" : "DFlash2", (ggml_time_us() - t0) / 1e6);
             }
         }
 
@@ -1843,6 +1901,12 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                         sorted_idx[k] = k;
                     }
                     std::sort(sorted_idx.begin(), sorted_idx.end(), [row](int32_t a, int32_t b) { return row[a] < row[b]; });
+
+                    if (is_dspine) {
+                        // DSpine samples under the request's filters (dspine_mlx serial_sample_chain / filter_probs):
+                        // joint top-k / top-p on the candidates in id order, then min-p, renormalized
+                        dspine_filter(probs, sorted_idx, dp.top_k, dp.top_p, dp.min_p);
+                    }
 
                     // a round-off overshoot keeps the argmax, which has q > 0
                     double u = std::uniform_real_distribution<double>(0.0, 1.0)(dflash2_rng[seq_id]);
@@ -3482,6 +3546,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     case LLAMA_DFLASH_VARIANT_DFLASH2:  type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2;  break;
                     case LLAMA_DFLASH_VARIANT_DSPARK:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;   break;
                     case LLAMA_DFLASH_VARIANT_LILICORR: type_model = COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR; break;
+                    // DSpine is walked by the DFlash2 driver: its lattice has the same layout
+                    case LLAMA_DFLASH_VARIANT_DSPINE:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2;  break;
                     case LLAMA_DFLASH_VARIANT_NONE:     break;
                 }
                 if (type_model == COMMON_SPECULATIVE_TYPE_NONE) {

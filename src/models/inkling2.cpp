@@ -455,6 +455,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             Vcur = build_lora_mm(layer.wv,        inputs[2]);
         }
 
+        // the attention sinks read the attention input only: put them next to the projections in the graph, so that the
+        // backends compute them together (the mask that reads them then needs no extra sync)
+        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        // (only with one attention input: the separate inputs of the full-attention layers have their own chains, which
+        // the backends interleave better in the default order)
+        const bool order = fuse("order") && inputs[1] == inputs[0] && inputs[2] == inputs[0];
+        if (order) {
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, sinks);
+        }
+
         // the short convolutions of K and V, in one call over both when their rows are next to each other (no dynamic taps)
         ggml_tensor * k_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1], 0) : layer.attn_k_conv;
         ggml_tensor * v_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1],
@@ -512,7 +523,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         const int64_t n_kv = rel_pos->ne[0];
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         if (fused_attn) {
             // one F16 mask per head: mask + attn_rel_bias[:, q_pos - kv_pos] . Rcur - sink, the bias in F32
@@ -552,6 +562,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                             sinks_c, qpos_c, kv_pos) :
                     ggml_rel_bias_mask(ctx0, mask_c, layer.attn_rel_bias, rcur_c, sinks_c, qpos_c, kv_pos);
                 cb(kq_mask, "kq_mask_rel", il);
+
+                // the mask before the K/V stores in the graph: it then runs with them, its output allocated before their
+                // temporaries are freed (a reuse of those would need a sync)
+                if (order) {
+                    ggml_build_forward_expand(gf, kq_mask);
+                }
 
                 outs.push_back(build_attn_masked(inp, q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr,
                         kq_mask, zero_sinks, 1.0f/sqrtf(n_embd_head), il, pre_rot));

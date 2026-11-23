@@ -794,7 +794,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // unsorted: the test and the residual need the probabilities, not their order (a sort of the whole vocabulary
+        // per position costs more than the verification)
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
@@ -840,14 +842,32 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             continue;
         }
 
-        // rejected: tokens outside q's support keep all of p
+        // rejected: tokens outside q's support keep all of p. q by token id, so the pass over the vocabulary does not
+        // search q for every token (the first entry of a token wins, as in prob_of)
+        static thread_local std::vector<float> q_by_id;
+        const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (q_by_id.size() < n_vocab) {
+            q_by_id.assign(n_vocab, 0.0f);
+        }
+        for (size_t k = q.size(); k-- > 0;) {
+            if (q[k].id >= 0 && (size_t) q[k].id < n_vocab) {
+                q_by_id[q[k].id] = q[k].p;
+            }
+        }
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const llama_token id_k = cur_p->data[k].id;
+            const float r = p_of(k) - (id_k >= 0 && (size_t) id_k < n_vocab ? q_by_id[id_k] : 0.0f);
             if (r > 0.0f) {
                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
+            }
+        }
+
+        for (const auto & e : q) {
+            if (e.id >= 0 && (size_t) e.id < n_vocab) {
+                q_by_id[e.id] = 0.0f;
             }
         }
 

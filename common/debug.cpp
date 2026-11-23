@@ -150,7 +150,9 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src1 = t->src[1];
 
     if (ask) {
-        return true;  // Always retrieve data
+        // LLAMA_DEBUG_DUMP_MATCH: only the matching tensors, so that the backend computes the rest of the graph as usual (fusions)
+        static const char * only = getenv("LLAMA_DEBUG_DUMP_MATCH");
+        return only == nullptr || strstr(t->name, only) != nullptr;
     }
 
     bool matches_filter = pimpl->tensor_filters.empty();

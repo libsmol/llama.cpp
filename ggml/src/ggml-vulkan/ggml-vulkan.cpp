@@ -4328,7 +4328,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 12, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column, uint32_t(gdn_packed_rows)}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -12436,6 +12436,20 @@ static void ggml_vk_cpy_multi(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { sbuf, dbuf }, pc, { pc.ne0 * pc.ne1, pc.ne2, pc.ncopy });
 }
 
+// GATED_DELTA_NET runs as the chunked coopmat scan (prefill), else as the scalar scan, the only one with the fused variants
+static bool ggml_vk_gdn_use_cm(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const uint32_t S_v      = (uint32_t) dst->src[2]->ne[0];
+    const uint32_t n_tokens = (uint32_t) dst->src[2]->ne[2];
+    const uint32_t K        = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    // RDNA3: the scan is faster below ~4k tokens
+    const uint32_t cm_min_tokens = ctx->device->architecture == AMD_RDNA3 ? 4096u : 64u;
+    return (ctx->device->pipeline_gated_delta_net_cm != nullptr ||
+            ctx->device->pipeline_gated_delta_net_cm_v32 != nullptr ||
+            ctx->device->pipeline_gated_delta_net_cm_v128 != nullptr) &&
+        dst->src[3]->ne[0] == 1 && S_v == 128 && dst->src[0]->ne[0] == 128 && K == 1 && n_tokens >= cm_min_tokens &&
+        ggml_get_op_params_i32(dst, 1) == 0;
+}
+
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
@@ -12454,14 +12468,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
-    const ggml_tensor * src_g = dst->src[3];
-    // RDNA3: the scan is faster below ~4k tokens
-    const uint32_t cm_min_tokens = ctx->device->architecture == AMD_RDNA3 ? 4096u : 64u;
-    const bool use_cm = (ctx->device->pipeline_gated_delta_net_cm != nullptr ||
-                         ctx->device->pipeline_gated_delta_net_cm_v32 != nullptr ||
-                         ctx->device->pipeline_gated_delta_net_cm_v128 != nullptr) &&
-        src_g->ne[0] == 1 && S_v == 128 && dst->src[0]->ne[0] == 128 && K == 1 && n_tokens >= cm_min_tokens;
-
+    const bool use_cm = ggml_vk_gdn_use_cm(ctx, dst);
     const bool use_cm2 = use_cm && ctx->device->coopmat2;
     const bool have_v64 = ctx->device->pipeline_gated_delta_net_cm != nullptr;
     bool use_v32  = use_cm && !use_cm2 && !have_v64 && ctx->device->pipeline_gated_delta_net_cm_v32 != nullptr;
@@ -12529,6 +12536,105 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+
+    // unfused: states go to the snapshot area of dst, s0 is src[5]
+    vk_subbuffer sout_buf = dst_buf;
+    vk_subbuffer sidx_buf = src_buf[5];
+    uint32_t so_off  = s_off;
+    uint32_t so_seq  = S_v * S_v * H;
+    uint32_t so_slot = S_v * S_v * H * n_seqs;
+    uint32_t si_row  = 0;
+    uint32_t use_idx = 0;
+    uint32_t gates_raw = 0;
+    vk_subbuffer dt_buf = src_buf[0];
+    vk_subbuffer a_buf  = src_buf[0];
+
+    // lazy snapshots: unfused, the base and the factors follow the attention scores in dst (binding 7),
+    // the factors in are binding 11 and the replay counts binding 8. Fused, bindings 5 / 7 are the whole
+    // cache and binding 8 the whole index tensor (ggml_vk_find_gdn_fusions checks they are shared).
+    const bool lazy = ggml_get_op_params_i32(dst, 1) != 0;
+    vk_subbuffer fin_buf = src_buf[0];
+    uint32_t fi_off = 0, fi_row = 0, fii_off = 0, fo_off = 0, fo_row = 0, foi_off = 0, rp_off = 0, si_off = 0;
+    auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    // element offset of t within the subbuffer sb
+    auto const elem_off = [&](const ggml_tensor * t, const vk_subbuffer & sb) {
+        return (uint32_t) ((vk_tensor_offset(t) + t->view_offs - sb.offset) / ggml_type_size(t->type));
+    };
+    if (lazy) {
+        fin_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[6]);
+        fo_off  = s_off + S_v * S_v * H * n_seqs;
+        // binding 8 spans the replay counts and the fused index tensors, all in one buffer
+        std::vector<const ggml_tensor *> idx = { dst->src[7] };
+        auto fit0 = ctx->gdn_fusions.find(dst);
+        if (fit0 != ctx->gdn_fusions.end()) {
+            for (const ggml_tensor * n : { fit0->second.state_rows, fit0->second.fin_rows, fit0->second.fout_rows }) {
+                if (n) {
+                    idx.push_back(n->src[1]);
+                }
+            }
+        }
+        sidx_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[7], true);
+        size_t lo = sidx_buf.offset, hi = sidx_buf.offset + sidx_buf.size;
+        for (const ggml_tensor * t : idx) {
+            const vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, t, true);
+            GGML_ASSERT(sb.buffer == sidx_buf.buffer);
+            lo = std::min(lo, (size_t) sb.offset);
+            hi = std::max(hi, (size_t) (sb.offset + sb.size));
+        }
+        sidx_buf = vk_subbuffer{ sidx_buf.buffer, lo, hi - lo };
+        rp_off   = elem_off(dst->src[7], sidx_buf);
+    }
+
+    auto fit = ctx->gdn_fusions.find(dst);
+    if (fit != ctx->gdn_fusions.end()) {
+        if (fit->second.alpha) {
+            src_buf[3] = ggml_vk_tensor_subbuffer(ctx, fit->second.alpha);
+            src_buf[4] = ggml_vk_tensor_subbuffer(ctx, fit->second.beta_raw);
+            dt_buf     = ggml_vk_tensor_subbuffer(ctx, fit->second.dt);
+            a_buf      = ggml_vk_tensor_subbuffer(ctx, fit->second.a);
+            gates_raw  = 1;
+        }
+        if (const ggml_tensor * cpy = fit->second.state_cpy) {
+            const ggml_tensor * sdst = cpy->src[1];
+            sout_buf = ggml_vk_tensor_subbuffer(ctx, root(sdst), true);
+            so_off  = elem_off(sdst, sout_buf);
+            so_seq  = (uint32_t) (sdst->nb[1] / sizeof(float));
+            so_slot = (uint32_t) (sdst->nb[2] / sizeof(float));
+        }
+        if (const ggml_tensor * rows = fit->second.state_rows) {
+            src_buf[5] = ggml_vk_tensor_subbuffer(ctx, rows->src[0]);
+            if (!lazy) {
+                sidx_buf = ggml_vk_tensor_subbuffer(ctx, rows->src[1], true);
+            }
+            si_off  = elem_off(rows->src[1], sidx_buf);
+            si_row  = (uint32_t) (rows->src[0]->nb[1] / sizeof(float));
+            use_idx = 1;
+        }
+        if (const ggml_tensor * rows = fit->second.fin_rows) {
+            // GET_ROWS(view of the cache in binding 5, idx)
+            fi_off  = elem_off(rows->src[0], src_buf[5]);
+            fi_row  = (uint32_t) (rows->src[0]->nb[1] / sizeof(float));
+            fii_off = elem_off(rows->src[1], sidx_buf);
+        }
+        if (const ggml_tensor * rows = fit->second.fout_rows) {
+            // SET_ROWS(view of the cache in binding 7, factors, idx)
+            fo_off  = elem_off(rows, sout_buf);
+            fo_row  = (uint32_t) (rows->nb[1] / sizeof(float));
+            foi_off = elem_off(rows->src[1], sidx_buf);
+        }
+    }
+
+    // the fused and lazy variants exist for the scalar scan only (ggml_vk_find_gdn_fusions skips the chunked nodes)
+    GGML_ASSERT(!use_cm || (fit == ctx->gdn_fusions.end() && !lazy));
+    // fi_row and fo_row both address rows of the recurrent cache
+    GGML_ASSERT(fi_row == 0 || fo_row == 0 || fi_row == fo_row);
+
+    const uint32_t flags = (use_idx   ? GGML_VK_GDN_FLAG_USE_IDX   : 0u) |
+                           (gates_raw ? GGML_VK_GDN_FLAG_GATES_RAW : 0u) |
+                           (lazy      ? GGML_VK_GDN_FLAG_LAZY      : 0u) |
+                           (fi_row    ? GGML_VK_GDN_FLAG_FI_ROWS   : 0u) |
+                           (fo_row    ? GGML_VK_GDN_FLAG_FO_ROWS   : 0u);
+
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
@@ -12537,7 +12643,13 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        so_off, so_seq, so_slot,
+        si_row, flags,
+        fi_off, fii_off,
+        fo_off, foi_off,
+        fi_row ? fi_row : fo_row,
+        rp_off, si_off,
     };
 
     if (use_v128) {
@@ -12545,10 +12657,15 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, mirror_buf},
             pc, std::array<uint32_t, 3>{ S_v / cm_V, n_seqs, H });
         ctx->prealloc_x_need_sync = true;
-    } else {
+    } else if (use_cm) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-            pc, use_cm ? std::array<uint32_t, 3>{ S_v / cm_V, n_seqs, H } : std::array<uint32_t, 3>{ H, n_seqs, S_v });
+            pc, std::array<uint32_t, 3>{ S_v / cm_V, n_seqs, H });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, sout_buf, sidx_buf, dt_buf, a_buf,
+             fin_buf},
+            pc, std::array<uint32_t, 3>{ H, n_seqs, S_v });
     }
 }
 
@@ -14619,6 +14736,13 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             }
         }
         if (gdn_fit != ctx->gdn_fusions.end()) {
+            // the absorbed gate inputs are read by the GDN but are not among its srcs: a later node that reuses
+            // their memory must wait for it
+            if (gdn_fit->second.alpha) {
+                for (const ggml_tensor * t : { gdn_fit->second.alpha, gdn_fit->second.beta_raw, gdn_fit->second.dt, gdn_fit->second.a }) {
+                    ctx->unsynced_nodes_read.push_back(t);
+                }
+            }
             if (gdn_fit->second.state_cpy) {
                 ctx->unsynced_nodes_written.push_back(gdn_fit->second.state_cpy->src[1]);
             }
@@ -16911,8 +17035,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     ctx->glu_to_f16.clear();
     ctx->glu_to_f16_b.clear();
 
-    // the fusion targets the v0.9.0 GDN shader: off until it is ported to the current one
-    static const bool disabled     = true;
+    static const bool disabled     = getenv("GGML_VK_DISABLE_GDN_FUSION") != nullptr;
     static const bool glu_disabled = getenv("GGML_VK_DISABLE_GLU_F16") != nullptr;
 
     // this runs before the first submit of every graph: the use counts below are only built when a node needs them
@@ -16962,7 +17085,8 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * g = cgraph->nodes[i];
-        if (g->op != GGML_OP_GATED_DELTA_NET || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        // the chunked coopmat scan has no fused variant
+        if (g->op != GGML_OP_GATED_DELTA_NET || (g->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_vk_gdn_use_cm(ctx, g)) {
             continue;
         }
         const ggml_tensor * v = g->src[2];
@@ -17156,6 +17280,32 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
             for (const ggml_tensor * n : gate_nodes) {
                 ctx->gdn_fused_skip.insert(n);
             }
+        }
+    }
+    // GGML_VK_GDN_FUSION_LOG: what the fusion found, once per distinct graph shape
+    static const bool log_fusions = getenv("GGML_VK_GDN_FUSION_LOG") != nullptr;
+    if (log_fusions) {
+        static std::set<std::pair<int, int>> seen;
+        int n_gdn = 0, n_rows = 0, n_cpy = 0, n_gates = 0, n_fin = 0, n_fout = 0, n_tok = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * g = cgraph->nodes[i];
+            if (g->op != GGML_OP_GATED_DELTA_NET) {
+                continue;
+            }
+            n_gdn++;
+            n_tok = (int) g->src[2]->ne[2];
+            const auto it = ctx->gdn_fusions.find(g);
+            if (it != ctx->gdn_fusions.end()) {
+                n_rows  += it->second.state_rows != nullptr;
+                n_cpy   += it->second.state_cpy  != nullptr;
+                n_gates += it->second.alpha      != nullptr;
+                n_fin   += it->second.fin_rows   != nullptr;
+                n_fout  += it->second.fout_rows  != nullptr;
+            }
+        }
+        if (n_gdn > 0 && seen.insert({n_gdn, n_tok}).second) {
+            fprintf(stderr, "ggml_vulkan: GDN fusion, %d nodes of %d tokens: state rows %d, state cpy %d, gates %d, lazy in %d, lazy out %d\n",
+                    n_gdn, n_tok, n_rows, n_cpy, n_gates, n_fin, n_fout);
         }
     }
 }
@@ -18360,8 +18510,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     // GATED_DELTA_NET evaluates its gate ops itself (ggml_vk_find_gdn_fusions) once their inputs are
     // kept alive up to it; the tag tells the compute pass that they are.
-    // off with the GDN fusion (ggml_vk_find_gdn_fusions)
-    static const bool gates_disabled = true;
+    static const bool gates_disabled = getenv("GGML_VK_DISABLE_GDN_GATES_FUSION") != nullptr;
     if (!gates_disabled && params && params->add_alloc_dep) {
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * g = graph->nodes[i];
@@ -19280,8 +19429,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                // the lazy variant (ggml_gated_delta_net_lazy) is not ported to the current GDN shader yet
-                if (ggml_get_op_params_i32(op, 1) != 0) {
+                if (ggml_get_op_params_i32(op, 1) != 0 && (op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32)) {
                     return false;
                 }
                 return op->type == GGML_TYPE_F32;

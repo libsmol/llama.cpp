@@ -47,8 +47,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT;
         lazy = arch_ok && n_rs_seq > 0 && mem_size == 1 && type_s == GGML_TYPE_F32 && h > 0 &&
                (uint64_t) s_v * s_v * h == hparams.n_embd_s() && 3 * (n_rs_seq + 1) <= s_v &&
-               // the lazy op targets the v0.9.0 GDN shader: off until it is ported to the current one
-               getenv("LLAMA_RS_LAZY_ENABLE") != nullptr;
+               getenv("LLAMA_RS_LAZY_DISABLE") == nullptr;
         if (lazy) {
             lz_s_v = s_v;
             lz_h   = h;

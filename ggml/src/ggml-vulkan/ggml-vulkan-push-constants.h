@@ -917,7 +917,25 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // scalar scan only (gated_delta_net.comp): snapshot/state output (binding 7) at so_off, per-seq and per-slot strides
+    uint32_t so_off, so_seq, so_slot;
+    // GGML_VK_GDN_FLAG_USE_IDX: the state input is row idx[seq] (binding 8, at si_off) of si_row elements
+    uint32_t si_row, flags;
+    // lazy snapshots: factors in at fi_off (binding 11, or the cache in binding 5 with GGML_VK_GDN_FLAG_FI_ROWS: row
+    // idx[seq] of f_row elements, the index at fii_off), factors out likewise at fo_off / foi_off; replay counts at rp_off
+    uint32_t fi_off, fii_off;
+    uint32_t fo_off, foi_off;
+    uint32_t f_row;
+    uint32_t rp_off, si_off;
 };
+
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+
+#define GGML_VK_GDN_FLAG_USE_IDX   1u
+#define GGML_VK_GDN_FLAG_GATES_RAW 2u
+#define GGML_VK_GDN_FLAG_LAZY      4u
+#define GGML_VK_GDN_FLAG_FI_ROWS   8u
+#define GGML_VK_GDN_FLAG_FO_ROWS   16u
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;

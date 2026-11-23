@@ -1011,6 +1011,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rot_gate_f32;
     vk_pipeline pipeline_short_conv_rs_f32[9]; // by n_conv
     vk_pipeline pipeline_res_mix_norm[9][3]; // RES_MIX + RMS_NORM_MUL of its rows, by states and queries
+    vk_pipeline pipeline_reduce_long[2][2];  // SUM / ARGMAX of a few long rows, by mode and pass
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;

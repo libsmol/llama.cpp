@@ -349,6 +349,16 @@ struct vk_op_short_conv_rs_push_constants {
     uint32_t has_r, nbr1, r_offset;
 };
 
+struct vk_op_reduce_long_push_constants {
+    uint32_t n_cols;
+    uint32_t row_stride;
+    uint32_t a_offset;
+    uint32_t d_offset;
+    uint32_t chunk;
+    uint32_t n_chunks;
+    float weight;
+};
+
 struct vk_op_res_mix_norm_push_constants {
     uint32_t n_embd, n_tokens;
     uint32_t nbq1;

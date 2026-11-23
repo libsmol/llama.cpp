@@ -4133,6 +4133,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
+    for (uint32_t mode = 0; mode < 2; ++mode) {
+        for (uint32_t pass = 1; pass <= 2; ++pass) {
+            static const char * names[2][2] = { { "sum_long1_f32", "sum_long2_f32" }, { "argmax_long1_f32", "argmax_long2_f32" } };
+            ggml_vk_create_pipeline(device, device->pipeline_reduce_long[mode][pass - 1], names[mode][pass - 1],
+                reduce_long_f32_len, reduce_long_f32_data, "main", 3, sizeof(vk_op_reduce_long_push_constants), {1, 1, 1}, { mode, pass }, 1);
+        }
+    }
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32_wg512, "cross_entropy_loss_f32_wg512", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -13936,7 +13943,58 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     ctx->prealloc_x_need_sync = true;
 }
 
+// SUM / ARGMAX of a few long contiguous f32 rows (e.g. the vocabulary, in backend sampling and drafting): the single
+// workgroup per row of sum_rows / argmax scans it serially (~0.85 ms for 201k columns); here chunks of each row are
+// reduced in parallel, then their partials. Returns false when the shape does not qualify.
+static bool ggml_vk_reduce_long(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, ggml_tensor * dst,
+        uint32_t mode, int64_t n_cols, int64_t n_rows, int64_t row_stride) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_REDUCE_LONG") != nullptr;
+    if (disabled || src0->type != GGML_TYPE_F32 || n_cols < 16384 || n_rows > 64 || n_cols > UINT32_MAX / 2 ||
+        !ctx->device->pipeline_reduce_long[mode][0]) {
+        return false;
+    }
+    const uint32_t chunk    = 2048;
+    const uint32_t n_chunks = (uint32_t) CEIL_DIV(n_cols, (int64_t) chunk);
+
+    const size_t temp_size = sizeof(uint32_t) * 2 * n_chunks * n_rows;
+    if (ctx->prealloc_size_split_k < temp_size) {
+        ctx->prealloc_size_split_k = temp_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    vk_pipeline p1 = ctx->device->pipeline_reduce_long[mode][0];
+    vk_pipeline p2 = ctx->device->pipeline_reduce_long[mode][1];
+    ggml_pipeline_request_descriptor_sets(ctx, p1, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, p2, 1);
+
+    vk_op_reduce_long_push_constants pc {};
+    pc.n_cols     = (uint32_t) n_cols;
+    pc.row_stride = (uint32_t) row_stride;
+    pc.a_offset   = get_misalign_bytes(ctx, src0) / sizeof(float);
+    pc.d_offset   = get_misalign_bytes(ctx, dst) / sizeof(float);
+    pc.chunk      = chunk;
+    pc.n_chunks   = n_chunks;
+    pc.weight     = 1.0f;
+
+    vk_subbuffer src_buf  = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    vk_subbuffer temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, p1, { src_buf, temp_buf, dst_buf }, pc, { n_chunks, (uint32_t) n_rows, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, p2, { src_buf, temp_buf, dst_buf }, pc, { 1, (uint32_t) n_rows, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+    return true;
+}
+
 void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    if (ggml_is_contiguous(src0) && dst->type == GGML_TYPE_F32 &&
+        ggml_vk_reduce_long(ctx, subctx, src0, dst, 0, ggml_nelements(src0), 1, ggml_nelements(src0))) {
+        return;
+    }
     vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, ggml_nelements(src0));
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
 }
@@ -14098,6 +14156,10 @@ void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& 
 }
 
 void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    if (ggml_is_contiguous_rows(src0) && ggml_nrows(src0) == src0->ne[1] && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) &&
+        ggml_vk_reduce_long(ctx, subctx, src0, dst, 1, src0->ne[0], src0->ne[1], src0->nb[1] / sizeof(float))) {
+        return;
+    }
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
@@ -17867,6 +17929,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 }
 
 static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    const int64_t perf_graph_start_us = ggml_time_us();
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -18418,6 +18481,19 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
                 }
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
             }
+        }
+        // GGML_VK_PERF_LOGGER_GRAPHS: one line per graph: its GPU time, the host time since the end of the previous graph
+        static const bool graphs_log = getenv("GGML_VK_PERF_LOGGER_GRAPHS") != nullptr;
+        if (graphs_log && ctx->query_idx > 1) {
+            static int64_t last_end_us = 0;
+            static int graph_id = 0;
+            const int64_t now_us = ggml_time_us();
+            const double gpu_us = (timestamps[ctx->query_idx - 1] - timestamps[0]) * ctx->device->properties.limits.timestampPeriod / 1000.0;
+            const double wall_us = (double) (now_us - perf_graph_start_us);
+            fprintf(stderr, "GRAPH %5d nodes %5d first %-24.24s last %-24.24s gpu %8.1f us wall %8.1f us gap-before %8.1f us\n", graph_id++,
+                cgraph->n_nodes, cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "",
+                gpu_us, wall_us, last_end_us ? (double) (perf_graph_start_us - last_end_us) : 0.0);
+            last_end_us = now_us;
         }
         ctx->perf_logger->print_timings();
     }

@@ -349,6 +349,15 @@ struct vk_op_short_conv_rs_push_constants {
     uint32_t has_r, nbr1, r_offset;
 };
 
+struct vk_op_res_mix_norm_push_constants {
+    uint32_t n_embd, n_tokens;
+    uint32_t nbq1;
+    uint32_t nbs1[VK_RES_MIX_MAX_STATES];
+    float eps, scale;
+    uint32_t norm_mask;
+    float norm_eps;
+};
+
 struct vk_op_loop_gate_push_constants {
     uint32_t ne0, ne1;
     uint32_t nba1, nbm1, nbg1, nbf1;

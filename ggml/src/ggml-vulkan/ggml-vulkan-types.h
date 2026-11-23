@@ -235,6 +235,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #endif // GGML_VULKAN_DEBUG
 
 #define MAX_PARAMETER_COUNT 12
+// bindings of the shared descriptor set layout (the pipelines with more buffers than MAX_PARAMETER_COUNT: res_mix_norm)
+#define VK_MAX_BINDINGS 24
 #define VK_RES_MIX_MAX_STATES 9
 #define VK_RES_MIX_MAX_Q 4
 
@@ -1008,6 +1010,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_loop_up_f32;
     vk_pipeline pipeline_rot_gate_f32;
     vk_pipeline pipeline_short_conv_rs_f32[9]; // by n_conv
+    vk_pipeline pipeline_res_mix_norm[9][3]; // RES_MIX + RMS_NORM_MUL of its rows, by states and queries
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1229,6 +1232,63 @@ struct vk_buffer_copy_region {
     size_t size;
 };
 
+// use counts of a few tensors of a graph (as srcs of its nodes): a small open-addressing table of the tensors, then one
+// pass over the srcs of every node. The fusion analysis runs before the first submit, so it has to be cheap (counting
+// every tensor of an Inkling token, ~6k nodes, costs ~0.1-0.3 ms of GPU idle time)
+struct vk_graph_uses {
+    std::vector<const ggml_tensor *> keys;
+    std::vector<int32_t>             counts;
+    size_t                           mask = 0;
+
+    static size_t hash(const ggml_tensor * t) {
+        uint64_t x = (uint64_t) (uintptr_t) t;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+        return (size_t) x;
+    }
+    // counts the uses of the tensors ts
+    void count(const ggml_cgraph * cgraph, const std::vector<const ggml_tensor *> & ts) {
+        size_t cap = 64;
+        while (cap < ts.size()*4) {
+            cap <<= 1;
+        }
+        keys.assign(cap, nullptr);
+        counts.assign(cap, 0);
+        mask = cap - 1;
+        for (const ggml_tensor * t : ts) {
+            size_t h = hash(t) & mask;
+            while (keys[h] && keys[h] != t) {
+                h = (h + 1) & mask;
+            }
+            keys[h] = t;
+        }
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            for (const ggml_tensor * s : cgraph->nodes[i]->src) {
+                if (!s) {
+                    continue;
+                }
+                size_t h = hash(s) & mask;
+                while (keys[h]) {
+                    if (keys[h] == s) {
+                        counts[h]++;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
+        }
+    }
+    int32_t get(const ggml_tensor * t) const {
+        size_t h = hash(t) & mask;
+        while (keys[h]) {
+            if (keys[h] == t) {
+                return counts[h];
+            }
+            h = (h + 1) & mask;
+        }
+        return 0;
+    }
+};
+
 struct vk_context_struct {
     vk_submission * s;
     std::vector<vk_sequence> seqs;
@@ -1242,6 +1302,10 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    // a transfer command (copy / fill) was recorded since the last barrier, or the command buffer is new and earlier
+    // ones in the queue may hold some: the next barrier then also waits for the transfer stage
+    bool transfer_unsynced = true;
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1381,6 +1445,26 @@ struct ggml_backend_vk_context {
     };
     std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
     std::unordered_set<const ggml_tensor *> gdn_fused_skip;
+    vk_graph_uses graph_uses;
+    // RES_MIX + RMS_NORM * weight of its rows (ggml_vk_find_mix_norm_fusions): one res_mix_norm dispatch at the RES_MIX,
+    // the RMS_NORM and MUL nodes in gdn_fused_skip
+    struct vk_mix_norm_fusion {
+        const ggml_tensor * mix = nullptr;
+        const ggml_tensor * norm_w[3]   = {};
+        const ggml_tensor * norm_out[3] = {}; // the MUL nodes
+        float norm_eps = 0.0f;
+        uint32_t norm_mask = 0;
+    };
+    std::unordered_map<const ggml_tensor *, vk_mix_norm_fusion> mix_norm_fusions;
+    // the last result of ggml_vk_find_fusions_counted, for an equal graph
+    struct {
+        bool valid = false;
+        ggml_tensor ** nodes = nullptr;
+        int n_nodes = 0;
+        uint64_t sig = 0;
+        std::unordered_map<const ggml_tensor *, vk_mix_norm_fusion> mix_norm_fusions;
+        std::vector<const ggml_tensor *> skip;
+    } fusion_cache;
     // runs of CPY nodes done in one dispatch by the first (ggml_vk_find_cpy_groups); the rest are in
     // gdn_fused_skip
     std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> cpy_groups;

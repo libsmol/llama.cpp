@@ -1120,6 +1120,7 @@ void process_shaders() {
     string_to_spv("loop_down_f32", "loop_down.comp", {});
     string_to_spv("loop_up_f32", "loop_up.comp", {});
     string_to_spv("short_conv_rs_f32", "short_conv_rs.comp", {});
+    string_to_spv("res_mix_norm_f32", "res_mix_norm.comp", {});
     string_to_spv("rot_gate_f32", "rot_gate.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

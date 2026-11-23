@@ -1,0 +1,198 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// RES_MIX -> RMS_NORM * weight of the mixed rows, one workgroup per token. Computes exactly what res_mix.comp (256
+// invocations) and rms_norm.comp (512 invocations, rms_norm(8), subgroup sums) do, in their orders: the mix with the
+// first 256 invocations (the others add nothing), the norms of the mixed rows from shared memory with all 512. The mix
+// is stored too. Phases, each after a barrier: 1 reads the queries and states and writes the mix, 2 reads the norm
+// weights and writes the normed rows.
+layout (constant_id = 0) const uint NS = 1; // mix states
+layout (constant_id = 1) const uint NQ = 1; // mix queries
+layout (local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+#define MIX_BS     256
+#define NORM_BS    512
+#define NORM_ITERS 8
+#define MAX_EMBD   2560
+#define NACC       (NS*(NQ + 1))
+
+layout (binding = 0)  readonly  buffer Q  {float data_q[];};
+layout (binding = 1)  readonly  buffer S0 {float data_s0[];};
+layout (binding = 2)  readonly  buffer S1 {float data_s1[];};
+layout (binding = 3)  readonly  buffer S2 {float data_s2[];};
+layout (binding = 4)  readonly  buffer S3 {float data_s3[];};
+layout (binding = 5)  readonly  buffer S4 {float data_s4[];};
+layout (binding = 6)  readonly  buffer S5 {float data_s5[];};
+layout (binding = 7)  readonly  buffer S6 {float data_s6[];};
+layout (binding = 8)  readonly  buffer S7 {float data_s7[];};
+layout (binding = 9)  readonly  buffer S8 {float data_s8[];};
+layout (binding = 10) writeonly buffer D  {float data_d[];};
+layout (binding = 11) readonly  buffer N0 {float data_n0[];};
+layout (binding = 12) readonly  buffer N1 {float data_n1[];};
+layout (binding = 13) readonly  buffer N2 {float data_n2[];};
+layout (binding = 14) writeonly buffer O0 {float data_o0[];};
+layout (binding = 15) writeonly buffer O1 {float data_o1[];};
+layout (binding = 16) writeonly buffer O2 {float data_o2[];};
+
+layout (push_constant) uniform parameter {
+    uint n_embd, n_tokens;
+    uint nbq1;
+    uint nbs1[9];
+    float eps, scale;
+    // bit q set: row q is normed with weight q
+    uint norm_mask;
+    float norm_eps;
+} p;
+
+shared float mixs[NQ*MAX_EMBD];
+shared float red[NACC*32];
+shared float tot[NACC];
+shared float wsh[NQ*NS];
+shared float sumsh[NORM_BS/32];
+
+float load_s(const uint s, const uint idx) {
+    switch (s) {
+        case 0: return data_s0[idx];
+        case 1: return data_s1[idx];
+        case 2: return data_s2[idx];
+        case 3: return data_s3[idx];
+        case 4: return data_s4[idx];
+        case 5: return data_s5[idx];
+        case 6: return data_s6[idx];
+        case 7: return data_s7[idx];
+        default: return data_s8[idx];
+    }
+}
+
+void main() {
+    const uint it = gl_WorkGroupID.y*512u + gl_WorkGroupID.x;
+    if (it >= p.n_tokens) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+
+    // 1. the mix (res_mix.comp)
+    float acc[NACC];
+    [[unroll]] for (uint a = 0; a < NACC; ++a) {
+        acc[a] = 0.0;
+    }
+    if (tid < MIX_BS) {
+        for (uint i = tid; i < p.n_embd; i += MIX_BS) {
+            float qv[NQ];
+            [[unroll]] for (uint q = 0; q < NQ; ++q) {
+                qv[q] = data_q[q*p.nbq1 + i];
+            }
+            [[unroll]] for (uint s = 0; s < NS; ++s) {
+                const float x = load_s(s, it*p.nbs1[s] + i);
+                acc[s*(NQ + 1)] += x*x;
+                [[unroll]] for (uint q = 0; q < NQ; ++q) {
+                    acc[s*(NQ + 1) + 1 + q] += qv[q]*x;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint a = 0; a < NACC; ++a) {
+        const float v = subgroupAdd(acc[a]);
+        if (subgroupElect() && tid < MIX_BS) {
+            red[a*32 + gl_SubgroupID] = v;
+        }
+    }
+    barrier();
+    if (tid < NACC) {
+        float v = 0.0;
+        for (uint g = 0; g < MIX_BS/gl_SubgroupSize; ++g) {
+            v += red[tid*32 + g];
+        }
+        tot[tid] = v;
+    }
+    barrier();
+
+    if (tid < NQ) {
+        const uint q = tid;
+        float sc[NS];
+        float inv[NS];
+        float mx = -1.0/0.0;
+        [[unroll]] for (uint s = 0; s < NS; ++s) {
+            inv[s] = inversesqrt(tot[s*(NQ + 1)]/float(p.n_embd) + p.eps);
+            sc[s]  = tot[s*(NQ + 1) + 1 + q]*inv[s]*p.scale;
+            mx = max(mx, sc[s]);
+        }
+        float sum = 0.0;
+        [[unroll]] for (uint s = 0; s < NS; ++s) {
+            sc[s] = exp(sc[s] - mx);
+            sum += sc[s];
+        }
+        [[unroll]] for (uint s = 0; s < NS; ++s) {
+            wsh[q*NS + s] = sc[s]*inv[s]/sum;
+        }
+    }
+    barrier();
+
+    if (tid < MIX_BS) {
+        for (uint i = tid; i < p.n_embd; i += MIX_BS) {
+            float xs[NS];
+            [[unroll]] for (uint s = 0; s < NS; ++s) {
+                xs[s] = load_s(s, it*p.nbs1[s] + i);
+            }
+            [[unroll]] for (uint q = 0; q < NQ; ++q) {
+                float o = 0.0;
+                [[unroll]] for (uint s = 0; s < NS; ++s) {
+                    o += wsh[q*NS + s]*xs[s];
+                }
+                data_d[(q*p.n_tokens + it)*p.n_embd + i] = o;
+                mixs[q*MAX_EMBD + i] = o;
+            }
+        }
+    }
+
+    // 2. the norms of the mixed rows (rms_norm.comp), times the weights
+    [[unroll]] for (uint q = 0; q < NQ; ++q) {
+        if ((p.norm_mask & (1u << q)) == 0) {
+            continue;
+        }
+        barrier();
+        float sum = 0.0;
+        [[unroll]] for (uint col = tid, idx = 0; idx < NORM_ITERS; col += NORM_BS, ++idx) {
+            float xi = 0.0;
+            if (col < p.n_embd) {
+                xi = mixs[q*MAX_EMBD + col];
+            }
+            sum += xi * xi;
+        }
+        sum = subgroupAdd(sum);
+        if (subgroupElect()) {
+            sumsh[gl_SubgroupID] = sum;
+        }
+        barrier();
+        sum = 0.0;
+        if (gl_NumSubgroups <= 4) {
+            [[unroll]] for (uint i = 0; i < gl_NumSubgroups; ++i) {
+                sum += sumsh[i];
+            }
+        } else {
+            for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) {
+                sum += sumsh[i];
+            }
+            sum = subgroupAdd(sum);
+        }
+        const float mean  = sum / float(p.n_embd);
+        const float scale = inversesqrt(mean + p.norm_eps);
+        [[unroll]] for (uint col = tid, idx = 0; idx < NORM_ITERS; col += NORM_BS, ++idx) {
+            if (col >= p.n_embd) {
+                continue;
+            }
+            const uint o = it*p.n_embd + col;
+            if (q == 0) {
+                data_o0[o] = scale * mixs[q*MAX_EMBD + col] * data_n0[col];
+            } else if (q == 1) {
+                data_o1[o] = scale * mixs[q*MAX_EMBD + col] * data_n1[col];
+            } else {
+                data_o2[o] = scale * mixs[q*MAX_EMBD + col] * data_n2[col];
+            }
+        }
+    }
+}

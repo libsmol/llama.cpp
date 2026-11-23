@@ -1562,7 +1562,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // kq_mask is the final per-head mask (see ggml_rel_bias_mask)
+    // kq_mask is the final per-head mask (see ggml_rel_bias_mask); q, k and v are already rotated for the KV cache, the
+    // output is returned rotated
     ggml_tensor * build_attn_masked(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * q_cur,
@@ -1571,8 +1572,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask, // F16 [n_kv, n_rows, n_head_q]
             ggml_tensor * sinks,
                   float   kq_scale,
-                    int   il,
-                   bool   pre_rotated = false) const; // q, k, v are already rotated for the KV cache, the output is returned rotated
+                    int   il) const;
 
     //
     // pooling

@@ -1697,6 +1697,11 @@ struct llama_model_dflash : public llama_model_base {
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
 
+    // the n_cand best output candidates of cur [n_embd, n_tokens] by the approximate head (dflash_output_approx), rescored
+    // with the original head: cand I32 [n_cand, n_tokens], exact [n_cand, n_tokens]; false without an approximate head
+    static bool build_approx_candidates(llm_graph_context & g, const llama_model & model, ggml_tensor * cur, int64_t n_cand,
+            ggml_tensor *& cand, ggml_tensor *& exact);
+
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
 
@@ -2548,10 +2553,6 @@ struct llama_model_inkling2 : public llama_model_base {
                 int64_t offset,
                 ggml_tensor * residual = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
-
-        // LLAMA_INKLING_FUSE_OFF=a,b,...: these fusions off, "all": every one (SITU, the router clamp and the scale gather of
-        // build_moe_ffn stay); for A/B checks
-        bool fuse(const char * name) const;
 
     protected:
         // the helpers alone, a derived graph builds its own body

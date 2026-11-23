@@ -44,6 +44,7 @@ struct vk_mat_mat_stream_k_fixup_push_constants {
 };
 
 static_assert(sizeof(vk_mat_mat_push_constants) <= 128);
+
 // dflash_conv.comp (GGML_OP_DFLASH_CONV)
 struct vk_op_dflash_conv_push_constants {
     uint32_t C; uint32_t T; uint32_t K; uint32_t G; uint32_t gs; uint32_t bs; uint32_t n_taps; uint32_t side;
@@ -55,7 +56,7 @@ struct vk_op_dflash_conv_push_constants {
 struct vk_op_cpy_multi_push_constants {
     uint32_t ne0, ne1, ne2;
     uint32_t snb1, snb2, dnb1;
-    uint32_t ncopy, pad;
+    uint32_t ncopy;
     uint32_t soff[8], doff[8];
 };
 
@@ -80,20 +81,17 @@ struct vk_op_add_rms_norm_mul_push_constants {
 struct vk_mm_rdna4_push_constants {
     uint32_t M; uint32_t N; uint32_t K;
     uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
-    uint32_t flags;
-    uint32_t tiles_m;
+    uint32_t d_aligned16;
     uint32_t n_full;
     uint32_t n_parts;
     uint32_t k_part;
-    uint32_t bs_off;     // flags bit 2: the per-row scales of B (b_to_f16_rowscale.comp), in floats
+    uint32_t bs_off;     // the per-row scales of B (b_to_f16_rowscale.comp), in floats
 };
 
 struct vk_mm_rdna4_reduce_push_constants {
     uint32_t M; uint32_t N; uint32_t stride_d;
-    uint32_t tiles_m;
     uint32_t n_full;
     uint32_t n_parts;
-    uint32_t flags;
 };
 
 struct vk_mat_vec_push_constants {
@@ -310,7 +308,7 @@ struct vk_op_short_conv_push_constants {
 };
 
 struct vk_op_res_mix_push_constants {
-    uint32_t n_embd, n_q, n_states, n_tokens;
+    uint32_t n_embd, n_tokens;
     uint32_t nbq1, q_offset, d_offset;
     uint32_t nbs1[VK_RES_MIX_MAX_STATES];
     uint32_t s_offset[VK_RES_MIX_MAX_STATES];
@@ -326,20 +324,20 @@ struct vk_op_rel_bias_mask_push_constants {
 };
 
 struct vk_op_loop_down_push_constants {
-    uint32_t n_embd, n_rank, n_t;
+    uint32_t n_embd;
     uint32_t nba1, nbm1, nbw1, nbd1;
     uint32_t a_offset, m_offset, w_offset, d_offset;
     float eps;
 };
 
 struct vk_op_loop_up_push_constants {
-    uint32_t n_embd, n_rank, n_t;
+    uint32_t n_embd, n_rank;
     uint32_t nba1, nbm1, nbh1, nbw1;
     uint32_t a_offset, m_offset, h_offset, wg_offset, wf_offset, d_offset;
 };
 
 struct vk_op_short_conv_rs_push_constants {
-    uint32_t n_conv, n_ch, n_t, n_s;
+    uint32_t n_ch, n_t;
     uint32_t nbc1, nbp1, nbp2, nbw1, nbd1, nbs1;
     uint32_t ch_per_head, has_d;
     uint32_t c_offset, p_offset, w_offset, t_offset, s_offset, d_offset;

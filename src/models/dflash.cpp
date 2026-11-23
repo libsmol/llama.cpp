@@ -316,6 +316,41 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_dflash::get_lm_head(const ll
     return { model_other->output, model_other->output_s };
 }
 
+bool llama_model_dflash::build_approx_candidates(llm_graph_context & g, const llama_model & model, ggml_tensor * cur, int64_t n_cand,
+        ggml_tensor *& cand, ggml_tensor *& exact) {
+    const auto [output, output_s] = get_lm_head(g, model);
+    if (!model.dflash_output_approx || model.d2t || output_s != nullptr || model.dflash_output_approx->ne[1] != output->ne[1] ||
+            n_cand >= output->ne[1]) {
+        return false;
+    }
+
+    ggml_context * ctx0     = g.ctx0;
+    const int64_t  n_embd   = cur->ne[0];
+    const int64_t  n_tokens = cur->ne[1];
+    const auto   & hparams  = g.hparams;
+
+    ggml_tensor * approx = ggml_mul_mat(ctx0, model.dflash_output_approx, cur); // [n_vocab, n_tokens]
+    g.cb(approx, "result_output_approx", -1);
+
+    cand = ggml_top_k(ctx0, approx, n_cand);
+
+    ggml_tensor * rows = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand, n_cand*n_tokens));
+    rows  = ggml_reshape_3d(ctx0, rows, n_embd, n_cand, n_tokens);
+    exact = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens));
+    exact = ggml_reshape_2d(ctx0, exact, n_cand, n_tokens);
+    if (hparams.f_logit_scale != 0.0f) {
+        exact = ggml_scale(ctx0, exact, hparams.f_logit_scale);
+    }
+    if (hparams.f_final_logit_softcapping > 0.0f) {
+        exact = ggml_scale(ctx0, exact, 1.0f / hparams.f_final_logit_softcapping);
+        exact = ggml_tanh(ctx0, exact);
+        exact = ggml_scale(ctx0, exact, hparams.f_final_logit_softcapping);
+    }
+    g.cb(exact, "result_output_cand", -1);
+
+    return true;
+}
+
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
@@ -673,7 +708,6 @@ static void build_dspine_lattice(llm_graph_context & g, const llama_model & mode
     res->t_logits = nullptr;
 }
 
-
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
@@ -885,18 +919,10 @@ llama_model_dflash::graph_dspine::graph_dspine(const llm_graph_params & params) 
     // the exact top 16 fall outside the approximate top 128 for 0.05% of the candidates (only exact ranks 9..16;
     // 64: 1%, ranks 5..16), at nearly the cost of 64
     const int64_t n_cand = 128;
-    if (lattice && model.dflash_output_approx && !model.d2t && output_s == nullptr &&
-            model.dflash_output_approx->ne[1] == output->ne[1] && n_cand < output->ne[1] &&
-            n_cand >= (int64_t) hparams.dspine_head_top_k &&
-            hparams.f_logit_scale == 0.0f && hparams.f_final_logit_softcapping <= 0.0f) {
-        ggml_tensor * approx = ggml_mul_mat(ctx0, model.dflash_output_approx, cur);    // [n_vocab, n_tokens]
-        cb(approx, "result_output_approx", -1);
-        ggml_tensor * cand   = ggml_top_k(ctx0, approx, n_cand);                         // [n_cand, n_tokens]
-        ggml_tensor * rows   = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand, n_cand * n_tokens));
-        rows = ggml_reshape_3d(ctx0, rows, n_embd, n_cand, n_tokens);
-        ggml_tensor * exact  = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens));
-        exact = ggml_reshape_2d(ctx0, exact, n_cand, n_tokens);
-        cb(exact, "result_output_cand", -1);
+    ggml_tensor * cand  = nullptr;
+    ggml_tensor * exact = nullptr;
+    if (lattice && n_cand >= (int64_t) hparams.dspine_head_top_k && hparams.f_logit_scale == 0.0f &&
+            hparams.f_final_logit_softcapping <= 0.0f && build_approx_candidates(*this, model, cur, n_cand, cand, exact)) {
         res->t_logits = nullptr;
         build_dspine_lattice(*this, model, inp_tokens, output, stash, block, n_blocks, cand, exact);
         return;

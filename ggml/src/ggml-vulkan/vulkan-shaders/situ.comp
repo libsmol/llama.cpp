@@ -2,15 +2,12 @@
 
 #include "glu_head.glsl"
 
-// overflow-safe tanh, as in unary.comp
-float situ_tanh(float x) {
-    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
-}
+#include "tanh_safe.glsl"
 
 // situ(g, u) = beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb); alpha = beta, limit = lb (lb <= 0: identity on u)
 float op(float a, float b) {
-    const float gate = p.alpha * situ_tanh(a / p.alpha) / (1.0f + exp(-a));
-    const float up   = p.limit > 0.0f ? p.limit * situ_tanh(b / p.limit) : b;
+    const float gate = p.alpha * tanh_safe(a / p.alpha) / (1.0f + exp(-a));
+    const float up   = p.limit > 0.0f ? p.limit * tanh_safe(b / p.limit) : b;
 
     return gate * up;
 }

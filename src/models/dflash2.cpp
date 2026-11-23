@@ -241,34 +241,12 @@ llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params
 
     // approximate head: rank the vocabulary with the Q2_K copy, rescore the best n_cand candidates
     // with the original weights and let the selector take its top k from those
-    {
-        const auto [output, output_s] = get_lm_head(*this, model);
-        const int64_t n_cand = 64;
-        if (model.dflash_output_approx && !model.d2t && output_s == nullptr &&
-                model.dflash_output_approx->ne[1] == output->ne[1] && n_cand < output->ne[1] &&
-                n_cand >= (int64_t) hparams.dflash_selector_top_k) {
-            ggml_tensor * approx = ggml_mul_mat(ctx0, model.dflash_output_approx, cur);    // [n_vocab, n_tokens]
-            cb(approx, "result_output_approx", -1);
-            ggml_tensor * cand   = ggml_top_k(ctx0, approx, n_cand);                         // [n_cand, n_tokens]
-            ggml_tensor * rows   = ggml_get_rows(ctx0, output, ggml_reshape_1d(ctx0, cand, n_cand * n_tokens));
-            rows = ggml_reshape_3d(ctx0, rows, n_embd, n_cand, n_tokens);
-            ggml_tensor * exact  = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens));
-            exact = ggml_reshape_2d(ctx0, exact, n_cand, n_tokens);
-            if (hparams.f_logit_scale != 0.0f) {
-                exact = ggml_scale(ctx0, exact, hparams.f_logit_scale);
-            }
-            if (hparams.f_final_logit_softcapping > 0.0f) {
-                exact = ggml_scale(ctx0, exact, 1.0f / hparams.f_final_logit_softcapping);
-                exact = ggml_tanh(ctx0, exact);
-                exact = ggml_scale(ctx0, exact, hparams.f_final_logit_softcapping);
-            }
-            cb(exact, "result_output_cand", -1);
-
-            res->t_embd = cur;
-            res->t_logits = nullptr;
-            build_dflash2_selector(*this, model, inp_tokens, cand, exact);
-            return;
-        }
+    const int64_t n_cand = 64;
+    ggml_tensor * cand  = nullptr;
+    ggml_tensor * exact = nullptr;
+    if (n_cand >= (int64_t) hparams.dflash_selector_top_k && build_approx_candidates(*this, model, cur, n_cand, cand, exact)) {
+        build_dflash2_selector(*this, model, inp_tokens, cand, exact);
+        return;
     }
 
     build_logits(cur);

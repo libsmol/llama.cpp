@@ -17,14 +17,12 @@ layout (binding = 4) readonly  buffer WF {float data_wf[];};
 layout (binding = 5) writeonly buffer D  {float data_d[];};
 
 layout (push_constant) uniform parameter {
-    uint n_embd, n_rank, n_t;
+    uint n_embd, n_rank;
     uint nba1, nbm1, nbh1, nbw1;
     uint a_offset, m_offset, h_offset, wg_offset, wf_offset, d_offset;
 } p;
 
-float tanh_safe(const float x) {
-    return 1.0 - 2.0/(exp(2.0*x) + 1.0);
-}
+#include "tanh_safe.glsl"
 
 void main() {
     const uint it   = gl_WorkGroupID.y;

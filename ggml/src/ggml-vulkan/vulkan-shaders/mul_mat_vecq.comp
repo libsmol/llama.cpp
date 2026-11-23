@@ -44,17 +44,9 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint b_block_idx_outer = b_block_idx / 4;
         const uint b_block_idx_inner = b_block_idx % 4;
         b_ds[j] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
-#if K_PER_ITER == 16
-        [[unroll]] for (uint k = 0; k < 4; ++k) {
-            b_qs[j][k] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + k];
-        }
-#elif K_PER_ITER == 32
         [[unroll]] for (uint k = 0; k < 8; ++k) {
             b_qs[j][k] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + k];
         }
-#else
-#error unimplemented
-#endif
     }
 
     uint ibi = first_row*p.ncols;
@@ -62,7 +54,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
         ibi += p.ncols;
 
-        const mmvq_a_t a = mmvq_prepare_a(a_block_idx, b_qs_idx);
+        const mmvq_a_t a = mmvq_prepare_a(a_block_idx);
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             temp[j][n] += mmvq_apply_a(a, b_qs[j], b_ds[j]);
         }
@@ -164,7 +156,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
-#if defined(DATA_A_NVFP4) && defined(MUL_MAT_ID) && !defined(MMVQ_NVFP4_PER_COL)
+#if defined(DATA_A_NVFP4) && defined(MUL_MAT_ID)
 // one 16-element sub-block of one row (its e4m3 scale and 8 bytes) per thread and step, the (row, sub-block) pairs of
 // the workgroup's rows spread evenly over its threads: the two halves of a sub-block share their loads, scale and
 // float math, and no thread idles at the end of a row

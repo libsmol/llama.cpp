@@ -27,7 +27,7 @@ layout (binding = 9)  readonly  buffer S8 {float data_s8[];};
 layout (binding = 10) writeonly buffer D  {float data_d[];};
 
 layout (push_constant) uniform parameter {
-    uint n_embd, n_q, n_states, n_tokens;
+    uint n_embd, n_tokens;
     uint nbq1, q_offset, d_offset;
     uint nbs1[MAX_STATES];
     uint s_offset[MAX_STATES];

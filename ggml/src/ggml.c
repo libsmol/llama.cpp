@@ -1109,6 +1109,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SHORT_CONV_RS",
     "ROT_GATE",
     "DFLASH_CONV",
+    "GATED_DELTA_NET_LAZY",
 
     "UNARY",
 
@@ -1130,7 +1131,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGMOID_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,6 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "short_conv_rs(x, past, w, d, state)",
     "rot_gate(a, g)",
     "dflash_conv(x, dynamic, base)",
+    "gated_delta_net_lazy(q, k, v, g, beta, s, f, n)",
 
     "unary(x)",
 
@@ -1257,7 +1259,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sigmoid_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3166,6 +3168,8 @@ struct ggml_tensor * ggml_swiglu_clamp(
     return result;
 }
 
+// ggml_situ
+
 struct ggml_tensor * ggml_situ(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3227,6 +3231,7 @@ struct ggml_tensor * ggml_norm_rot(
     struct ggml_tensor * result = ggml_clip_norm(ctx, a, s, c, max_norm, eps);
     ggml_set_op_params_i32(result, 2, n_rot);
     ggml_set_op_params_i32(result, 3, rms ? 1 : 0);
+
     return result;
 }
 
@@ -3336,7 +3341,7 @@ struct ggml_tensor * ggml_rel_bias_mask(
     GGML_ASSERT(ggml_is_matrix(mask) && mask->nb[0] == ggml_type_size(mask->type));
     GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_matrix(bias) && ggml_is_contiguous(bias));
     GGML_ASSERT(r->type == GGML_TYPE_F32 && r->nb[0] == sizeof(float) && ggml_is_3d(r) && r->ne[0] == bias->ne[0]);
-    GGML_ASSERT(r->ne[0] <= 64); // the clipped r of a row is staged in a fixed buffer (CPU) / shared memory
+    GGML_ASSERT(r->ne[0] <= 64); // the clipped r of a row is staged in a fixed buffer (CPU; Vulkan takes up to 16)
     GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && kv_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(q_pos) && ggml_is_contiguous(kv_pos));
 
@@ -3386,6 +3391,7 @@ struct ggml_tensor * ggml_rel_bias_mask_clip(
     ggml_set_op_params_f32(result, 0, max_norm);
     result->src[6] = rs;
     result->src[7] = tau;
+
     return result;
 }
 
@@ -3496,6 +3502,7 @@ struct ggml_tensor * ggml_short_conv_rs_add(
         GGML_ASSERT(res->type == GGML_TYPE_F32 && ggml_are_same_shape(res, cur) && res->nb[0] == sizeof(float));
         result->src[5] = res;
     }
+
     return result;
 }
 
@@ -6769,9 +6776,8 @@ static struct ggml_tensor * ggml_gated_delta_net_impl(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
-    ggml_set_op_params_i32(result, 1, lazy ? 1 : 0);
 
-    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->op     = lazy ? GGML_OP_GATED_DELTA_NET_LAZY : GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;

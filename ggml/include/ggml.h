@@ -425,6 +425,7 @@ extern "C" {
         GGML_OP_SHORT_CONV_RS,
         GGML_OP_ROT_GATE,
         GGML_OP_DFLASH_CONV,
+        GGML_OP_GATED_DELTA_NET_LAZY,
 
         GGML_OP_UNARY,
 
@@ -2600,6 +2601,8 @@ extern "C" {
     //   then the base [S_v, S_v, H_v, n_seqs]: the state before the last m tokens,
     //   then the factors [3*K*S_v*H_v, n_seqs]: slot t < m holds token n_tokens - m + t as
     //   k [S_v, H_v], delta [S_v, H_v], g [H_v] (padded to S_v*H_v)
+    // f_in must not share memory with where the caller stores the new factors (a backend may write them while other
+    // workgroups still replay f_in)
     GGML_API struct ggml_tensor * ggml_gated_delta_net_lazy(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

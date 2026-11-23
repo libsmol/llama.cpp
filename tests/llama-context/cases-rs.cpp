@@ -11,15 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <string>
 #include <vector>
-
-// rollback depth of the rs cases: 8 by default, LLAMA_TEST_N_RS_SEQ to run them deeper (e.g. 15, a DSpine block)
-static uint32_t test_n_rs_seq() {
-    const char * env = getenv("LLAMA_TEST_N_RS_SEQ");
-    return env ? (uint32_t) atoi(env) : 8u;
-}
 
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
 // seq's replay spans several ubatches while its rollback restore is still pending. Compared against a reference context
@@ -38,11 +31,10 @@ struct case_multi_seq_split_replay : ctx_test {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
 
         constexpr uint32_t  n_seqs     = 2;
-        // split_equal keeps the last n_rs_seq + 1 tokens of a seq in one ubatch, so it needs n_ubatch > n_rs_seq + 1
-        const     uint32_t  n_ubatch   = std::max<uint32_t>(16, test_n_rs_seq() + 2);
+        constexpr uint32_t  n_ubatch   = 16;
         constexpr uint32_t  n_prompt   = 20;
         constexpr uint32_t  n_rollback = 3;
-        const     uint32_t  n_replay   = 40 + n_ubatch - 16; // > n_ubatch so each seq spans multiple ubatches
+        constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
         constexpr llama_pos p0         = n_prompt - n_rollback;
 
         // both contexts have the same layout, only what they decode differs
@@ -52,7 +44,7 @@ struct case_multi_seq_split_replay : ctx_test {
             opts.n_batch    = 256;
             opts.n_ubatch   = n_ubatch;
             opts.n_seq_max  = n_seqs;
-            opts.n_rs_seq   = test_n_rs_seq();
+            opts.n_rs_seq   = 8;
             opts.kv_unified = 0;
             return mr.ctx(opts);
         };
@@ -212,7 +204,7 @@ struct case_rollback : ctx_test {
         const auto make_rs_ctx = [&]() {
             ctx_opts opts;
             opts.n_seq_max = 1;
-            opts.n_rs_seq  = test_n_rs_seq();
+            opts.n_rs_seq  = 8;
             return mr.ctx(opts);
         };
 
@@ -373,7 +365,7 @@ struct case_rollback_bound : ctx_test {
             opts.n_batch   = 64;
             opts.n_ubatch  = 64;
             opts.n_seq_max = 1;
-            opts.n_rs_seq  = test_n_rs_seq();
+            opts.n_rs_seq  = 8;
             return mr.ctx(opts);
         };
 

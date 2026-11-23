@@ -51,7 +51,6 @@ void main() {
         const uint end = min(beg + p.chunk, p.n_cols);
         const uint base = p.a_offset + row * p.row_stride;
         // an invocation without elements keeps -inf at index 0, below every element of the chunk on a tie
-        idx = 0u;
         for (uint i = beg + tid; i < end; i += 256u) {
             const float x = data_a[base + i];
             if (MODE == 0) {

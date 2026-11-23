@@ -9,7 +9,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout (push_constant) uniform parameter {
     uint ne0; uint ne1; uint ne2;
     uint snb1; uint snb2; uint dnb1;   // strides in elements
-    uint ncopy; uint pad;
+    uint ncopy;
     uint soff[8]; uint doff[8];        // element offsets of each copy within the bound buffers
 } p;
 

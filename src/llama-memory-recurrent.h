@@ -208,8 +208,8 @@ public:
 
     bool is_lazy() const;
     bool is_lazy_state(const ggml_tensor * t) const;   // t is one of the lazy s_l tensors
-    // lazy: for the n_seqs cells of the ubatch, 5 rows of n_seqs: base rows to read, factor rows to read,
-    // factor rows to write, base rows to write, tokens to replay
+    // lazy: for the n_seqs cells of the ubatch, 4 rows of n_seqs: base rows to read, factor rows to read,
+    // factor rows to write, tokens to replay (the new bases go to the ubatch's cells, from the head)
     void lazy_info(int32_t * data, int n_seqs) const;
 
 private:

@@ -8,9 +8,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cfloat>
-#include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1488,7 +1485,6 @@ void llama_memory_recurrent_context::lazy_info(int32_t * data, int n_seqs) const
         data[2 * n_seqs + s] = set ? c.lz_fout : (int32_t) (2 * size + i);
         // the GDN replays the factors in while it writes the factors out: two different factor sets
         GGML_ASSERT(data[1 * n_seqs + s] != data[2 * n_seqs + s]);
-        data[3 * n_seqs + s] = (int32_t) i;
-        data[4 * n_seqs + s] = set ? (int32_t) c.lz_rep : 0;
+        data[3 * n_seqs + s] = set ? (int32_t) c.lz_rep : 0;
     }
 }

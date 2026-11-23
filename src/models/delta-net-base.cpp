@@ -126,7 +126,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor * factors = ggml_view_2d(ctx0, ssm_states_all, F, ssm_states_all->ne[1], ssm_states_all->nb[1], 0);
         ggml_tensor * f_in    = ggml_get_rows(ctx0, factors, info(1));
 
-        ggml_tensor * gdn_out = ggml_gated_delta_net_lazy(ctx0, q, k, v, g, b, s, f_in, info(4), K);
+        ggml_tensor * gdn_out = ggml_gated_delta_net_lazy(ctx0, q, k, v, g, b, s, f_in, info(3), K);
 
         ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
             S_v, H_v, n_seq_tokens, n_seqs,

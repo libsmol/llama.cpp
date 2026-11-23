@@ -11367,7 +11367,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     // lazy: base state and replay factors instead of K snapshots (see ggml_gated_delta_net_lazy)
-    const bool lazy = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool lazy = dst->op == GGML_OP_GATED_DELTA_NET_LAZY;
     GGML_ASSERT(!lazy || !kda);
 
     const int64_t per_thread = S_v + (K > 1 || lazy ? S_v * S_v : 0);
@@ -12769,7 +12769,6 @@ void ggml_compute_forward_lightning_indexer(
     }
 }
 
-
 // orthonormal Walsh-Hadamard transform of each n block of x (Sylvester order, as the KV cache rotation matrices)
 static void ggml_fwht_rows(float * x, int64_t ne0, int64_t n) {
     const float sc = 1.0f/sqrtf((float) n);
@@ -13012,8 +13011,7 @@ void ggml_compute_forward_rel_bias_mask(const ggml_compute_params * params, ggml
         const float   sink = sinks ? *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + i*sinks->nb[1]) : 0.0f;
 
         // optional clip of r, as ggml_clip_norm
-        float rbuf[64];
-        GGML_ASSERT(n_rel <= 64);
+        float rbuf[64]; // n_rel <= 64 (ggml_rel_bias_mask)
         const float * rv = rv0;
         if (max_norm > 0.0f) {
             double ss = 0.0;

@@ -78,7 +78,6 @@ typedef struct VkPhysicalDeviceCooperativeMatrixMaintenance1FeaturesEXT {
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
-
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -1376,6 +1375,8 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+    // the rows the f16 B of mul_mm_rdna4 / mul_mmv_rdna4 is laid out for (ggml_vk_rdna4_b_scale_off)
+    uint32_t prealloc_y_last_rows_alloc {};
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -1411,6 +1412,7 @@ struct ggml_backend_vk_context {
         uint64_t sig = 0;
         std::unordered_map<const ggml_tensor *, vk_mix_norm_fusion> mix_norm_fusions;
         std::vector<const ggml_tensor *> skip;
+        std::vector<const ggml_tensor *> single;   // the fusions need a single use of these in the whole graph
     } fusion_cache;
     // runs of CPY nodes done in one dispatch by the first (ggml_vk_find_cpy_groups); the rest are in
     // fused_skip

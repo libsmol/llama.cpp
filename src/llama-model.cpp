@@ -35,9 +35,9 @@
 #include <map>
 #include <numeric>
 #include <regex>
-#include <thread>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -3776,7 +3776,9 @@ bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_m
     // 2-bit is enough to rank: the selector only sees candidates rescored with the original weights
     const ggml_type     type = GGML_TYPE_Q2_K;
     if (out == nullptr || out->buffer == nullptr || out->type == type || ggml_get_type_traits(out->type)->to_float == nullptr ||
-        out->ne[2] != 1 || out->ne[3] != 1 || out->ne[0] % ggml_blck_size(type) != 0 || !ggml_is_contiguous(out)) {
+        out->ne[2] != 1 || out->ne[3] != 1 || out->ne[0] % ggml_blck_size(type) != 0 || !ggml_is_contiguous(out) ||
+        out->ne[1] != (int64_t) model_tgt->vocab.n_tokens()) {
+        // (a head padded past the vocabulary would rank the padding rows)
         return false;
     }
 
@@ -3837,7 +3839,6 @@ bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_m
             n_rows * dst_row / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1e6);
     return true;
 }
-
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;

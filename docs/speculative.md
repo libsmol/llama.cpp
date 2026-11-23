@@ -146,6 +146,15 @@ The Inkling 2 drafter always decodes its full trained block. It also supports `-
 at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
 rejection sampling.
 
+With one slot, `--spec-draft-adaptive` picks the draft length of every step (0 turns drafting off) from the measured
+acceptance per draft position and step times. With rejection sampling the output distribution does not depend on it.
+
+```bash
+llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf -np 1 \
+    --spec-type draft-dspark --spec-draft-n-max 5 --spec-draft-p-min 0 \
+    --spec-draft-sampling probabilistic --spec-draft-adaptive -fa on --jinja
+```
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 

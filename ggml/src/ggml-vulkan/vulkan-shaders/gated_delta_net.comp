@@ -262,8 +262,7 @@ void main() {
             }
         }
 
-
-        // gs = g * s is rounded once and shared, as the compiler did before the explicit fma
+        // gs = g * s is rounded once and shared by the k . s sum and the state update
         FLOAT_TYPE gs[ROWS_PER_LANE];
         FLOAT_TYPE kv_shard = 0.0;
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {

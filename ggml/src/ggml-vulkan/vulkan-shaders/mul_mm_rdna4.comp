@@ -11,8 +11,8 @@
 // Prefill GEMM for RDNA4 (wave32 WMMA): D[n][m] = sum_k A[m][k] * B[n][k]
 // A: Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS/IQ4_NL/Q8_0, dequantized to f16 (round to nearest) into LDS, or BF16, converted to
 // f16 (exact unless |w| < 2^-14, which becomes an f16 subnormal). B: f16. f32 accumulation.
-// With flags bit 2, row n of B was stored times 1 / scale[n] to keep it finite as f16 (b_to_f16_rowscale.comp),
-// and output column n is multiplied by scale[n].
+// Row n of B was stored times 1 / scale[n] to keep it finite as f16 (b_to_f16_rowscale.comp), and output column n
+// is multiplied by scale[n].
 //
 // Warp-specialized: 8 consumer waves run the WMMAs on 64x64 slices of the 128x256 tile, 4 producer
 // waves load and dequantize. LDS is double-buffered in 32-deep K stages, and the producers keep two
@@ -26,9 +26,7 @@ layout(local_size_x = 384, local_size_y = 1, local_size_z = 1) in;
 layout (push_constant) uniform parameter {
     uint M; uint N; uint K;
     uint stride_a; uint stride_b; uint stride_d;
-    uint flags;      // bit 0: D is 16-byte aligned (vec4 stores); bit 1: tiles numbered along N first;
-                     // bit 2: B has a scale per row at bs_off
-    uint tiles_m;
+    uint d_aligned16; // D is 16-byte aligned (vec4 stores)
     uint n_full;
     uint n_parts;
     uint k_part;
@@ -37,9 +35,9 @@ layout (push_constant) uniform parameter {
 
 layout (binding = 0) readonly buffer A {uvec4 data_a[];};
 layout (binding = 1) readonly buffer B {uvec4 data_b[];};
-layout (binding = 1) readonly buffer BS {float data_bs[];};  // only if flags bit 2 is set
+layout (binding = 1) readonly buffer BS {float data_bs[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
-layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};  // only if flags bit 0 is set
+layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};  // only if d_aligned16
 layout (binding = 3) writeonly buffer S {vec4 data_s4[];};   // split-tile partial sums, [tile][part - 1][n][m]
 
 #if defined(DATA_A_Q4_K)
@@ -100,7 +98,7 @@ void scale_min(const uvec3 sc, const uint j, out uint d, out uint m) {
 
 // the scale of output column n: 1 unless row n of B would have overflowed f16
 float b_scale(const uint n) {
-    return ((p.flags & 4) != 0 && n < p.N) ? data_bs[p.bs_off + n] : 1.0f;
+    return n < p.N ? data_bs[p.bs_off + n] : 1.0f;
 }
 // (a select, so that a column with the scale 1 is stored exactly as computed)
 vec4 b_scaled(const vec4 v, const float sc) {
@@ -204,9 +202,10 @@ void main() {
     const uint tile = split ? p.n_full + (w - p.n_full) / p.n_parts : w;
     const uint part = split ? (w - p.n_full) % p.n_parts : 0;
     const uint tiles_n = (p.N + BN - 1) / BN;
-    const bool n_fast = (p.flags & 2) != 0;
-    const uint m0 = (n_fast ? tile / tiles_n : tile % p.tiles_m) * BM;
-    const uint n0 = (n_fast ? tile % tiles_n : tile / p.tiles_m) * BN;
+    // tiles numbered along N first: the workgroups in flight share the rows of A and read the same few column blocks
+    // of B, which stay in L2
+    const uint m0 = (tile / tiles_n) * BM;
+    const uint n0 = (tile % tiles_n) * BN;
     const uint st0 = part * p.k_part;
     const uint nstages = split ? min(p.k_part, p.K / BK - st0) : p.K / BK;
 
@@ -570,6 +569,8 @@ void main() {
     // The two roles run separate loops with the same number of barriers (the role is wave-uniform),
     // so the producers' in-flight registers never count against the consumers' accumulators.
     // Barrier t (t = 0 .. nstages): stage t is in LDS buffer t & 1, stage t - 1 is consumed.
+    // (barriers in wave-uniform but workgroup-divergent control flow: SPIR-V leaves them undefined, RADV/ACO emits
+    // plain s_barrier instructions, which pair up by count; this pipeline is only created for RDNA4)
     if (consumer) {
         barrier();
         [[dont_unroll]]
@@ -636,7 +637,7 @@ void main() {
         }
         return;
     }
-    const bool d_vec4 = (p.flags & 1) != 0 && (p.stride_d % 4) == 0;
+    const bool d_vec4 = p.d_aligned16 != 0 && (p.stride_d % 4) == 0;
     [[unroll]] for (uint j = 0; j < 4; ++j) {
         const uint n = n0 + wn * 64 + j * 16 + lane % 16;
         if (n >= p.N) {

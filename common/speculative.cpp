@@ -1633,12 +1633,11 @@ public:
 
             const int32_t n = (int32_t) dp.pos0;
 
-            // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_max of it
-            // (the caller may ask for fewer per sequence, dp.n_max)
-            const int32_t n_draft = dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
-            n_read[seq_id] = n_draft;
-            n_read_max     = std::max(n_read_max, n_draft);
-            const int32_t n_block_tokens = has_markov_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
+            // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_max of it.
+            // The blocks of one batch have one size; a sequence may read fewer of its positions (dp.n_max)
+            const int32_t n_block_tokens = has_markov_context ? block_size : params.n_max + (sample_from_anchor ? 0 : 1);
+            n_read[seq_id] = dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
+            n_read_max     = std::max(n_read_max, n_read[seq_id]);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1784,13 +1783,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
         // the lattice ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
         // and rescore the best candidates with the original weights
-        {
-            const int64_t t0 = ggml_time_us();
-            if (llama_model_dflash_build_approx_head(const_cast<llama_model *>(model_dft), model_tgt)) {
-                LOG_INF("%s: - %s ranks the vocabulary with a 2-bit copy of the target output head (%.1f s)\n",
-                        __func__, is_dspine ? "DSpine" : "DFlash2", (ggml_time_us() - t0) / 1e6);
-            }
-        }
+        llama_model_dflash_build_approx_head(const_cast<llama_model *>(model_dft), model_tgt);
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits
         init({

@@ -504,7 +504,7 @@ struct mmvq_a_t {
     vec2    dm;
 };
 
-mmvq_a_t mmvq_prepare_a(const uint ib_a, const uint iqs) {
+mmvq_a_t mmvq_prepare_a(const uint ib_a) {
     mmvq_a_t a;
     a.qs0 = repack4(ib_a, 0);
     a.qs1 = repack4(ib_a, 4);

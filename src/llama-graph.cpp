@@ -547,12 +547,12 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_rs::set_input_lazy(const llama_memory_recurrent_context * mctx) {
     if (lz_info) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lz_info->buffer));
-        mctx->lazy_info((int32_t *) lz_info->data, (int) (lz_info->ne[0] / 5));
+        mctx->lazy_info((int32_t *) lz_info->data, (int) (lz_info->ne[0] / 4));
     }
 }
 
 bool llm_graph_input_rs::can_reuse_lazy(const llama_memory_recurrent_context * mctx, int64_t n_seqs) const {
-    return (lz_info != nullptr) == mctx->is_lazy() && (!lz_info || lz_info->ne[0] == 5 * n_seqs);
+    return (lz_info != nullptr) == mctx->is_lazy() && (!lz_info || lz_info->ne[0] == 4 * n_seqs);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -2657,7 +2657,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const bool merged = gu != nullptr && up->view_src == gu && cur->view_offs == 0 &&
                         up->view_offs == (size_t) cur->ne[0]*ggml_element_size(cur) && gu->ne[0] == 2*cur->ne[0] &&
                         ggml_are_same_shape(cur, up) && cur->ne[1] == gu->ne[1] && cur->ne[2] == gu->ne[2];
-                    cur = merged ? ggml_situ(ctx0, gu, nullptr, beta, lb) : ggml_situ(ctx0, ggml_cont(ctx0, cur), ggml_cont(ctx0, up), beta, lb);
+                    auto const cont = [&](ggml_tensor * t) { return ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t); };
+                    cur = merged ? ggml_situ(ctx0, gu, nullptr, beta, lb) : ggml_situ(ctx0, cont(cur), cont(up), beta, lb);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -4200,7 +4201,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->rs_z = mctx_cur->get_rs_z();
 
     if (mctx_cur->is_lazy()) {
-        inp->lz_info = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 5 * n_seqs);
+        inp->lz_info = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4 * n_seqs);
         ggml_set_input(inp->lz_info);
         ggml_set_name(inp->lz_info, "rs_lz_info");
     }
@@ -4502,9 +4503,8 @@ ggml_tensor * llm_graph_context::build_attn_masked(
         ggml_tensor * kq_mask,
         ggml_tensor * sinks,
               float   kq_scale,
-                int   il,
-               bool   pre_rotated) const {
-    return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il, pre_rotated);
+                int   il) const {
+    return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il, true);
 }
 
 void llm_graph_context::build_dense_out(

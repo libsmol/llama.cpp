@@ -4211,8 +4211,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
         {"--spec-draft-adaptive"},
-        "choose the draft length of every step (up to --spec-draft-n-max, 0: no draft) by the measured acceptance per draft "
-        "position and step time, for the highest expected throughput (default: off)",
+        "server with one slot: the draft length of every step (0: no draft, else --spec-draft-n-min..--spec-draft-n-max) "
+        "with the highest expected throughput, from the measured acceptance per draft position and step times (default: off)",
         [](common_params & params) {
             params.speculative.draft.adaptive = true;
         }

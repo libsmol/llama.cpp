@@ -14,7 +14,7 @@ layout (binding = 2) readonly  buffer W {float data_w[];};
 layout (binding = 3) writeonly buffer D {float data_d[];};
 
 layout (push_constant) uniform parameter {
-    uint n_embd, n_rank, n_t;
+    uint n_embd;
     uint nba1, nbm1, nbw1, nbd1;
     uint a_offset, m_offset, w_offset, d_offset;
     float eps;

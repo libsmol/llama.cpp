@@ -9,10 +9,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout (push_constant) uniform parameter {
     uint M; uint N; uint stride_d;
-    uint tiles_m;
     uint n_full;
     uint n_parts;
-    uint flags;      // bit 1: tiles numbered along N first (as in mul_mm_rdna4.comp)
 } p;
 
 layout (binding = 0) readonly buffer S {vec4 data_s4[];};
@@ -25,9 +23,8 @@ void main() {
     const uint t    = gl_WorkGroupID.x;   // split tile index, from 0
     const uint tile = p.n_full + t;
     const uint tiles_n = (p.N + BN - 1) / BN;
-    const bool n_fast  = (p.flags & 2) != 0;
-    const uint m0   = (n_fast ? tile / tiles_n : tile % p.tiles_m) * BM;
-    const uint n0   = (n_fast ? tile % tiles_n : tile / p.tiles_m) * BN;
+    const uint m0   = (tile / tiles_n) * BM;   // tiles numbered along N first, as in mul_mm_rdna4.comp
+    const uint n0   = (tile % tiles_n) * BN;
 
     for (uint idx = gl_LocalInvocationIndex; idx < BM * BN / 4; idx += 256) {
         const uint n = n0 + idx / (BM / 4);

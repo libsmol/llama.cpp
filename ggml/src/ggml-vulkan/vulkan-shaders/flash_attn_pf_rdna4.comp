@@ -146,12 +146,10 @@ shared uint Msh[BQ * MR];
 // O^T accumulates in f32 (the graph asks for f32 precision; the f16 P and V products are exact in it). Every
 // FLUSH_STEPS blocks each lane adds it into an f32 partial in the part of the output buffer it owns and restarts
 // from zero.
-#ifndef FLUSH_STEPS
-#define FLUSH_STEPS 16
-#endif
+const uint FLUSH_STEPS = 16;
 
 const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
-// scores are kept in log2 units (log2(e) is folded into the Q scale), so the softmax uses exp2 directly
+// scores are kept in log2 units (S times log2(e)), so the softmax uses exp2 directly
 const float LOG2E = 1.4426950408889634f;
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f*LOG2E;
 
@@ -175,13 +173,12 @@ void main() {
     const uint iv3  = iq3 / (p.neq3 / p.nev3);
     const uint pos  = iblk * BQ + qsub * 16 + q;
 
-    // ---- Q^T B operands: element e of lane l = Q[pos][t*16 + half*8 + e] * scale * log2(e) -----------
-    // (SPLIT: Q * scale as in the coopmat1 kernel, and log2(e) is applied to S in f32; measurably closer
-    // to f32 on short contexts, where the other errors are small)
+    // ---- Q^T B operands: element e of lane l = Q[pos][t*16 + half*8 + e] * scale, as in the coopmat1 kernel ---
+    // (log2(e) is applied to S in f32)
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qb[NT];
     {
         const uint q_base4 = (iq2 * p.nb02 + iq3 * p.nb03) / 16 + pos * (p.nb01 / 4);
-        const float qscale = SPLIT != 0 ? p.scale : p.scale * LOG2E;
+        const float qscale = p.scale;
         [[unroll]] for (uint t = 0; t < NT; ++t) {
             vec4 a = vec4(0), b = vec4(0);
             if (pos < p.N) {
@@ -395,10 +392,8 @@ void main() {
                 }
             }
 
-            if (SPLIT != 0) {
-                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
-                    Sacc[kt] = Sacc[kt] * LOG2E;
-                }
+            [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                Sacc[kt] = Sacc[kt] * LOG2E;
             }
 
             // ---- mask, online softmax (lane-local per query), P^T ------------------------------------

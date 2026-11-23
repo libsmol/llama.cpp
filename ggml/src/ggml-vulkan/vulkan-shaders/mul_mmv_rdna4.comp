@@ -314,12 +314,10 @@ void main() {
     if (bcol) {
         const uint m0 = rg * 16 + h * 8;
         const uint di = gl_WorkGroupID.z * p.d_slice + r * p.stride_d + m0;
-        // (a select, so that a column with the scale 1 is stored exactly as computed)
         const float sc = data_bs[p.bs_off + r];
         [[unroll]] for (uint e = 0; e < 8; ++e) {
             if (m0 + e < p.M) {
-                const float v = acc[0][e] + acc[1][e];
-                data_d[di + e] = sc == 1.0f ? v : v * sc;
+                data_d[di + e] = (acc[0][e] + acc[1][e]) * sc;
             }
         }
     }

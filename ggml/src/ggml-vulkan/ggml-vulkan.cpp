@@ -572,8 +572,8 @@ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::
 }
 
 // flash_attn_pf_rdna4: 16-row query blocks per workgroup, keys per iteration
-static constexpr uint32_t fa_pf_qb() { return 2; }
-static constexpr uint32_t fa_pf_bc() { return 32; }
+static constexpr uint32_t fa_pf_qb = 2;
+static constexpr uint32_t fa_pf_bc = 32;
 
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
@@ -3305,7 +3305,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return is_rdna3_or_4 ? 4u : rows;
     };
     // RDNA4: with several columns (speculative verification) the f32-B k-quant mat-vec is bound by
-    // B loads; 4 rows per workgroup reuse each one 4 times
+    // B loads; 4 rows per workgroup reuse each one 4 times (rm_iq = 2 * rm_kq: 8 for the i-quants, MXFP4 and NVFP4)
     if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA4) {
         rm_kq = 4;
     }
@@ -3654,24 +3654,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->architecture == AMD_RDNA4 && device->coopmat_support && device->subgroup_size_control &&
         device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
         // 128x256 tiles (B padded to 256 rows), dispatched as a flat list
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_q4_k, "mul_mm_rdna4_q4_k", mul_mm_rdna4_q4_k_cm1_len, mul_mm_rdna4_q4_k_cm1_data, "main", 4,
+#define CREATE_MM_RDNA4(t) \
+        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_##t, "mul_mm_rdna4_" #t, mul_mm_rdna4_##t##_cm1_len, mul_mm_rdna4_##t##_cm1_data, "main", 4, \
                                 sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_q5_k, "mul_mm_rdna4_q5_k", mul_mm_rdna4_q5_k_cm1_len, mul_mm_rdna4_q5_k_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_q6_k, "mul_mm_rdna4_q6_k", mul_mm_rdna4_q6_k_cm1_len, mul_mm_rdna4_q6_k_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_iq4_xs, "mul_mm_rdna4_iq4_xs", mul_mm_rdna4_iq4_xs_cm1_len, mul_mm_rdna4_iq4_xs_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_iq4_nl, "mul_mm_rdna4_iq4_nl", mul_mm_rdna4_iq4_nl_cm1_len, mul_mm_rdna4_iq4_nl_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_q3_k, "mul_mm_rdna4_q3_k", mul_mm_rdna4_q3_k_cm1_len, mul_mm_rdna4_q3_k_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_iq3_s, "mul_mm_rdna4_iq3_s", mul_mm_rdna4_iq3_s_cm1_len, mul_mm_rdna4_iq3_s_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_q8_0, "mul_mm_rdna4_q8_0", mul_mm_rdna4_q8_0_cm1_len, mul_mm_rdna4_q8_0_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
-        ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_bf16, "mul_mm_rdna4_bf16", mul_mm_rdna4_bf16_cm1_len, mul_mm_rdna4_bf16_cm1_data, "main", 4,
-                                sizeof(vk_mm_rdna4_push_constants), {128, 256, 1}, {}, 1, true, true, 32);
+        CREATE_MM_RDNA4(q3_k)
+        CREATE_MM_RDNA4(q4_k)
+        CREATE_MM_RDNA4(q5_k)
+        CREATE_MM_RDNA4(q6_k)
+        CREATE_MM_RDNA4(iq3_s)
+        CREATE_MM_RDNA4(iq4_xs)
+        CREATE_MM_RDNA4(iq4_nl)
+        CREATE_MM_RDNA4(q8_0)
+        CREATE_MM_RDNA4(bf16)
+#undef CREATE_MM_RDNA4
         ggml_vk_create_pipeline(device, device->pipeline_mm_rdna4_reduce, "mul_mm_rdna4_reduce", mul_mm_rdna4_reduce_len, mul_mm_rdna4_reduce_data, "main", 2,
                                 sizeof(vk_mm_rdna4_reduce_push_constants), {1, 1, 1}, {}, 1);
 #define CREATE_MMV_RDNA4(t) \
@@ -4187,10 +4182,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rot_gate_f32, "rot_gate_f32", rot_gate_f32_len, rot_gate_f32_data, "main", 3, sizeof(vk_op_rot_gate_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_short_conv_f32, "short_conv_f32", short_conv_f32_len, short_conv_f32_data, "main", 4,  sizeof(vk_op_short_conv_push_constants), {64, 1, 1}, {}, 1);
     // RES_MIX + RMS_NORM_MUL reproduces res_mix (256) and rms_norm (512, the subgroup-sum variant: the same condition),
-    // with at most 16 subgroups of 512 invocations, and needs 17 bindings
+    // with at most 16 subgroups of 512 invocations, and needs VK_MAX_BINDINGS bindings
     if (device->subgroup_arithmetic && device->subgroup_require_full_support && device->subgroup_size >= 32 &&
         (device->vendor_id == VK_VENDOR_ID_INTEL || device->vendor_id == VK_VENDOR_ID_NVIDIA || device->vendor_id == VK_VENDOR_ID_AMD) &&
-        device->n_bindings >= 17) {
+        device->n_bindings >= VK_MAX_BINDINGS) {
         for (uint32_t ns = 1; ns <= VK_RES_MIX_MAX_STATES; ++ns) {
             for (uint32_t nq = 1; nq <= VK_RES_MIX_NORM_MAX_Q; ++nq) {
                 ggml_vk_create_pipeline2(device, device->pipeline_res_mix_norm[ns - 1][nq - 1], "res_mix_norm_f32_" + std::to_string(ns) + "_" + std::to_string(nq),
@@ -7323,18 +7318,21 @@ static ggml_type ggml_vk_mul_mat_b_type(
 
 // mul_mm_rdna4: one 128x256 tile per workgroup, one workgroup per CU (LDS bound). The tiles of a
 // partial last wave are split along K, and their partial sums are reduced into D in a fixed order.
-// The number of K parts mul_mm_rdna4 splits the tiles of the partial last wave into (1: no split).
-static uint32_t ggml_vk_mul_mat_rdna4_parts(const ggml_backend_vk_context * ctx, uint32_t M, uint32_t N, uint32_t K) {
-    const uint32_t tiles = CEIL_DIV(M, 128) * CEIL_DIV(N, 256);
+// b holds the f16 rows of B, then one scale per row from bs_off (in floats), see ggml_vk_rdna4_b_to_f16
+static void ggml_vk_mul_mat_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
+                                  const vk_subbuffer & a, const vk_subbuffer & b, const vk_subbuffer & d,
+                                  uint32_t M, uint32_t N, uint32_t K, uint32_t stride_d, bool d_aligned16, uint32_t bs_off) {
+    const uint32_t BM = 128, BN = 256, BK = 32;
+    const uint32_t tiles = CEIL_DIV(M, BM) * CEIL_DIV(N, BN);
     const uint32_t slots = ctx->device->shader_core_count;
-    const uint32_t nst   = K / 32;
+    const uint32_t nst   = K / BK;
     const uint32_t tail  = slots > 0 ? tiles % slots : 0;
+
+    // the tiles of a partial last wave are split along K: minimize the tail in waves, charging ~3% of a wave per extra
+    // part for the reduce, at most 8 parts of >= 8 K steps each. From 4 full waves on the tail is cheap and independent
+    // dispatches (e.g. gate / up) overlap it, which the reduce barrier would prevent.
     uint32_t n_parts = 1;
-    // From 4 full waves on the tail is cheap and independent dispatches (e.g. gate/up) overlap it,
-    // which the reduce barrier would prevent.
     if (tail > 0 && tiles / slots < 4) {
-        // minimize the tail in waves, charging ~3% of a wave per extra part for the reduce;
-        // at most 8 parts of >= 8 K steps each
         double best = 1.0;
         for (uint32_t np = 2; np <= 8 && nst / np >= 8; ++np) {
             const double t = (double) CEIL_DIV(tail * np, slots) / np + 0.03 * (np - 1);
@@ -7344,24 +7342,9 @@ static uint32_t ggml_vk_mul_mat_rdna4_parts(const ggml_backend_vk_context * ctx,
             }
         }
     }
-    const uint32_t k_part = CEIL_DIV(nst, n_parts);
-    return CEIL_DIV(nst, k_part);
-}
+    const uint32_t k_part  = CEIL_DIV(nst, n_parts);
+    n_parts = CEIL_DIV(nst, k_part);
 
-// bs_off: the per-row scales of B (ggml_vk_rdna4_b_to_f16) in b, in floats, or -1 for none
-// epi: SwiGLU epilogue (see mul_mm_rdna4.comp); o is the other half, d then receives the f16 result
-static void ggml_vk_mul_mat_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
-                                  const vk_subbuffer & a, const vk_subbuffer & b, const vk_subbuffer & d,
-                                  uint32_t M, uint32_t N, uint32_t K, uint32_t stride_d, bool d_aligned16, int64_t bs_off) {
-    const uint32_t BM = 128, BN = 256, BK = 32;
-    const uint32_t tiles_m = CEIL_DIV(M, BM);
-    const uint32_t tiles   = tiles_m * CEIL_DIV(N, BN);
-    const uint32_t slots   = ctx->device->shader_core_count;
-    const uint32_t nst     = K / BK;
-
-    const uint32_t tail = slots > 0 ? tiles % slots : 0;
-    const uint32_t n_parts = ggml_vk_mul_mat_rdna4_parts(ctx, M, N, K);
-    const uint32_t k_part = CEIL_DIV(nst, n_parts);
     const uint32_t n_split = n_parts > 1 ? tail : 0;
     const uint32_t n_full  = tiles - n_split;
     const uint32_t n_wg    = n_full + n_split * n_parts;
@@ -7380,17 +7363,12 @@ static void ggml_vk_mul_mat_rdna4(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_subbuffer s_buf = n_split > 0 ? vk_subbuffer{ ctx->prealloc_split_k, 0, s_size } : d; // unused without a split
-    // Tiles are numbered along N first: the workgroups in flight share the rows of A and all read the
-    // same few column blocks of B, which stay in L2 (the N columns of a prefill batch are few). 1-4%
-    // faster than M first on the model's shapes; the order does not change any result.
-    const uint32_t flags = (d_aligned16 ? 1u : 0u) | 2u | (bs_off >= 0 ? 4u : 0u);
-    const vk_mm_rdna4_push_constants pc = { M, N, K, K, K, stride_d, flags, tiles_m, n_full, n_parts, k_part,
-                                            bs_off >= 0 ? (uint32_t) bs_off : 0u };
+    const vk_mm_rdna4_push_constants pc = { M, N, K, K, K, stride_d, d_aligned16 ? 1u : 0u, n_full, n_parts, k_part, bs_off };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, s_buf }, pc, { n_wg * BM, 1, 1 });
 
     if (n_split > 0) {
         ggml_vk_sync_buffers(ctx, subctx);
-        const vk_mm_rdna4_reduce_push_constants pc2 = { M, N, stride_d, tiles_m, n_full, n_parts, flags };
+        const vk_mm_rdna4_reduce_push_constants pc2 = { M, N, stride_d, n_full, n_parts };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mm_rdna4_reduce, { s_buf, d }, pc2, { n_split, 1, 1 });
         ctx->prealloc_split_k_need_sync = true;
     }
@@ -7410,7 +7388,7 @@ static uint64_t ggml_vk_rdna4_b_size(uint64_t K, uint64_t rows_alloc) {
 static void ggml_vk_rdna4_b_to_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, uint32_t rows_alloc) {
     vk_pipeline pipeline = ctx->device->pipeline_b_to_f16_rowscale;
     if (ctx->prealloc_y_last_pipeline_used == pipeline.get() && ctx->prealloc_y_last_tensor_used == src &&
-        !ctx->prealloc_y_last_k_padded) {
+        !ctx->prealloc_y_last_k_padded && ctx->prealloc_y_last_rows_alloc == rows_alloc) {
         return;
     }
     // a SWIGLU that skipped its f32 result must be consumed from prealloc_y, never converted here
@@ -7439,6 +7417,7 @@ static void ggml_vk_rdna4_b_to_f16(ggml_backend_vk_context * ctx, vk_context& su
     ctx->prealloc_y_last_pipeline_used = pipeline.get();
     ctx->prealloc_y_last_tensor_used   = src;
     ctx->prealloc_y_last_k_padded      = false;
+    ctx->prealloc_y_last_rows_alloc    = rows_alloc;
 }
 
 // prealloc_y as the f16 B operand of the skinny matmul on `out` (ggml_vk_find_norm_to_f16), and tag it: the
@@ -7446,8 +7425,6 @@ static void ggml_vk_rdna4_b_to_f16(ggml_backend_vk_context * ctx, vk_context& su
 static vk_subbuffer ggml_vk_norm_f16_begin(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * out) {
     const uint32_t K = (uint32_t) out->ne[0], rows = (uint32_t) out->ne[1];
     const uint64_t size = ggml_vk_rdna4_b_size(K, rows);
-    // the shaders place the scales at rows * K halves rounded up to 16 bytes
-    GGML_ASSERT(ggml_vk_rdna4_b_scale_off(K, rows) * sizeof(float) == ((uint64_t) rows * K * 2 + 15) / 16 * 16);
     if (ctx->prealloc_size_y < size) {
         ctx->prealloc_size_y = size;
         ggml_vk_preallocate_buffers(ctx, subctx);
@@ -7458,6 +7435,7 @@ static vk_subbuffer ggml_vk_norm_f16_begin(ggml_backend_vk_context * ctx, vk_con
     ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_b_to_f16_rowscale.get();
     ctx->prealloc_y_last_tensor_used   = out;
     ctx->prealloc_y_last_k_padded      = false;
+    ctx->prealloc_y_last_rows_alloc    = rows;
     ctx->prealloc_y_need_sync          = true;
     return vk_subbuffer{ ctx->prealloc_y, 0, size };
 }
@@ -7465,7 +7443,6 @@ static vk_subbuffer ggml_vk_norm_f16_begin(ggml_backend_vk_context * ctx, vk_con
 // The mul_mm_rdna4 pipeline if ggml_vk_mul_mat_q_f16 would use it for this matmul, else nullptr.
 // src1 is then read as f16 from prealloc_y.
 static vk_pipeline ggml_vk_mul_mat_rdna4_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const bool disable = getenv("GGML_VK_DISABLE_RDNA4_MM") != nullptr;
     const vk_device & device = ctx->device;
     vk_pipeline rp = src0->type == GGML_TYPE_Q4_K   ? device->pipeline_mm_rdna4_q4_k :
                      src0->type == GGML_TYPE_Q5_K   ? device->pipeline_mm_rdna4_q5_k :
@@ -7479,27 +7456,28 @@ static vk_pipeline ggml_vk_mul_mat_rdna4_pipeline(ggml_backend_vk_context * ctx,
     // coopmat1 with a generic pipeline for this type, whose setup ggml_vk_mul_mat_q_f16 goes through: f16 B for
     // the quantized types, bf16 B for BF16 (B is converted by ggml_vk_rdna4_b_to_f16 in either case)
     const ggml_type generic_b = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
-    if (disable || !rp || !device->coopmat_support || device->coopmat2 || src1->type != GGML_TYPE_F32 ||
+    if (!rp || !device->coopmat_support || device->coopmat2 || src1->type != GGML_TYPE_F32 ||
         !ggml_vk_dim01_contiguous(src0) || device->pipeline_b_to_f16_rowscale == nullptr || !ggml_vk_src1_prec_allows_f16(dst) ||
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, generic_b, ggml_prec_get_acc(dst)) == nullptr) {
         return nullptr;
     }
     const int64_t ne01 = src0->ne[1], ne10 = src1->ne[0], ne11 = src1->ne[1];
     const int64_t blck = ggml_blck_size(src0->type);   // 256 or 32 (one block per K stage), 1 for BF16
-    // BF16 needs no dequantization, and on less than one tile per CU the generic bf16 x bf16 pipeline is faster
-    // (e.g. 512 x 1024 x 2304: 65 vs 49 us); from one tile per CU on this one is (3-25%)
+    // BF16 needs no dequantization: below one tile per CU the generic bf16 x bf16 pipeline is faster
     if (src0->type == GGML_TYPE_BF16 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) < (int64_t) device->shader_core_count) {
         return nullptr;
     }
-    // (below two tile rows the few, mostly empty tiles lose to the generic path, e.g. 48 rows: 71 vs 28 us)
-    // (B is converted by ggml_vk_rdna4_b_to_f16: rows of f32 elements, one workgroup each)
+    // below two tile rows the few, mostly empty tiles lose to the generic path; B is converted by ggml_vk_rdna4_b_to_f16
+    // (rows of f32 elements, one workgroup each)
     if (ne11 >= 64 && ne11 <= 65535 && ne01 >= 256 && (ne01 % 8) == 0 && (ne10 % blck) == 0 && (ne10 % 32) == 0 &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->nb[0] == sizeof(float) && (src1->nb[1] % sizeof(float)) == 0 &&
         ggml_nbytes(src0) <= device->properties.limits.maxStorageBufferRange &&
         (uint64_t) ne01 * (ne10 / blck) * ggml_type_size(src0->type) < (1ull << 32) &&
         src0->nb[1] == (size_t) (ne10 / blck) * ggml_type_size(src0->type) &&
-        ((vk_tensor_offset(src0) + src0->view_offs) % 16) == 0 && dst->nb[0] == sizeof(float)) {
+        ((vk_tensor_offset(src0) + src0->view_offs) % 16) == 0 && dst->nb[0] == sizeof(float) &&
+        // one workgroup per tile, up to 8 per tile of a partial last wave (ggml_vk_mul_mat_rdna4)
+        (uint64_t) CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) * 8 <= device->properties.limits.maxComputeWorkGroupCount[0]) {
         return rp;
     }
     return nullptr;
@@ -7618,9 +7596,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
 
-    vk_pipeline pipeline_generic = pipeline;
-    if (rdna4_rp && !qx_needs_dequant && qy_needs_dequant) {
+    // mul_mm_rdna4: B converted into prealloc_y with a scale per row (ggml_vk_rdna4_b_to_f16), its own K split
+    const bool y_rdna4 = rdna4_rp && !qx_needs_dequant && qy_needs_dequant;
+    if (y_rdna4) {
         pipeline = rdna4_rp;
+        split_k  = 1;
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
@@ -7629,14 +7609,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // 128 elements per Q8_1 x4 block
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
-
-    // mul_mm_rdna4: B converted into prealloc_y with a scale per row (ggml_vk_rdna4_b_to_f16)
-    const bool y_rdna4  = pipeline != pipeline_generic;
-
-    // mul_mm_rdna4 does its own K split
-    if (pipeline != pipeline_generic) {
-        split_k = 1;
-    }
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -7807,10 +7779,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         : (uint64_t)src1->nb[1];
 
     // compute
-    if (pipeline != pipeline_generic) {
+    if (y_rdna4) {
         ggml_vk_mul_mat_rdna4(ctx, subctx, pipeline, { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
                               ggml_vk_subbuffer(ctx, d_D, d_buf_offset), ne01, ne11, ne10, stride_d, (d_buf_offset % 16) == 0,
-                              y_rdna4 ? (int64_t) ggml_vk_rdna4_b_scale_off(ne10, padded_n) : -1);
+                              (uint32_t) ggml_vk_rdna4_b_scale_off(ne10, padded_n));
     } else {
         ggml_vk_matmul(
             ctx, subctx, pipeline,
@@ -7850,10 +7822,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return true;
     }
 
-    // the float NVFP4 mat-vec decodes the E4M3 scales and the E2M1 values one pair at a time; q8_1 B also below
-    // k 2048 (Inkling's expert down projection), as the CPU's q8_0 vec_dot: Inkling decode KLD against f32 B
-    // -0.07e-3 +- 0.07e-3 (paired, 16 x 1024)
-    if (src0_type == GGML_TYPE_NVFP4 && !device->ocp_fp4) {
+    // RDNA4: the float NVFP4 mat-vec decodes the E4M3 scales and the E2M1 values one pair at a time; q8_1 B, as the
+    // CPU's q8_0 vec_dot, also below k 2048 (Inkling's expert down projection): decode KLD against f32 B -0.07e-3 +- 0.07e-3
+    if (src0_type == GGML_TYPE_NVFP4 && device->architecture == AMD_RDNA4 && !device->ocp_fp4) {
         return true;
     }
 
@@ -7927,10 +7898,6 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 // matmul_split_k_reduce.
 // the mul_mmv_rdna4 pipeline ggml_vk_mul_mat_skinny_rdna4 would run this matmul with, else nullptr
 static vk_pipeline ggml_vk_mul_mat_skinny_rdna4_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const bool disable = getenv("GGML_VK_DISABLE_RDNA4_MMV") != nullptr;
-    if (disable) {
-        return nullptr;
-    }
     vk_pipeline pipeline = src0->type == GGML_TYPE_Q2_K   ? ctx->device->pipeline_mmv_rdna4_q2_k :
                            src0->type == GGML_TYPE_Q4_K   ? ctx->device->pipeline_mmv_rdna4_q4_k :
                            src0->type == GGML_TYPE_Q5_K   ? ctx->device->pipeline_mmv_rdna4_q5_k :
@@ -7967,11 +7934,8 @@ static vk_pipeline ggml_vk_mul_mat_skinny_rdna4_pipeline(ggml_backend_vk_context
     return pipeline;
 }
 
-static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    vk_pipeline pipeline = ggml_vk_mul_mat_skinny_rdna4_pipeline(ctx, src0, src1, dst);
-    if (!pipeline) {
-        return false;
-    }
+static void ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline & pipeline, const ggml_tensor * src0,
+        const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t M = (uint32_t) src0->ne[1], K = (uint32_t) src0->ne[0], N = (uint32_t) src1->ne[1];
 
     // split K until there are ~640 16-row waves: fewer leave the long per-wave K loops latency bound
@@ -8026,7 +7990,6 @@ static bool ggml_vk_mul_mat_skinny_rdna4(ggml_backend_vk_context * ctx, vk_conte
         ctx->prealloc_split_k_need_sync = true;
     }
     ctx->prealloc_y_need_sync = true;
-    return true;
 }
 
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
@@ -8640,9 +8603,12 @@ static uint32_t ggml_vk_elem_offset(const ggml_backend_vk_context * ctx, const g
     return t ? get_misalign_bytes(ctx, t)/ggml_type_size(t->type) : 0;
 }
 
-static uint32_t ggml_vk_nb_f32(const ggml_tensor * t, int i) {
+// stride i of t in elements, 0 without t
+static uint32_t ggml_vk_stride_elems(const ggml_tensor * t, int i) {
     return t ? (uint32_t) (t->nb[i]/ggml_type_size(t->type)) : 0;
 }
+
+static std::array<uint32_t, 3> ggml_vk_nrows_elements(uint32_t nr);
 
 // one workgroup per row/token, split over x and y
 static std::array<uint32_t, 3> ggml_vk_rows_elements(uint32_t n) {
@@ -8664,11 +8630,11 @@ void ggml_vk_clip_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_t
 
     vk_op_clip_norm_push_constants pc = {
         (uint32_t) a->ne[0], (uint32_t) a->ne[1], (uint32_t) a->ne[2], (uint32_t) a->ne[3],
-        ggml_vk_nb_f32(a, 1), ggml_vk_nb_f32(a, 2), ggml_vk_nb_f32(a, 3),
+        ggml_vk_stride_elems(a, 1), ggml_vk_stride_elems(a, 2), ggml_vk_stride_elems(a, 3),
         s ? (uint32_t) s->ne[1] : 1u, s ? (uint32_t) s->ne[2] : 1u, s ? (uint32_t) s->ne[3] : 1u,
-        ggml_vk_nb_f32(s, 1), ggml_vk_nb_f32(s, 2), ggml_vk_nb_f32(s, 3),
+        ggml_vk_stride_elems(s, 1), ggml_vk_stride_elems(s, 2), ggml_vk_stride_elems(s, 3),
         c ? (uint32_t) c->ne[1] : 1u, c ? (uint32_t) c->ne[2] : 1u, c ? (uint32_t) c->ne[3] : 1u,
-        ggml_vk_nb_f32(c, 1), ggml_vk_nb_f32(c, 2), ggml_vk_nb_f32(c, 3),
+        ggml_vk_stride_elems(c, 1), ggml_vk_stride_elems(c, 2), ggml_vk_stride_elems(c, 3),
         s ? 1u : 0u, c ? 1u : 0u,
         ggml_vk_elem_offset(ctx, a), ggml_vk_elem_offset(ctx, s), ggml_vk_elem_offset(ctx, c), ggml_vk_elem_offset(ctx, dst),
         ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
@@ -8687,7 +8653,7 @@ void ggml_vk_rot_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_op_rot_gate_push_constants pc = {
-        (uint32_t) a->ne[0], (uint32_t) a->ne[1], ggml_vk_nb_f32(a, 1), ggml_vk_nb_f32(g, 1),
+        (uint32_t) a->ne[0], (uint32_t) a->ne[1], ggml_vk_stride_elems(a, 1), ggml_vk_stride_elems(g, 1),
         ggml_vk_elem_offset(ctx, a), ggml_vk_elem_offset(ctx, g), ggml_vk_elem_offset(ctx, dst), (uint32_t) ggml_get_op_params_i32(dst, 0),
         ggml_get_op_params_i32(dst, 0) > 0 ? 1.0f/sqrtf((float) ggml_get_op_params_i32(dst, 0)) : 1.0f,
     };
@@ -8720,7 +8686,7 @@ void ggml_vk_short_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
 
     vk_op_short_conv_push_constants pc = {
         n_conv, n_ch, n_t, n_s,
-        ggml_vk_nb_f32(x, 1), ggml_vk_nb_f32(x, 2), ggml_vk_nb_f32(w, 1), ggml_vk_nb_f32(d, 1),
+        ggml_vk_stride_elems(x, 1), ggml_vk_stride_elems(x, 2), ggml_vk_stride_elems(w, 1), ggml_vk_stride_elems(d, 1),
         d ? (uint32_t) (n_ch/(d->ne[0]/n_conv)) : n_ch, d ? 1u : 0u,
         ggml_vk_elem_offset(ctx, x), ggml_vk_elem_offset(ctx, w), ggml_vk_elem_offset(ctx, d), ggml_vk_elem_offset(ctx, dst),
         ggml_get_op_params_f32(dst, 0),
@@ -8739,10 +8705,8 @@ void ggml_vk_res_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_ten
 
     vk_op_res_mix_push_constants pc {};
     pc.n_embd   = (uint32_t) q->ne[0];
-    pc.n_q      = (uint32_t) q->ne[1];
-    pc.n_states = (uint32_t) n_states;
     pc.n_tokens = (uint32_t) dst->ne[1];
-    pc.nbq1     = ggml_vk_nb_f32(q, 1);
+    pc.nbq1     = ggml_vk_stride_elems(q, 1);
     pc.q_offset = ggml_vk_elem_offset(ctx, q);
     pc.d_offset = ggml_vk_elem_offset(ctx, dst);
     pc.eps      = ggml_get_op_params_f32(dst, 0);
@@ -8753,7 +8717,7 @@ void ggml_vk_res_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_ten
     for (int i = 0; i < VK_RES_MIX_MAX_STATES; ++i) {
         const ggml_tensor * st = i < n_states ? dst->src[1 + i] : nullptr;
         s_buf[i]       = st ? ggml_vk_tensor_subbuffer(ctx, st, true) : q_buf;
-        pc.nbs1[i]     = ggml_vk_nb_f32(st, 1);
+        pc.nbs1[i]     = ggml_vk_stride_elems(st, 1);
         pc.s_offset[i] = ggml_vk_elem_offset(ctx, st);
     }
     const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
@@ -8787,10 +8751,10 @@ void ggml_vk_rel_bias_mask(ggml_backend_vk_context * ctx, vk_context& subctx, gg
 
     vk_op_rel_bias_mask_push_constants pc = {
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) bias->ne[1], (uint32_t) bias->ne[0],
-        ggml_vk_nb_f32(mask, 1), ggml_vk_nb_f32(r, 1), ggml_vk_nb_f32(r, 2), ggml_vk_nb_f32(sinks, 0), ggml_vk_nb_f32(sinks, 1), sinks ? 1u : 0u,
+        ggml_vk_stride_elems(mask, 1), ggml_vk_stride_elems(r, 1), ggml_vk_stride_elems(r, 2), ggml_vk_stride_elems(sinks, 0), ggml_vk_stride_elems(sinks, 1), sinks ? 1u : 0u,
         ggml_vk_elem_offset(ctx, mask), ggml_vk_elem_offset(ctx, bias), ggml_vk_elem_offset(ctx, sinks),
         ggml_vk_elem_offset(ctx, q_pos), ggml_vk_elem_offset(ctx, kv_pos), ggml_vk_elem_offset(ctx, r), ggml_vk_elem_offset(ctx, dst),
-        max_norm > 0.0f ? 1u : 0u, rs ? ggml_vk_nb_f32(rs, 1) : 0u, ggml_vk_elem_offset(ctx, rs), tau ? 1u : 0u, ggml_vk_elem_offset(ctx, tau),
+        max_norm > 0.0f ? 1u : 0u, rs ? ggml_vk_stride_elems(rs, 1) : 0u, ggml_vk_elem_offset(ctx, rs), tau ? 1u : 0u, ggml_vk_elem_offset(ctx, tau),
         max_norm,
     };
     // the shader applies the per-channel scale whenever it clips (see supports_op)
@@ -8810,8 +8774,8 @@ void ggml_vk_loop_down(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_t
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_op_loop_down_push_constants pc = {
-        (uint32_t) a->ne[0], (uint32_t) w->ne[1], (uint32_t) a->ne[1],
-        ggml_vk_nb_f32(a, 1), ggml_vk_nb_f32(m, 1), ggml_vk_nb_f32(w, 1), ggml_vk_nb_f32(dst, 1),
+        (uint32_t) a->ne[0],
+        ggml_vk_stride_elems(a, 1), ggml_vk_stride_elems(m, 1), ggml_vk_stride_elems(w, 1), ggml_vk_stride_elems(dst, 1),
         ggml_vk_elem_offset(ctx, a), ggml_vk_elem_offset(ctx, m), ggml_vk_elem_offset(ctx, w), ggml_vk_elem_offset(ctx, dst),
         ggml_get_op_params_f32(dst, 0),
     };
@@ -8832,8 +8796,8 @@ void ggml_vk_loop_up(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_ten
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_op_loop_up_push_constants pc = {
-        (uint32_t) a->ne[0], (uint32_t) h->ne[0], (uint32_t) a->ne[1],
-        ggml_vk_nb_f32(a, 1), ggml_vk_nb_f32(m, 1), ggml_vk_nb_f32(h, 1), ggml_vk_nb_f32(wg, 1),
+        (uint32_t) a->ne[0], (uint32_t) h->ne[0],
+        ggml_vk_stride_elems(a, 1), ggml_vk_stride_elems(m, 1), ggml_vk_stride_elems(h, 1), ggml_vk_stride_elems(wg, 1),
         ggml_vk_elem_offset(ctx, a), ggml_vk_elem_offset(ctx, m), ggml_vk_elem_offset(ctx, h),
         ggml_vk_elem_offset(ctx, wg), ggml_vk_elem_offset(ctx, wf), ggml_vk_elem_offset(ctx, dst),
     };
@@ -8864,20 +8828,20 @@ void ggml_vk_short_conv_rs(ggml_backend_vk_context * ctx, vk_context& subctx, gg
     const vk_subbuffer t_buf = d ? ggml_vk_tensor_subbuffer(ctx, d, true) : c_buf;
 
     vk_op_short_conv_rs_push_constants pc = {
-        n_conv, n_ch, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
-        ggml_vk_nb_f32(cur, 1), ggml_vk_nb_f32(past, 1), ggml_vk_nb_f32(past, 2), ggml_vk_nb_f32(w, 1), ggml_vk_nb_f32(d, 1), ggml_vk_nb_f32(state, 1),
+        n_ch, (uint32_t) dst->ne[1],
+        ggml_vk_stride_elems(cur, 1), ggml_vk_stride_elems(past, 1), ggml_vk_stride_elems(past, 2), ggml_vk_stride_elems(w, 1), ggml_vk_stride_elems(d, 1), ggml_vk_stride_elems(state, 1),
         d ? (uint32_t) (n_ch/(d->ne[0]/n_conv)) : n_ch, d ? 1u : 0u,
         ggml_vk_elem_offset(ctx, cur), ggml_vk_elem_offset(ctx, past), ggml_vk_elem_offset(ctx, w), ggml_vk_elem_offset(ctx, d),
         ggml_vk_elem_offset(ctx, state), ggml_vk_elem_offset(ctx, dst),
         ggml_get_op_params_f32(dst, 0),
-        res ? 1u : 0u, ggml_vk_nb_f32(res, 1), ggml_vk_elem_offset(ctx, res),
+        res ? 1u : 0u, ggml_vk_stride_elems(res, 1), ggml_vk_elem_offset(ctx, res),
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { c_buf, ggml_vk_tensor_subbuffer(ctx, past, true), ggml_vk_tensor_subbuffer(ctx, w, true), t_buf,
           ggml_vk_tensor_subbuffer(ctx, state, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
           res ? ggml_vk_tensor_subbuffer(ctx, res, true) : c_buf },
-        pc, { n_ch, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] });
+        pc, { n_ch, std::min((uint32_t) dst->ne[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]), (uint32_t) dst->ne[2] });
 }
 
 static void ggml_vk_res_mix_norm(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_backend_vk_context::vk_mix_norm_fusion & f);
@@ -8893,23 +8857,14 @@ void ggml_vk_loop_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_t
 
     vk_op_loop_gate_push_constants pc = {
         (uint32_t) a->ne[0], (uint32_t) a->ne[1],
-        ggml_vk_nb_f32(a, 1), ggml_vk_nb_f32(m, 1), ggml_vk_nb_f32(g, 1), ggml_vk_nb_f32(f, 1),
+        ggml_vk_stride_elems(a, 1), ggml_vk_stride_elems(m, 1), ggml_vk_stride_elems(g, 1), ggml_vk_stride_elems(f, 1),
         ggml_vk_elem_offset(ctx, a), ggml_vk_elem_offset(ctx, m), ggml_vk_elem_offset(ctx, g), ggml_vk_elem_offset(ctx, f), ggml_vk_elem_offset(ctx, dst),
     };
 
-    const uint32_t ne = (uint32_t) ggml_nelements(dst);
-    std::array<uint32_t, 3> elements;
-    if (ne > 262144) {
-        elements = { 512, 512, CEIL_DIV(ne, 262144) };
-    } else if (ne > 512) {
-        elements = { 512, CEIL_DIV(ne, 512), 1 };
-    } else {
-        elements = { ne, 1, 1 };
-    }
-
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, m, true), ggml_vk_tensor_subbuffer(ctx, g, true),
-          ggml_vk_tensor_subbuffer(ctx, f, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc, elements);
+          ggml_vk_tensor_subbuffer(ctx, f, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        ggml_vk_nrows_elements((uint32_t) ggml_nelements(dst)));
 }
 
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -9016,9 +8971,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
-    } else if (ctx->num_additional_fused_ops == 0 && dst->ne[1] >= 2 && dst->ne[1] <= 16 &&
-               ggml_vk_mul_mat_skinny_rdna4(ctx, subctx, src0, src1, dst)) {
-        // done
+    } else if (vk_pipeline skinny = ctx->num_additional_fused_ops == 0 && dst->ne[1] >= 2 && dst->ne[1] <= 16 ?
+                   ggml_vk_mul_mat_skinny_rdna4_pipeline(ctx, src0, src1, dst) : nullptr) {
+        ggml_vk_mul_mat_skinny_rdna4(ctx, subctx, skinny, src0, src1, dst);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_max_cols(ctx->device) && src1->ne[2] * src1->ne[3] == 1)) &&
@@ -9572,13 +9527,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     uint32_t fusion_flags = 0;
 
     if (ctx->num_additional_fused_ops > 0) {
-        const ggml_tensor * n1 = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, n1->src[1]);
-        if (n1->op == GGML_OP_MUL) {
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+
+        if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
             fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE0;
         } else {
-            GGML_ASSERT(n1->op == GGML_OP_ADD_ID);
+            GGML_ASSERT(cgraph->nodes[node_idx + 1]->op == GGML_OP_ADD_ID);
             fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
         }
     }
@@ -9586,7 +9542,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // a second scale (MUL_MAT_ID + ADD_ID + MUL, or MUL_MAT_ID + MUL + MUL: e.g. the expert scale, then the routing weights)
     vk_subbuffer d_F1 = d_D;
     if (ctx->num_additional_fused_ops > 1) {
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + 2]->src[1]);
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 2]->src[1];
+
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
@@ -9880,11 +9838,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // query rows. Speculative verification (<= 16 rows) on a long context: one workgroup per KV head and KV
     // split, combined by flash_attn_pf_rdna4_reduce.comp.
     {
-        static const bool disable_pf     = getenv("GGML_VK_DISABLE_FA_PF") != nullptr;
-        // below ~6K keys the coopmat1 path is as fast (this one pays a mask pass and a reduce)
-        // from 16K keys on: below that the coopmat1 path is measurably (~3e-7 KLD) closer to f32
+        // verification from 16K keys on: below that the coopmat1 path is measurably (~3e-7 KLD) closer to f32
         const uint32_t verify_min_kv = 16384;
-            float pf_max_bias = 0.0f, pf_softcap = 0.0f;
+        float pf_max_bias = 0.0f, pf_softcap = 0.0f;
         memcpy(&pf_max_bias, (const float *) dst->op_params + 1, sizeof(float));
         memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
         const uint32_t G  = qk_ratio;
@@ -9898,7 +9854,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const bool pf_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
             (nbk1 % 16) == 0 && (nbk2 % 16) == 0 && (nbk3 % 16) == 0 &&
             (nbv1 % 16) == 0 && (nbv2 % 16) == 0 && (nbv3 % 16) == 0;
-        const bool pf_common = !disable_pf &&
+        const bool pf_common =
             ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA4 &&
             ctx->device->coopmat_support && ctx->device->subgroup_size_control &&
             ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32 &&
@@ -9915,15 +9871,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // prompt after a long context) KV is split over workgroups instead, as for verification; below
         // verify_min_kv keys the coopmat1 path is used then.
         const uint32_t n_cu    = std::max(1u, ctx->device->shader_core_count);
-        const bool     few_wgs = 2 * CEIL_DIV(NQ, 16 * fa_pf_qb()) * nek2 * neq3 < n_cu;
+        const bool     few_wgs = 2 * CEIL_DIV(NQ, 16 * fa_pf_qb) * nek2 * neq3 < n_cu;
         const bool pf_prefill = pf_common && NQ >= 32 && !few_wgs;
         const bool pf_verify  = pf_common && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
                                 ctx->device->pipeline_fa_pf_rdna4_reduce != nullptr;
         if (pf_prefill || pf_verify) {
-            const uint32_t QB    = pf_verify ? 1 : fa_pf_qb();
+            const uint32_t QB    = pf_verify ? 1 : fa_pf_qb;
             const uint32_t SPLIT = pf_verify ? 1 : 0;
             const uint32_t key   = G | (QB << 8) | (SPLIT << 16) | ((HSK / 64) << 20) | ((pf_q8 ? 1u : 0u) << 24);
-            const uint32_t pf_Br = 16 * QB, pf_Bc = fa_pf_bc();
+            const uint32_t pf_Br = 16 * QB, pf_Bc = fa_pf_bc;
             vk_pipeline pf_pipeline, pf_mask_opt;
             {
                 std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
@@ -10809,7 +10765,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         case 4:
             // dim-0 concat with a transposed src1: transpose through LDS so both sides coalesce
             if (ggml_get_op_params_i32(dst, 0) == 0 && !ggml_is_quantized(dst->type) && src1->nb[0] != 4 && src1->nb[1] == 4 &&
-                dst->nb[0] == 4 && CEIL_DIV(dst->ne[1], 32) <= 65535 && dst->ne[2] * dst->ne[3] <= 65535) {
+                dst->nb[0] == 4 && CEIL_DIV(dst->ne[0], 32) <= 65535 && CEIL_DIV(dst->ne[1], 32) <= 65535 &&
+                dst->ne[2] * dst->ne[3] <= 65535) {
                 return ctx->device->pipeline_concat_t_i32;
             }
             return ctx->device->pipeline_concat_i32;
@@ -11138,6 +11095,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_GATED_DELTA_NET_LAZY:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
@@ -11947,8 +11905,8 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
 // RMS_NORM + SCALE (mode 1) or RMS_NORM + MUL(weight row) + MUL(tensor) (mode 2) in one dispatch
 // (rms_norm_fused.comp): the separate ops' expressions, the norm summed in another order.
 static int ggml_vk_can_fuse_rms_norm_ext(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
-    // an ADD before may have prepared partial sums for this RMS_NORM (do_add_rms_partials)
-    if (ctx->device->pipeline_rms_norm_fused[0][0] == nullptr || i + 1 >= cgraph->n_nodes || ctx->do_add_rms_partials) {
+    // an ADD before may have prepared partial sums for this RMS_NORM, the plain RMS_NORM accounts for them
+    if (ctx->device->pipeline_rms_norm_fused[0][0] == nullptr || i + 1 >= cgraph->n_nodes || ctx->do_add_rms_partials_offset_calculation) {
         return 0;
     }
     const ggml_tensor * norm = cgraph->nodes[i];
@@ -11971,8 +11929,9 @@ static int ggml_vk_can_fuse_rms_norm_ext(const ggml_backend_vk_context * ctx, co
         const ggml_tensor * m2 = cgraph->nodes[i + 2];
         const ggml_tensor * w  = n1->src[0] == norm ? n1->src[1] : n1->src[1] == norm ? n1->src[0] : nullptr;
         const ggml_tensor * c  = m2->src[0] == n1 ? m2->src[1] : m2->src[1] == n1 ? m2->src[0] : nullptr;
-        if (w && c && w->type == GGML_TYPE_F32 && w->ne[0] == norm->ne[0] && ggml_nrows(w) == 1 && w->nb[0] == sizeof(float) &&
-            contig_f32(n1) && contig_f32(m2) && contig_f32(c)) {
+        // (the norm and the first product are not written)
+        if (w && c && w != norm && c != norm && c != n1 && w->type == GGML_TYPE_F32 && w->ne[0] == norm->ne[0] && ggml_nrows(w) == 1 &&
+            w->nb[0] == sizeof(float) && contig_f32(n1) && contig_f32(m2) && contig_f32(c)) {
             return 2;
         }
     }
@@ -12447,8 +12406,8 @@ static bool ggml_vk_gdn_use_cm(const ggml_backend_vk_context * ctx, const ggml_t
     return (ctx->device->pipeline_gated_delta_net_cm != nullptr ||
             ctx->device->pipeline_gated_delta_net_cm_v32 != nullptr ||
             ctx->device->pipeline_gated_delta_net_cm_v128 != nullptr) &&
-        dst->src[3]->ne[0] == 1 && S_v == 128 && dst->src[0]->ne[0] == 128 && K == 1 && n_tokens >= cm_min_tokens &&
-        ggml_get_op_params_i32(dst, 1) == 0;
+        dst->op == GGML_OP_GATED_DELTA_NET && dst->src[3]->ne[0] == 1 && S_v == 128 && dst->src[0]->ne[0] == 128 && K == 1 &&
+        n_tokens >= cm_min_tokens;
 }
 
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -12553,7 +12512,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     // lazy snapshots: unfused, the base and the factors follow the attention scores in dst (binding 7),
     // the factors in are binding 11 and the replay counts binding 8. Fused, bindings 5 / 7 are the whole
     // cache and binding 8 the whole index tensor (ggml_vk_find_gdn_fusions checks they are shared).
-    const bool lazy = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool lazy = dst->op == GGML_OP_GATED_DELTA_NET_LAZY;
     vk_subbuffer fin_buf = src_buf[0];
     uint32_t fi_off = 0, fi_row = 0, fii_off = 0, fo_off = 0, fo_row = 0, foi_off = 0, rp_off = 0, si_off = 0;
     auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -14669,7 +14628,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
     }
-    if (!ctx->fused_skip.empty() && ctx->fused_skip.count(node)) {
+    if (ctx->fused_skip.count(node)) {
         return false; // absorbed into a GATED_DELTA_NET or grouped CPY dispatch
     }
 
@@ -14681,7 +14640,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     ggml_tensor * src2 = node->src[2];
     ggml_tensor * src3 = node->src[3];
 
-    if (node->op == GGML_OP_ADD) {
+    // (the fused ADD + RMS_NORM + MUL writes no partials)
+    if (node->op == GGML_OP_ADD && !ctx->fused_add_rms_norm_mul) {
         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
         if (next_node_idx < cgraph->n_nodes &&
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
@@ -14701,7 +14661,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-    const auto bd_it = !ctx->mix_norm_fusions.empty() ? ctx->mix_norm_fusions.find(node) : ctx->mix_norm_fusions.end();
+    const auto bd_it = ctx->mix_norm_fusions.find(node);
 
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
@@ -14763,7 +14723,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
 
         // a fused GDN accesses cache tensors that are not among its srcs: always sync
-        const auto gdn_fit = node->op == GGML_OP_GATED_DELTA_NET ? ctx->gdn_fusions.find(node) : ctx->gdn_fusions.end();
+        const bool gdn     = node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_GATED_DELTA_NET_LAZY;
+        const auto gdn_fit = gdn ? ctx->gdn_fusions.find(node) : ctx->gdn_fusions.end();
         if (gdn_fit != ctx->gdn_fusions.end()) {
             need_sync = true;
         }
@@ -14912,7 +14873,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_MUL:
         if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
-        } else if (!ctx->glu_to_f16.empty() && ctx->glu_to_f16.count(node)) {
+        } else if (ctx->glu_to_f16.count(node)) {
             ggml_vk_swiglu_to_f16(ctx, compute_ctx, node, true);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -15312,6 +15273,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_GATED_DELTA_NET_LAZY:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
         break;
@@ -16973,9 +16935,11 @@ static int32_t ggml_vk_graph_use_count(const ggml_cgraph * cgraph, const ggml_te
 // tag on a GATED_DELTA_NET whose gate inputs the graph optimizer kept alive (op_params slot 15)
 static constexpr int32_t GGML_VK_GDN_GATES_TAG = 0x52344747;
 
-// A split SWIGLU whose next compute node is a mul_mm_rdna4 matmul taking it as B writes that f16 B
-// operand straight into prealloc_y. Its f32 result is skipped when nothing else reads it.
 static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * out, const ggml_tensor * mm);
+
+// A split SWIGLU (or a MUL, for a skinny consumer) whose next compute node is a mul_mm_rdna4 / mul_mmv_rdna4 matmul
+// taking it as B writes that f16 B operand straight into prealloc_y. Its f32 result is skipped when nothing else
+// reads it.
 static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->glu_to_f16.clear();
     ctx->glu_to_f16_b.clear();
@@ -16994,7 +16958,8 @@ static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
         const ggml_tensor * g = glu->src[0];
         const ggml_tensor * u = glu->src[1];
-        if (glu->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 ||
+        if ((glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            glu->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(glu) || !ggml_is_contiguous(g) || !ggml_is_contiguous(u) ||
             !ggml_are_same_shape(g, glu) || !ggml_are_same_shape(u, glu) || (glu->ne[0] % 4) != 0 ||
             !aligned16(glu) || !aligned16(g) || !aligned16(u) ||
@@ -17038,10 +17003,10 @@ static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph *
         if (is_mul || j >= cgraph->n_nodes) {
             continue;
         }
-        // mul_mm_rdna4 consumer (as before)
+        // a mul_mm_rdna4 consumer (the path ggml_vk_mul_mat takes for it: no FWHT, A within one buffer range)
         const ggml_tensor * mm = cgraph->nodes[j];
         if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            ggml_vk_mul_mat_rdna4_pipeline(ctx, mm->src[0], glu, mm) == nullptr) {
+            ggml_vk_can_use_fwht(ctx, glu, mm) || ggml_vk_mul_mat_rdna4_pipeline(ctx, mm->src[0], glu, mm) == nullptr) {
             continue;
         }
         // (a view that ends at the consumer: an eval callback may read its sources)
@@ -17089,7 +17054,7 @@ static void ggml_vk_swiglu_to_f16(ggml_backend_vk_context * ctx, vk_context& sub
 // matmul (2..16 columns): the norm writes that f16 B operand into prealloc_y as well, in the layout
 // ggml_vk_rdna4_b_to_f16 would produce for rows_alloc = the rows (which is what the skinny matmul asks for),
 // and tags prealloc_y with it, so the matmul's conversion is skipped. Bit-exact: the f16 values and the scales
-// are the conversion of the stored f32 result, by the same rules. Later matmuls on the same B reuse it as before.
+// are the conversion of the stored f32 result, by the same rules. Later matmuls on the same B reuse it.
 // The f32 result is still written, so a matmul whose reuse check fails converts B itself. The set holds the MUL;
 // ggml_vk_rms_norm (RMS_NORM + MUL) and ggml_vk_add_rms_norm_mul use the f16 variant when their result is in it.
 static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * out, const ggml_tensor * mm) {
@@ -17102,9 +17067,6 @@ static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_
 
 static void ggml_vk_find_norm_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->norm_to_f16.clear();
-    if (ctx->device->pipeline_add_rms_norm_mul_f16out_f32 == nullptr || ctx->device->pipeline_rms_norm_mul_f16out_f32[2] == nullptr) {
-        return;
-    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * mul = cgraph->nodes[i];
         if (mul->op != GGML_OP_MUL || mul->src[0] == nullptr || mul->src[1] == nullptr ||
@@ -17123,19 +17085,24 @@ static void ggml_vk_find_norm_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph 
     }
 }
 
-// Fuse into GATED_DELTA_NET the GET_ROWS that loads s0 from the recurrent cache and the CPY that
-// stores its states back; both nodes are then skipped. Bit-exact.
+// Fuse into GATED_DELTA_NET(_LAZY) the GET_ROWS that loads s0 from the recurrent cache, the CPY that stores its states
+// back, its gate ops (when the graph optimizer kept their inputs alive), and for the lazy op the GET_ROWS of the factors
+// in and the SET_ROWS of the factors out; these nodes are then skipped. Bit-exact. The factors in and out must be
+// different rows (llama_memory_recurrent alternates two sets): workgroups overwrite the factors out while others still
+// replay the factors in.
 static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->gdn_fusions.clear();
     ctx->fused_skip.clear();
 
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; i++) {
-        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
+        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET || cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET_LAZY;
     }
     if (!any) {
         return;
     }
+
+    auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
 
     // the (node, src slot) uses of each GDN result and its views in this graph, in graph order; a GDN with a use
     // outside this graph (a later split) is not fused
@@ -17148,9 +17115,9 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
             if (!s) {
                 continue;
             }
-            const ggml_tensor * root = s->view_src ? s->view_src : s;
-            if (root->op == GGML_OP_GATED_DELTA_NET) {
-                gdn_uses[root].emplace_back(i, j);
+            const ggml_tensor * r = root(s);
+            if (r->op == GGML_OP_GATED_DELTA_NET || r->op == GGML_OP_GATED_DELTA_NET_LAZY) {
+                gdn_uses[r].emplace_back(i, j);
                 gdn_local[s]++;
             }
         }
@@ -17160,7 +17127,8 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * g = cgraph->nodes[i];
         // the chunked coopmat scan has no fused variant
-        if (g->op != GGML_OP_GATED_DELTA_NET || (g->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_vk_gdn_use_cm(ctx, g)) {
+        if ((g->op != GGML_OP_GATED_DELTA_NET && g->op != GGML_OP_GATED_DELTA_NET_LAZY) || (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_vk_gdn_use_cm(ctx, g)) {
             continue;
         }
         const ggml_tensor * v = g->src[2];
@@ -17169,7 +17137,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
         const int64_t n_tokens = v->ne[2];
         const int64_t n_seqs   = v->ne[3];
         const int64_t K        = ggml_get_op_params_i32(g, 0);
-        const bool    lazy     = ggml_get_op_params_i32(g, 1) != 0;
+        const bool    lazy     = g->op == GGML_OP_GATED_DELTA_NET_LAZY;
         const int64_t D        = S_v * S_v * H;
         const int64_t F        = 3 * K * S_v * H;   // lazy: factors per seq
         // lazy: the base state takes the place of the snapshots
@@ -17306,7 +17274,6 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
         // index view separately, but into the same buffer), the base and the factors in from one cache
         // binding, and writes the base and the factors out to one cache binding
         if (lazy) {
-            auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
             auto const same_buf = [](const ggml_tensor * a, const ggml_tensor * b) {
                 return ((ggml_backend_vk_buffer_context *) a->buffer->context)->dev_buffer ==
                        ((ggml_backend_vk_buffer_context *) b->buffer->context)->dev_buffer;
@@ -17327,7 +17294,6 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
 
         // lazy factors in: GET_ROWS(view of the cache, idx), used only here
         if (lazy && f.state_rows) {
-            auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
             const ggml_tensor * fr = g->src[6];
             if (fr->op == GGML_OP_GET_ROWS && uses(fr) == 1 && !(fr->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                 root(fr->src[0]) == root(f.state_rows->src[0]) && fr->src[1]->buffer &&
@@ -17379,7 +17345,8 @@ static void ggml_vk_find_cpy_groups(ggml_backend_vk_context * ctx, ggml_cgraph *
                (s->nb[1] % sizeof(float)) == 0 && (s->nb[2] % sizeof(float)) == 0 &&
                n->nb[0] == sizeof(float) && (n->nb[1] % sizeof(float)) == 0 &&
                n->ne[0] == s->ne[0] * s->ne[1] && n->ne[1] == s->ne[2] && n->ne[2] == 1 && n->ne[3] == 1 &&
-               s->ne[0] * s->ne[1] <= UINT32_MAX / 2 && s->ne[2] <= 65535;
+               (uint64_t) s->ne[0] * s->ne[1] <= 256ull*ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+               s->ne[2] <= 65535;
     };
     auto const same_kind = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const ggml_tensor * sa = a->src[0];
@@ -17479,11 +17446,9 @@ static void ggml_vk_find_cpy_groups(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 }
 
-// the fusions that skip nodes whose results must have no other user: the candidates first, then one count of the uses
-// of the tensors they involve. A graph equal to the previous one (llama.cpp reuses the decode graph) reuses the result:
-// the analysis runs before the first submit, with the GPU idle.
 // RES_MIX -> RMS_NORM -> MUL (the weight) of its rows, as one res_mix_norm dispatch at the RES_MIX (Inkling attention
-// and FFN inputs). The mix is stored as before; the normed rows (the MUL results) are written at the RES_MIX, so their
+// and FFN inputs): the candidates, whose intermediates ggml_vk_find_mix_norm checks for a single use. The mix is
+// stored; the normed rows (the MUL results) are written at the RES_MIX, so their
 // memory must not hold anything else that is read or written until their own nodes; the RMS_NORM results are not
 // stored, their single use is checked by the counted pass.
 static void ggml_vk_find_mix_norm_fusions(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph,
@@ -17638,9 +17603,9 @@ static void ggml_vk_res_mix_norm(ggml_backend_vk_context * ctx, vk_context & sub
     vk_op_res_mix_norm_push_constants pc {};
     pc.n_embd   = (uint32_t) m->ne[0];
     pc.n_tokens = (uint32_t) m->ne[1];
-    pc.nbq1     = ggml_vk_nb_f32(q, 1);
+    pc.nbq1     = ggml_vk_stride_elems(q, 1);
     for (int s = 0; s < ns; s++) {
-        pc.nbs1[s] = ggml_vk_nb_f32(m->src[1 + s], 1);
+        pc.nbs1[s] = ggml_vk_stride_elems(m->src[1 + s], 1);
     }
     pc.eps       = ggml_get_op_params_f32(m, 0);
     pc.scale     = ggml_get_op_params_f32(m, 1);
@@ -17685,14 +17650,16 @@ static uint64_t ggml_vk_graph_signature(const ggml_cgraph * cgraph) {
     return h;
 }
 
-static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, std::vector<const ggml_tensor *> & skipped);
+static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, std::vector<const ggml_tensor *> & skipped,
+        std::vector<const ggml_tensor *> & single);
 
 // the mix-norm analysis, reused for an equal graph (the same nodes, shapes and memory: the server decodes the same
-// graph for every token)
+// graph for every token) whose full graph still uses the fused intermediates once
 static void ggml_vk_find_mix_norm_cached(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     auto & cache = ctx->fusion_cache;
     const uint64_t sig = ggml_vk_graph_signature(cgraph);
-    if (cache.valid && cache.nodes == cgraph->nodes && cache.n_nodes == cgraph->n_nodes && cache.sig == sig) {
+    if (cache.valid && cache.nodes == cgraph->nodes && cache.n_nodes == cgraph->n_nodes && cache.sig == sig &&
+        std::all_of(cache.single.begin(), cache.single.end(), [&](const ggml_tensor * t) { return ggml_vk_graph_use_count(cgraph, t) == 1; })) {
         ctx->mix_norm_fusions = cache.mix_norm_fusions;
         for (const ggml_tensor * t : cache.skip) {
             ctx->fused_skip.insert(t);
@@ -17701,7 +17668,8 @@ static void ggml_vk_find_mix_norm_cached(ggml_backend_vk_context * ctx, ggml_cgr
     }
     ctx->mix_norm_fusions.clear();
     cache.skip.clear();
-    ggml_vk_find_mix_norm(ctx, cgraph, cache.skip);
+    cache.single.clear();
+    ggml_vk_find_mix_norm(ctx, cgraph, cache.skip, cache.single);
     cache.mix_norm_fusions = ctx->mix_norm_fusions;
     cache.nodes   = cgraph->nodes;
     cache.n_nodes = cgraph->n_nodes;
@@ -17709,8 +17677,9 @@ static void ggml_vk_find_mix_norm_cached(ggml_backend_vk_context * ctx, ggml_cgr
     cache.valid   = true;
 }
 
-// skipped: the nodes it adds to fused_skip
-static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, std::vector<const ggml_tensor *> & skipped) {
+// skipped: the nodes it adds to fused_skip; single: the tensors the fusions need a single use of
+static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, std::vector<const ggml_tensor *> & skipped,
+        std::vector<const ggml_tensor *> & single) {
     std::vector<std::pair<const ggml_tensor *, ggml_backend_vk_context::vk_mix_norm_fusion>> cand;
     std::vector<std::vector<const ggml_tensor *>> cand_single, cand_skip;
     ggml_vk_find_mix_norm_fusions(ctx, cgraph, cand, cand_single, cand_skip);
@@ -17730,6 +17699,7 @@ static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * c
         }
         ctx->mix_norm_fusions[cand[k].first] = cand[k].second;
         taken.insert(cand[k].first);
+        single.insert(single.end(), cand_single[k].begin(), cand_single[k].end());
         for (const ggml_tensor * t : cand_skip[k]) {
             ctx->fused_skip.insert(t);
             skipped.push_back(t);
@@ -17739,7 +17709,6 @@ static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * c
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    const int64_t perf_graph_start_us = ggml_time_us();
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -17915,7 +17884,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_add_rms_norm_mul = false;
         ctx->fused_rms_norm_ext = 0;
         const char *fusion_string {};
-        const bool mix_norm_head = !ctx->mix_norm_fusions.empty() && ctx->mix_norm_fusions.count(cgraph->nodes[i]);
+        const bool mix_norm_head = ctx->mix_norm_fusions.count(cgraph->nodes[i]) != 0;
         if (mix_norm_head) {
             fusion_string = "RES_MIX_NORM";
         } else if (!ctx->device->disable_fusion) {
@@ -18282,34 +18251,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     node_idx += ctx->query_fusion_node_count[node_idx];
                 }
                 prev_node_idx = cur_node_idx;
-                // GGML_VK_PERF_LOGGER_SEQ=n: the barrier groups of the n-th graph in order
-                static const int seq_graph = getenv("GGML_VK_PERF_LOGGER_SEQ") ? atoi(getenv("GGML_VK_PERF_LOGGER_SEQ")) : -1;
-                static int graph_no = 0;
-                if (seq_graph >= 0 && graph_no == seq_graph) {
-                    std::string s;
-                    for (size_t k = 0; k < nodes.size(); k++) {
-                        s += std::string(k ? " | " : "") + ggml_op_name(nodes[k]->op) + ":" + nodes[k]->name + (ctx->fused_skip.count(nodes[k]) ? "(skip)" : "");
-                    }
-                    fprintf(stderr, "SEQ %4d %8.2f us  %s\n", i, (timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod / 1000.0, s.c_str());
-                }
-                if (i + 1 == ctx->query_idx) {
-                    graph_no++;
-                }
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
             }
-        }
-        // GGML_VK_PERF_LOGGER_GRAPHS: one line per graph: its GPU time, the host time since the end of the previous graph
-        static const bool graphs_log = getenv("GGML_VK_PERF_LOGGER_GRAPHS") != nullptr;
-        if (graphs_log && ctx->query_idx > 1) {
-            static int64_t last_end_us = 0;
-            static int graph_id = 0;
-            const int64_t now_us = ggml_time_us();
-            const double gpu_us = (timestamps[ctx->query_idx - 1] - timestamps[0]) * ctx->device->properties.limits.timestampPeriod / 1000.0;
-            const double wall_us = (double) (now_us - perf_graph_start_us);
-            fprintf(stderr, "GRAPH %5d nodes %5d first %-24.24s last %-24.24s gpu %8.1f us wall %8.1f us gap-before %8.1f us\n", graph_id++,
-                cgraph->n_nodes, cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "",
-                gpu_us, wall_us, last_end_us ? (double) (perf_graph_start_us - last_end_us) : 0.0);
-            last_end_us = now_us;
         }
         ctx->perf_logger->print_timings();
     }
@@ -18513,8 +18456,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             return -1;
         };
-        // (only fusions that compute exactly what the separate ops do: pulling ADD -> RMS_NORM together
-        // would enable the ADD + RMS_NORM fusion in new places, which sums the squares in another order)
+        // an RMS_NORM takes its SCALE consumer along, for the RMS_NORM + SCALE fusion (other pulls would change which
+        // fusions apply where)
         auto const pull_fusions = [&](int p) {
             if (graph->nodes[p]->op == GGML_OP_RMS_NORM) {
                 pull_consumer(p, GGML_OP_SCALE);
@@ -18757,7 +18700,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     if (params && params->add_alloc_dep) {
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * g = graph->nodes[i];
-            if (g->op != GGML_OP_GATED_DELTA_NET) {
+            if (g->op != GGML_OP_GATED_DELTA_NET && g->op != GGML_OP_GATED_DELTA_NET_LAZY) {
                 continue;
             }
             ggml_backend_vk_context::vk_gdn_fusion f;
@@ -19662,8 +19605,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DFLASH_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous_rows(op);
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous_rows(op) &&
+                   (uint64_t) ggml_nelements(op) <= 256ull*device->properties.limits.maxComputeWorkGroupCount[0];
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_LAZY:
             {
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
@@ -19674,7 +19619,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                if (ggml_get_op_params_i32(op, 1) != 0 && (op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32)) {
+                if (op->op == GGML_OP_GATED_DELTA_NET_LAZY && (op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32)) {
                     return false;
                 }
                 return op->type == GGML_TYPE_F32;

@@ -635,11 +635,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            // a grammar checks the backend-sampled token (grammar-based rejection sampling, as below); a rejected one is
-            // sampled again on the CPU from the raw logits, which the caller keeps for this sequence
-            // (llama_set_sampler_raw_logits)
-            // (grammar_first: the grammar before the chain, so always on the CPU)
-            bool valid = !(grmr && grammar_first);
+            // a grammar checks the backend-sampled token, as below; a rejected token, or a grammar that applies first, is
+            // sampled on the CPU from the raw logits the caller keeps (llama_set_sampler_raw_logits)
+            bool valid = !grmr;
             if (grmr && !grammar_first) {
                 llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
                 llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };

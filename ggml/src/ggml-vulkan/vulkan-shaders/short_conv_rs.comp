@@ -16,7 +16,7 @@ layout (binding = 5) writeonly buffer D  {float data_d[];};
 layout (binding = 6) readonly  buffer RS {float data_r[];};
 
 layout (push_constant) uniform parameter {
-    uint n_conv, n_ch, n_t, n_s;
+    uint n_ch, n_t;
     uint nbc1, nbp1, nbp2, nbw1, nbd1, nbs1;
     uint ch_per_head, has_d;
     uint c_offset, p_offset, w_offset, t_offset, s_offset, d_offset;
@@ -24,14 +24,7 @@ layout (push_constant) uniform parameter {
     uint has_r, nbr1, r_offset;
 } p;
 
-void main() {
-    const uint ic = gl_GlobalInvocationID.x;
-    const uint it = gl_GlobalInvocationID.y;
-    const uint is = gl_GlobalInvocationID.z;
-    if (ic >= p.n_ch) {
-        return;
-    }
-
+void conv(const uint ic, const uint it, const uint is) {
     const uint nc1 = N_CONV - 1;
     const uint pb  = p.p_offset + ic*p.nbp1 + is*p.nbp2;
     const uint tok = is*p.n_t + it;
@@ -64,5 +57,18 @@ void main() {
         for (uint k = 0; k < nc1 - p.n_t; ++k) {
             data_s[sb + k] = data_p[pb + p.n_t + k];
         }
+    }
+}
+
+void main() {
+    const uint ic = gl_GlobalInvocationID.x;
+    const uint is = gl_GlobalInvocationID.z;
+    if (ic >= p.n_ch) {
+        return;
+    }
+
+    // more tokens than workgroups along y: every gl_NumWorkGroups.y-th each
+    for (uint it = gl_GlobalInvocationID.y; it < p.n_t; it += gl_NumWorkGroups.y) {
+        conv(ic, it, is);
     }
 }

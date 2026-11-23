@@ -264,48 +264,55 @@ struct server_batch {
     }
 };
 
-// --spec-draft-adaptive: the draft length of every step, 0..n_max (0: no draft), with the highest expected
-// throughput E(L) / T(L). E(L) = 1 + sum_k prod_{i <= k} a_i, a_i the acceptance of draft position i given the earlier
-// ones were accepted (decayed counts); T(L) the measured time of a step with L drafted tokens, or for a length not yet
-// measured an estimate from a measured one and the relative costs of R(L). Without a draft the acceptance is probed
-// for probe_steps steps every probe_every steps. A different length is taken only when it is expected 3% faster.
+// --spec-draft-adaptive: the draft length L of the next step (0: no draft, else n_min..n_max) with the highest expected
+// throughput E(L) / T(L). E(L) = 1 + sum_{k<L} prod_{i<=k} a_i, a_i the rate at which draft position i is accepted when
+// the earlier ones are (decayed counts, a prior of 0.6). T(L) is the measured time of a step that verified L drafted
+// tokens; a length not measured yet is estimated from a measured one by rel_cost. A different length is taken only when
+// it is expected 3% faster. While drafting is off, the acceptance is probed for probe_steps steps every probe_every
+// steps. Replays after a checkpoint restore are not tracked.
 struct server_spec_adaptive {
-    static constexpr double decay       = 0.97;   // per verified step, ~23 steps half-life
-    static constexpr double t_alpha     = 0.2;    // EMA of the step times
+    static constexpr double decay       = 0.97;   // per verified step: a half-life of ~23 steps
+    static constexpr double t_alpha     = 0.2;    // EMA weight of a new step time
     static constexpr int    probe_every = 24;
     static constexpr int    probe_steps = 3;
 
+    int n_min   = 1;
     int n_max   = 0;
     int n_cur   = 0;
     int n_probe = 0;
+
     int steps_no_draft = 0;
     int probe_left     = 0;
 
-    std::vector<double> drafted;   // position i (from 0): times reached, decayed
-    std::vector<double> accepted;  // position i: times accepted, decayed
-    std::vector<double> t_step;    // length L: EMA step time in us, 0 when not measured
-    std::vector<int>    n_used;    // length L: steps of the current request
+    std::vector<double> drafted;   // draft position i: times reached, decayed
+    std::vector<double> accepted;  // draft position i: times accepted, decayed
+    std::vector<double> t_step;    // length L: EMA of the step time in us, 0 until measured
+    std::vector<int>    n_used;    // length L: steps of the current task
 
-    int64_t t_begin = -1;
+    bool    timed   = false;       // some length is measured
+    int64_t t_begin = -1;          // start of the tracked step, -1: none
     int     L_prev  = -1;          // the first step after a change of length rebuilds graphs: not timed
 
-    void init(int n_max_) {
+    void init(int n_min_, int n_max_) {
         n_max   = n_max_;
-        n_cur   = std::min(n_max, 3);
-        n_probe = std::min(n_max, 2);
+        n_min   = std::clamp(n_min_, 1, n_max);
+        n_cur   = std::clamp(3, n_min, n_max);
+        n_probe = std::clamp(2, n_min, n_max);
+
         drafted.assign(n_max, 0.0);
         accepted.assign(n_max, 0.0);
         t_step.assign(n_max + 1, 0.0);
         n_used.assign(n_max + 1, 0);
     }
 
-    // a new request: keep half of the statistics of the previous one
+    // a new task keeps half of the acceptance statistics of the previous one
     void new_task() {
         for (int i = 0; i < n_max; ++i) {
             drafted[i]  *= 0.5;
             accepted[i] *= 0.5;
         }
         std::fill(n_used.begin(), n_used.end(), 0);
+        t_begin = -1;
     }
 
     std::string summary() const {
@@ -318,16 +325,17 @@ struct server_spec_adaptive {
         return s;
     }
 
-    // the relative cost of a step with L drafted tokens (measured on Inkling 2 Mini / R9700 with DSpark)
+    // the cost of a step with L drafted tokens relative to one without: a draft decode, and a verification batch that
+    // grows with L (an estimate, measurements replace it)
     static double rel_cost(int L) {
-        static const double r[] = { 1.00, 1.71, 1.90, 2.15, 2.45, 2.75, 2.99, 3.28 };
-        return L < 8 ? r[L] : r[7] + 0.29*(L - 7);
+        return L == 0 ? 1.0 : 1.45 + 0.27*L;
     }
 
     double expected_tokens(int L) const {
-        double e = 1.0, p = 1.0;
+        double e = 1.0;
+        double p = 1.0;
         for (int i = 0; i < L; ++i) {
-            p *= (accepted[i] + 1.2)/(drafted[i] + 2.0);   // a prior of 0.6 until measured
+            p *= (accepted[i] + 1.2)/(drafted[i] + 2.0);
             e += p;
         }
         return e;
@@ -337,30 +345,25 @@ struct server_spec_adaptive {
         if (t_step[L] > 0.0) {
             return t_step[L];
         }
-        // from the measured length closest to L
-        int ref = -1;
-        for (int d = 1; d <= n_max && ref < 0; ++d) {
-            if (L - d >= 0 && t_step[L - d] > 0.0) {
-                ref = L - d;
-            } else if (L + d <= n_max && t_step[L + d] > 0.0) {
-                ref = L + d;
+        for (int d = 1; d <= n_max; ++d) {
+            for (const int ref : { L - d, L + d }) {
+                if (ref >= 0 && ref <= n_max && t_step[ref] > 0.0) {
+                    return t_step[ref]*rel_cost(L)/rel_cost(ref);
+                }
             }
         }
-        return ref < 0 ? rel_cost(L) : t_step[ref]*rel_cost(L)/rel_cost(ref);
+        return rel_cost(L);
     }
 
-    // the draft length of the next step
     int choose() {
-        if (n_max <= 0) {
-            return 0;
-        }
         if (probe_left > 0) {
             probe_left--;
             return n_probe;
         }
-        int best = n_cur;
+
+        int    best   = n_cur;
         double s_best = expected_tokens(n_cur)/step_time(n_cur);
-        for (int L = 0; L <= n_max; ++L) {
+        for (int L = 0; L <= n_max; L = L == 0 ? n_min : L + 1) {
             const double s = expected_tokens(L)/step_time(L);
             if (s > s_best*1.03) {
                 best   = L;
@@ -368,14 +371,16 @@ struct server_spec_adaptive {
             }
         }
         n_cur = best;
+
         if (n_cur > 0) {
             steps_no_draft = 0;
         } else if (++steps_no_draft >= probe_every) {
-            // a few steps, so that the ones after the first are timed
+            // several steps, so that the ones after the first are timed
             steps_no_draft = 0;
             probe_left     = probe_steps - 1;
             return n_probe;
         }
+
         return n_cur;
     }
 
@@ -383,20 +388,23 @@ struct server_spec_adaptive {
         t_begin = t_us;
     }
 
-    // a finished step that verified L drafted tokens (0: no draft) and accepted n_acc of them
+    // the tracked step verified L drafted tokens (0: no draft) and accepted n_acc of them
     void end(int64_t t_us, int L, int n_acc) {
+        if (t_begin < 0) {
+            return;
+        }
         L = std::min(L, n_max);
-        if (t_begin >= 0 && L == L_prev) {
-            // a step slower than half again the estimate (a prompt cache save, a graph rebuild) counts as that
-            const bool   est = std::any_of(t_step.begin(), t_step.end(), [](double x) { return x > 0.0; });
-            const double t   = est ? std::min((double) (t_us - t_begin), 1.5*step_time(L)) : (double) (t_us - t_begin);
+
+        if (L == L_prev) {
+            // a step slower than 1.5x the estimate (a prompt cache save, a graph rebuild) counts as 1.5x
+            const double t = timed ? std::min((double) (t_us - t_begin), 1.5*step_time(L)) : (double) (t_us - t_begin);
             t_step[L] = t_step[L] > 0.0 ? (1.0 - t_alpha)*t_step[L] + t_alpha*t : t;
+            timed     = true;
         }
-        if (t_begin >= 0) {
-            n_used[L]++;
-        }
+        n_used[L]++;
         t_begin = -1;
         L_prev  = L;
+
         if (L == 0) {
             return;
         }
@@ -1696,6 +1704,11 @@ private:
             return false;
         }
 
+        // one slot: the step time of a batch of several slots is not the time of one slot's draft length
+        if (spec && params_base.speculative.draft.adaptive && params_base.n_parallel > 1) {
+            SRV_WRN("%s", "--spec-draft-adaptive needs one slot (-np 1), the draft length stays fixed\n");
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1706,9 +1719,10 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
-            slot.spec_adaptive = spec && params_base.speculative.draft.adaptive;
+            slot.spec_adaptive = spec && params_base.speculative.draft.adaptive && params_base.n_parallel == 1 &&
+                                 common_speculative_n_max(spec.get()) > 0;
             if (slot.spec_adaptive) {
-                slot.spec_adapt.init(params_base.speculative.draft.n_max);
+                slot.spec_adapt.init(params_base.speculative.draft.n_min, common_speculative_n_max(spec.get()));
             }
 
             slot.mctx                   = mctx;
@@ -2184,6 +2198,7 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+
             // a grammar checks each backend-sampled token, a rejected one is sampled again from the raw logits
             llama_set_sampler_raw_logits(ctx_tgt, slot.id, use_backend_sampling && common_sampler_has_grammar(slot.smpl.get()));
 
@@ -3987,8 +4002,8 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 int n_draft_max = slot.get_n_draft_max();
-                if (slot.spec_adaptive) {
-                    if (slot.spec_draft.empty()) {
+                if (slot.spec_adaptive && slot.spec_draft.empty()) {
+                    if (n_draft_max > 0) {
                         n_draft_max = std::min(n_draft_max, slot.spec_adapt.choose());
                     }
                     slot.spec_adapt.begin(ggml_time_us());
@@ -5099,6 +5114,10 @@ private:
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                        }
+
+                        if (slot.spec_adaptive) {
+                            slot.spec_adapt.end(ggml_time_us(), (int) n_draft, (int) accepted.size() - 1);
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state

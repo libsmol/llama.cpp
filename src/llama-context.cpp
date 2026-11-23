@@ -2332,10 +2332,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     int64_t n_outputs_prev = 0;
+    int64_t n_tokens_prev  = 0;
 
     // the outputs whose raw logits are copied (llama_get_raw_logits_ith): with backend samplers, by ubatch
     sampling.raw_logits_copied.assign(n_outputs_all, 0);
-    int64_t n_tokens_prev  = 0;
 
     // ordering for the layer input device buffer
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
@@ -2890,12 +2890,10 @@ void llama_context::output_reorder() {
             }
 
             std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
-            if (i1 < sampling.raw_logits_copied.size()) {
-                std::swap(sampling.raw_logits_copied[i0], sampling.raw_logits_copied[i1]);
-            }
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+            std::swap(sampling.raw_logits_copied[i0], sampling.raw_logits_copied[i1]);
         }
     }
 

@@ -352,6 +352,8 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    bool adaptive = false; // server: per step, the draft length (up to n_max, 0: none) with the highest expected throughput
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

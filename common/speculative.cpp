@@ -1599,6 +1599,8 @@ public:
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
         std::vector<bool>    sampled    (n_seq,  false);
+        std::vector<int32_t> n_read     (n_seq,  0);   // drafted positions read per sequence
+        int32_t              n_read_max = 0;
 
         block_state.clear();
 
@@ -1632,7 +1634,10 @@ public:
             const int32_t n = (int32_t) dp.pos0;
 
             // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_max of it
-            const int32_t n_draft = params.n_max;
+            // (the caller may ask for fewer per sequence, dp.n_max)
+            const int32_t n_draft = dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
+            n_read[seq_id] = n_draft;
+            n_read_max     = std::max(n_read_max, n_draft);
             const int32_t n_block_tokens = has_markov_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1663,7 +1668,7 @@ public:
         }
 
         // the Markov head computes only the positions read below
-        llama_set_dspark_n_draft(ctx_dft, params.n_max);
+        llama_set_dspark_n_draft(ctx_dft, n_read_max);
 
         // decode all sequence's noise block in a single batch
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -1687,7 +1692,7 @@ public:
 
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-            const int32_t i_draft_end = std::min(n_block_tokens, i_draft_beg + params.n_max);
+            const int32_t i_draft_end = std::min(n_block_tokens, i_draft_beg + n_read[seq_id]);
 
             if (sampled[seq_id]) {
                 // the tokens the graph drew, and the distribution q each one was drawn from

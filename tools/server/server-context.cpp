@@ -264,6 +264,144 @@ struct server_batch {
     }
 };
 
+// --spec-draft-adaptive: the draft length of every step, 0..n_max (0: no draft), with the highest expected
+// throughput E(L) / T(L). E(L) = 1 + sum_k prod_{i <= k} a_i, a_i the acceptance of draft position i given the earlier
+// ones were accepted (decayed counts); T(L) the measured time of a step with L drafted tokens, or for a length not yet
+// measured an estimate from a measured one and the relative costs of R(L). Without a draft the acceptance is probed
+// every probe_every steps. A different length is taken only when it is expected 3% faster.
+struct server_spec_adaptive {
+    static constexpr double decay       = 0.97;   // per verified step, ~23 steps half-life
+    static constexpr double t_alpha     = 0.2;    // EMA of the step times
+    static constexpr int    probe_every = 24;
+
+    int n_max = 0;
+    int n_cur = 0;
+    int steps_no_draft = 0;
+
+    std::vector<double> drafted;   // position i (from 0): times reached, decayed
+    std::vector<double> accepted;  // position i: times accepted, decayed
+    std::vector<double> t_step;    // length L: EMA step time in us, 0 when not measured
+    std::vector<int>    n_used;    // length L: steps of the current request
+
+    int64_t t_begin = -1;
+    int     L_prev  = -1;          // the first step after a change of length rebuilds graphs: not timed
+
+    void init(int n_max_) {
+        n_max = n_max_;
+        n_cur = std::min(n_max, 3);
+        drafted.assign(n_max, 0.0);
+        accepted.assign(n_max, 0.0);
+        t_step.assign(n_max + 1, 0.0);
+        n_used.assign(n_max + 1, 0);
+    }
+
+    // a new request: keep half of the statistics of the previous one
+    void new_task() {
+        for (int i = 0; i < n_max; ++i) {
+            drafted[i]  *= 0.5;
+            accepted[i] *= 0.5;
+        }
+        std::fill(n_used.begin(), n_used.end(), 0);
+    }
+
+    std::string summary() const {
+        std::string s;
+        for (int L = 0; L <= n_max; ++L) {
+            if (n_used[L] > 0) {
+                s += string_format(" %d:%d (%.1f ms, E %.2f)", L, n_used[L], step_time(L)/1000.0, expected_tokens(L));
+            }
+        }
+        return s;
+    }
+
+    // the relative cost of a step with L drafted tokens (measured on Inkling 2 Mini / R9700 with DSpark)
+    static double rel_cost(int L) {
+        static const double r[] = { 1.00, 1.71, 1.90, 2.15, 2.45, 2.75, 2.99, 3.28 };
+        return L < 8 ? r[L] : r[7] + 0.29*(L - 7);
+    }
+
+    double expected_tokens(int L) const {
+        double e = 1.0, p = 1.0;
+        for (int i = 0; i < L; ++i) {
+            p *= (accepted[i] + 1.2)/(drafted[i] + 2.0);   // a prior of 0.6 until measured
+            e += p;
+        }
+        return e;
+    }
+
+    double step_time(int L) const {
+        if (t_step[L] > 0.0) {
+            return t_step[L];
+        }
+        // from the measured length closest to L
+        int ref = -1;
+        for (int d = 1; d <= n_max && ref < 0; ++d) {
+            if (L - d >= 0 && t_step[L - d] > 0.0) {
+                ref = L - d;
+            } else if (L + d <= n_max && t_step[L + d] > 0.0) {
+                ref = L + d;
+            }
+        }
+        return ref < 0 ? rel_cost(L) : t_step[ref]*rel_cost(L)/rel_cost(ref);
+    }
+
+    // the draft length of the next step
+    int choose() {
+        if (n_max <= 0) {
+            return 0;
+        }
+        int best = n_cur;
+        double s_best = expected_tokens(n_cur)/step_time(n_cur);
+        for (int L = 0; L <= n_max; ++L) {
+            const double s = expected_tokens(L)/step_time(L);
+            if (s > s_best*1.03) {
+                best   = L;
+                s_best = s;
+            }
+        }
+        n_cur = best;
+        if (n_cur == 0 && ++steps_no_draft >= probe_every) {
+            steps_no_draft = 0;
+            return std::min(n_max, 2);
+        }
+        if (n_cur > 0) {
+            steps_no_draft = 0;
+        }
+        return n_cur;
+    }
+
+    void begin(int64_t t_us) {
+        t_begin = t_us;
+    }
+
+    // a finished step that verified L drafted tokens (0: no draft) and accepted n_acc of them
+    void end(int64_t t_us, int L, int n_acc) {
+        L = std::min(L, n_max);
+        if (t_begin >= 0 && L == L_prev) {
+            const double t = (double) (t_us - t_begin);
+            t_step[L] = t_step[L] > 0.0 ? (1.0 - t_alpha)*t_step[L] + t_alpha*t : t;
+        }
+        if (t_begin >= 0) {
+            n_used[L]++;
+        }
+        t_begin = -1;
+        L_prev  = L;
+        if (L == 0) {
+            return;
+        }
+        for (int i = 0; i < n_max; ++i) {
+            drafted[i]  *= decay;
+            accepted[i] *= decay;
+        }
+        for (int i = 0; i < L && i <= n_acc; ++i) {
+            drafted[i] += 1.0;
+            if (i < n_acc) {
+                accepted[i] += 1.0;
+            }
+        }
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -304,6 +442,8 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    server_spec_adaptive spec_adapt; // --spec-draft-adaptive
+    bool spec_adaptive = false;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -819,6 +959,9 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (spec_adaptive) {
+                SLT_INF(*this, "adaptive draft length, steps per length:%s\n", spec_adapt.summary().c_str());
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -1552,6 +1695,11 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
+            slot.spec_adaptive = spec && params_base.speculative.draft.adaptive;
+            if (slot.spec_adaptive) {
+                slot.spec_adapt.init(params_base.speculative.draft.n_max);
+            }
+
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
@@ -2045,6 +2193,10 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        if (slot.spec_adaptive) {
+            slot.spec_adapt.new_task();
+        }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -3823,7 +3975,13 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (slot.spec_adaptive) {
+                    if (slot.spec_draft.empty()) {
+                        n_draft_max = std::min(n_draft_max, slot.spec_adapt.choose());
+                    }
+                    slot.spec_adapt.begin(ggml_time_us());
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -4841,6 +4999,10 @@ private:
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
+            if (slot.spec_adaptive) {
+                slot.spec_adapt.end(t_now, 0, 0);
+            }
+
             slot.stats.n_gen += 1;
 
             if (slot.stats.n_gen == 1) {
@@ -4956,6 +5118,10 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                if (slot.spec_adaptive) {
+                    slot.spec_adapt.end(ggml_time_us(), (int) n_draft, (int) accepted.size() - 1);
+                }
 
                 slot.spec_draft = std::move(accepted);
             }

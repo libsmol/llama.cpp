@@ -1692,6 +1692,14 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::set_sampler_raw_logits(llama_seq_id seq_id, bool keep) {
+    if (keep) {
+        sampling.raw_logits.insert(seq_id);
+    } else {
+        sampling.raw_logits.erase(seq_id);
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2118,16 +2126,17 @@ static void copy_tensor_async_rows(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers,
+        const std::set<llama_seq_id> & raw_logits) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
         }
 
-        // Check if the output token has at least one sequence without a backend sampler.
+        // Check if the output token has at least one sequence without a backend sampler, or one that keeps its raw logits.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() || raw_logits.count(seq_id)) {
                 return true;
             }
         }
@@ -2305,6 +2314,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     int64_t n_outputs_prev = 0;
+
+    // set when the raw logits of this batch are copied (llama_get_raw_logits_ith)
+    sampling.raw_logits_copied = false;
     int64_t n_tokens_prev  = 0;
 
     // ordering for the layer input device buffer
@@ -2409,7 +2421,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.raw_logits)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2420,6 +2432,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                sampling.raw_logits_copied = true;
             }
         }
 
@@ -4678,6 +4691,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
+float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->has_raw_logits() ? ctx->get_logits_ith(i) : nullptr;
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
@@ -4760,6 +4779,10 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_sampler_raw_logits(llama_context * ctx, llama_seq_id seq_id, bool keep) {
+    ctx->set_sampler_raw_logits(seq_id, keep);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

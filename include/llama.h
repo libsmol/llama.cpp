@@ -1472,6 +1472,16 @@ extern "C" {
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
 
+    // [EXPERIMENTAL]
+    // also copy the raw logits of a sequence that has a backend sampler, for a CPU fallback (e.g. a grammar that
+    // rejects the backend-sampled token)
+    LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool keep);
+
+    // [EXPERIMENTAL]
+    // the raw logits of output i, also for a sequence with a backend sampler (llama_get_logits_ith gives the logits of
+    // its chain then); NULL when they were not copied (llama_set_sampler_raw_logits)
+    LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
+
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);

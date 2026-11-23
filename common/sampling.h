@@ -55,6 +55,9 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// the sampler has a grammar: with backend sampling, keep the raw logits for its fallback (llama_set_sampler_raw_logits)
+bool common_sampler_has_grammar(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

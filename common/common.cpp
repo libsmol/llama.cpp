@@ -1396,6 +1396,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    // a grammar checks each backend-sampled token, a rejected one is sampled again from the raw logits
+    if (params.sampling.backend_sampling) {
+        for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+            llama_set_sampler_raw_logits(lctx, i, common_sampler_has_grammar(pimpl->samplers[i].get()));
+        }
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);

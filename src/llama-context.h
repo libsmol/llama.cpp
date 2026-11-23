@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -284,6 +285,8 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool keep);
+    bool has_raw_logits() const { return sampling.samplers.empty() || sampling.raw_logits_copied; }
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -366,6 +369,10 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        // sequences with a backend sampler whose raw logits are copied too (llama_set_sampler_raw_logits)
+        std::set<llama_seq_id> raw_logits;
+        // the raw logits of the last batch were copied (with backend samplers: not for every batch)
+        bool raw_logits_copied = false;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

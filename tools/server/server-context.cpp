@@ -2025,6 +2025,8 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            // a grammar checks each backend-sampled token, a rejected one is sampled again from the raw logits
+            llama_set_sampler_raw_logits(ctx_tgt, slot.id, use_backend_sampling && common_sampler_has_grammar(slot.smpl.get()));
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());

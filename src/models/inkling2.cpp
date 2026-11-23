@@ -5,15 +5,10 @@
 #include <string>
 #include <vector>
 
-// max query chunks per layer of the fused-mask attention
+// the fused-mask attention: about the max elements of its per-head F16 mask per call (2 GiB; chunks are whole multiples
+// of 64 rows), and the max query chunks per layer
+static constexpr int64_t n_kq_mask_max  = int64_t(1) << 30;
 static constexpr int64_t n_kq_chunk_max = 64;
-
-// about the max elements of its per-head F16 mask per attention call (2 GiB; chunks are whole multiples of 64 rows).
-// LLAMA_INKLING_KQ_MASK_MAX lowers it, to test the chunked path at a short context.
-static int64_t n_kq_mask_max() {
-    static const int64_t n = getenv("LLAMA_INKLING_KQ_MASK_MAX") ? std::max<int64_t>(1, atoll(getenv("LLAMA_INKLING_KQ_MASK_MAX"))) : int64_t(1) << 30;
-    return n;
-}
 
 static bool is_f32(const ggml_tensor * t) {
     return t == nullptr || t->type == GGML_TYPE_F32;
@@ -193,7 +188,7 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
 
 bool llama_model_inkling2::graph::fuse(const char * name) const {
     static const std::string off = getenv("LLAMA_INKLING_FUSE_OFF") ? std::string(",") + getenv("LLAMA_INKLING_FUSE_OFF") + "," : std::string();
-    return fused && off.find(std::string(",") + name + ",") == std::string::npos;
+    return off.find(",all,") == std::string::npos && off.find(std::string(",") + name + ",") == std::string::npos;
 }
 
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale; post: optional per-row multiplier
@@ -558,7 +553,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
             // the mask is n_kv x n_rows x n_head: query rows are chunked past the budget, the first chunk stores K and V
             const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-            int64_t n_rows_max = std::max({ int64_t(1), n_kq_mask_max()/(n_kv_max*n_head), (n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
+            int64_t n_rows_max = std::max({ int64_t(1), n_kq_mask_max/(n_kv_max*n_head), (n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_tokens) {
                 const int64_t n_chunks = (n_tokens + n_rows_max - 1)/n_rows_max;
                 n_rows_max = std::min<int64_t>(n_tokens, GGML_PAD((n_tokens + n_chunks - 1)/n_chunks, 64));

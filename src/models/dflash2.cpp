@@ -77,8 +77,7 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
     // fused: the tap chain below is ~10 small dependent ops per call
-    static const bool unfused = getenv("LLAMA_DFLASH_CONV_UNFUSED") != nullptr;
-    if (!unfused && base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
+    if (base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
         return ggml_dflash_conv(ctx0, hidden, dynamic, base, side, (int) n_blocks);
     }
 
@@ -244,9 +243,8 @@ llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params
     // with the original weights and let the selector take its top k from those
     {
         const auto [output, output_s] = get_lm_head(*this, model);
-        static const bool no_approx = getenv("LLAMA_DFLASH_NO_APPROX_HEAD") != nullptr;
         const int64_t n_cand = 64;
-        if (!no_approx && model.dflash_output_approx && !model.d2t && output_s == nullptr &&
+        if (model.dflash_output_approx && !model.d2t && output_s == nullptr &&
                 model.dflash_output_approx->ne[1] == output->ne[1] && n_cand < output->ne[1] &&
                 n_cand >= (int64_t) hparams.dflash_selector_top_k) {
             ggml_tensor * approx = ggml_mul_mat(ctx0, model.dflash_output_approx, cur);    // [n_vocab, n_tokens]

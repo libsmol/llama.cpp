@@ -1138,7 +1138,7 @@ protected:
             for (int32_t il = 0; all_swa && il < llama_model_n_layer(model_dft); ++il) {
                 all_swa = llama_model_layer_is_swa(model_dft, il);
             }
-            if (all_swa && n_seq == 1 && getenv("LLAMA_DFLASH_NO_PROMPT_SKIP") == nullptr) {
+            if (all_swa && n_seq == 1) {
                 n_swa_all = n_swa;
                 LOG_INF("%s: - every draft layer uses a %d-token window: prompt rows before it are not injected\n", __func__, n_swa);
             }
@@ -1784,7 +1784,7 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
         // the lattice ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
         // and rescore the best candidates with the original weights
-        if (getenv("LLAMA_DFLASH_NO_APPROX_HEAD") == nullptr) {
+        {
             const int64_t t0 = ggml_time_us();
             if (llama_model_dflash_build_approx_head(const_cast<llama_model *>(model_dft), model_tgt)) {
                 LOG_INF("%s: - %s ranks the vocabulary with a 2-bit copy of the target output head (%.1f s)\n",

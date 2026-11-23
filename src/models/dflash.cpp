@@ -884,9 +884,8 @@ llama_model_dflash::graph_dspine::graph_dspine(const llm_graph_params & params) 
     // the approximate head picks the candidates of the lattice (the walk only reads the lattice). 128: on Qwen3.8-27B
     // the exact top 16 fall outside the approximate top 128 for 0.05% of the candidates (only exact ranks 9..16;
     // 64: 1%, ranks 5..16), at nearly the cost of 64
-    static const bool no_approx = getenv("LLAMA_DFLASH_NO_APPROX_HEAD") != nullptr;
     const int64_t n_cand = 128;
-    if (lattice && !no_approx && model.dflash_output_approx && !model.d2t && output_s == nullptr &&
+    if (lattice && model.dflash_output_approx && !model.d2t && output_s == nullptr &&
             model.dflash_output_approx->ne[1] == output->ne[1] && n_cand < output->ne[1] &&
             n_cand >= (int64_t) hparams.dspine_head_top_k &&
             hparams.f_logit_scale == 0.0f && hparams.f_final_logit_softcapping <= 0.0f) {

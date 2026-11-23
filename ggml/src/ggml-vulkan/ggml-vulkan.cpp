@@ -1154,17 +1154,6 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
 }
 
-static bool getenv_disable_mmid_mul_mul() {
-    static const bool d = getenv("GGML_VK_DISABLE_MMID_MUL_MUL") != nullptr;
-    return d;
-}
-
-// GGML_VK_FULL_BARRIERS=1: every barrier waits for all stages (the upstream behaviour)
-static bool getenv_full_barriers() {
-    static const bool full = getenv("GGML_VK_FULL_BARRIERS") != nullptr;
-    return full;
-}
-
 void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
 
@@ -1176,7 +1165,7 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
 
     // the source scope covers the transfer stage only when a copy or fill may be pending: on the graphics queue a
     // transfer source stage costs ~1 us more per barrier (RADV, R9700); the destination scope always covers transfers
-    const bool src_transfer = transfer_queue || subctx->transfer_unsynced || getenv_full_barriers();
+    const bool src_transfer = transfer_queue || subctx->transfer_unsynced;
     subctx->transfer_unsynced = false;
 
     const vk::AccessFlags all_access = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
@@ -9892,8 +9881,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // split, combined by flash_attn_pf_rdna4_reduce.comp.
     {
         static const bool disable_pf     = getenv("GGML_VK_DISABLE_FA_PF") != nullptr;
-        static const bool disable_verify = getenv("GGML_VK_DISABLE_FA_VERIFY") != nullptr;
-        static const bool disable_pf_q8  = getenv("GGML_VK_DISABLE_FA_PF_Q8_0") != nullptr;
         // below ~6K keys the coopmat1 path is as fast (this one pays a mask pass and a reduce)
         // from 16K keys on: below that the coopmat1 path is measurably (~3e-7 KLD) closer to f32
         const uint32_t verify_min_kv = 16384;
@@ -9904,7 +9891,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t NQ = (uint32_t) neq1;   // query rows (N may have been folded into the GQA ratio above)
         // q8_0 K/V: fetched raw and dequantized from LDS; rows must be whole blocks on 8-byte offsets
         // (the shader indexes 8-byte units from the bound offset of K / V, so only the strides need 8-byte multiples)
-        const bool pf_q8 = !disable_pf_q8 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+        const bool pf_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
             (nbk1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 && (nbv1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 &&
             ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 8) == 0 &&
             k->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && v->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
@@ -9930,7 +9917,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t n_cu    = std::max(1u, ctx->device->shader_core_count);
         const bool     few_wgs = 2 * CEIL_DIV(NQ, 16 * fa_pf_qb()) * nek2 * neq3 < n_cu;
         const bool pf_prefill = pf_common && NQ >= 32 && !few_wgs;
-        const bool pf_verify  = pf_common && !disable_verify && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
+        const bool pf_verify  = pf_common && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
                                 ctx->device->pipeline_fa_pf_rdna4_reduce != nullptr;
         if (pf_prefill || pf_verify) {
             const uint32_t QB    = pf_verify ? 1 : fa_pf_qb();
@@ -11960,9 +11947,8 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
 // RMS_NORM + SCALE (mode 1) or RMS_NORM + MUL(weight row) + MUL(tensor) (mode 2) in one dispatch
 // (rms_norm_fused.comp): the separate ops' expressions, the norm summed in another order.
 static int ggml_vk_can_fuse_rms_norm_ext(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_VK_DISABLE_RMS_NORM_EXT_FUSION") != nullptr;
     // an ADD before may have prepared partial sums for this RMS_NORM (do_add_rms_partials)
-    if (disabled || ctx->device->pipeline_rms_norm_fused[0][0] == nullptr || i + 1 >= cgraph->n_nodes || ctx->do_add_rms_partials) {
+    if (ctx->device->pipeline_rms_norm_fused[0][0] == nullptr || i + 1 >= cgraph->n_nodes || ctx->do_add_rms_partials) {
         return 0;
     }
     const ggml_tensor * norm = cgraph->nodes[i];
@@ -12034,8 +12020,7 @@ static void ggml_vk_rms_norm_fused(ggml_backend_vk_context * ctx, vk_context& su
 
 // ADD + RMS_NORM + MUL(weight) in one dispatch (add_rms_norm_mul.comp), f32 rows of equal shape.
 static bool ggml_vk_can_fuse_add_rms_norm_mul(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_VK_DISABLE_ADD_RMS_NORM_FUSION") != nullptr;
-    if (disabled || ctx->device->pipeline_add_rms_norm_mul_f32 == nullptr || i + 2 >= cgraph->n_nodes) {
+    if (ctx->device->pipeline_add_rms_norm_mul_f32 == nullptr || i + 2 >= cgraph->n_nodes) {
         return false;
     }
     const ggml_tensor * add  = cgraph->nodes[i];
@@ -13928,10 +13913,9 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
 // (rounding only; the sampler's 0/1 mask sums exactly). Returns false when the shape does not qualify.
 static bool ggml_vk_reduce_long(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, ggml_tensor * dst,
         uint32_t mode, int64_t n_cols, int64_t n_rows, int64_t row_stride) {
-    static const bool disabled = getenv("GGML_VK_DISABLE_REDUCE_LONG") != nullptr;
     const uint32_t chunk    = 2048;
     const uint32_t n_chunks = (uint32_t) CEIL_DIV(n_cols, (int64_t) chunk);
-    if (disabled || src0->type != GGML_TYPE_F32 || n_cols < 16384 || n_rows > 64 || n_cols > UINT32_MAX / 2 ||
+    if (src0->type != GGML_TYPE_F32 || n_cols < 16384 || n_rows > 64 || n_cols > UINT32_MAX / 2 ||
         n_chunks > ctx->device->properties.limits.maxComputeWorkGroupCount[0] || !ctx->device->pipeline_reduce_long[mode][0]) {
         return false;
     }
@@ -16992,21 +16976,15 @@ static constexpr int32_t GGML_VK_GDN_GATES_TAG = 0x52344747;
 // A split SWIGLU whose next compute node is a mul_mm_rdna4 matmul taking it as B writes that f16 B
 // operand straight into prealloc_y. Its f32 result is skipped when nothing else reads it.
 static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * out, const ggml_tensor * mm);
-// GGML_VK_DISABLE_NORM_F16: no f16 B from the producers of skinny matmuls (norms, MUL)
-static bool ggml_vk_norm_f16_disabled() {
-    static const bool disabled = getenv("GGML_VK_DISABLE_NORM_F16") != nullptr;
-    return disabled;
-}
 static void ggml_vk_find_glu_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->glu_to_f16.clear();
     ctx->glu_to_f16_b.clear();
-    static const bool disabled = getenv("GGML_VK_DISABLE_GLU_F16") != nullptr;
-    if (disabled || ctx->device->pipeline_swiglu_to_f16 == nullptr) {
+    if (ctx->device->pipeline_swiglu_to_f16 == nullptr) {
         return;
     }
     // skinny (mul_mmv_rdna4) consumers, and a plain MUL of two same-shape tensors as the producer (Qwen3.5 / 3.8:
     // the gated attention output and the gated delta-net norm, before the output projection)
-    const bool skinny_ok = !ggml_vk_norm_f16_disabled() && ctx->device->pipeline_mul_to_f16 != nullptr;
+    const bool skinny_ok = ctx->device->pipeline_mul_to_f16 != nullptr;
     auto const aligned16 = [](const ggml_tensor * t) { return ((vk_tensor_offset(t) + t->view_offs) % 16) == 0; };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * glu = cgraph->nodes[i];
@@ -17124,7 +17102,7 @@ static bool ggml_vk_norm_f16_eligible(ggml_backend_vk_context * ctx, const ggml_
 
 static void ggml_vk_find_norm_to_f16(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->norm_to_f16.clear();
-    if (ggml_vk_norm_f16_disabled() || ctx->device->pipeline_add_rms_norm_mul_f16out_f32 == nullptr || ctx->device->pipeline_rms_norm_mul_f16out_f32[2] == nullptr) {
+    if (ctx->device->pipeline_add_rms_norm_mul_f16out_f32 == nullptr || ctx->device->pipeline_rms_norm_mul_f16out_f32[2] == nullptr) {
         return;
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -17151,10 +17129,9 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
     ctx->gdn_fusions.clear();
     ctx->fused_skip.clear();
 
-    static const bool disabled = getenv("GGML_VK_DISABLE_GDN_FUSION") != nullptr;
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; i++) {
-        any = !disabled && cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
+        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
     }
     if (!any) {
         return;
@@ -17312,8 +17289,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
 
         // gate ops: only where the graph optimizer kept their inputs alive up to this node
         std::vector<const ggml_tensor *> gate_nodes;
-        static const bool gates_disabled = getenv("GGML_VK_DISABLE_GDN_GATES_FUSION") != nullptr;
-        if (!gates_disabled && ggml_get_op_params_i32(g, 15) == GGML_VK_GDN_GATES_TAG &&
+        if (ggml_get_op_params_i32(g, 15) == GGML_VK_GDN_GATES_TAG &&
             ggml_vk_match_gdn_gates(g, f, gate_nodes, true)) {
             // each absorbed op, and every view between them, has exactly one consumer
             bool single = true;
@@ -17390,8 +17366,7 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, ggml_cgraph 
 // (cpy_multi.comp), the others are skipped. Bit-exact.
 static void ggml_vk_find_cpy_groups(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->cpy_groups.clear();
-    static const bool disabled = getenv("GGML_VK_DISABLE_CPY_GROUP") != nullptr;
-    if (disabled || ctx->device->pipeline_cpy_multi_f32 == nullptr) {
+    if (ctx->device->pipeline_cpy_multi_f32 == nullptr) {
         return;
     }
     auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -17516,8 +17491,7 @@ static void ggml_vk_find_mix_norm_fusions(ggml_backend_vk_context * ctx, ggml_cg
         std::vector<std::vector<const ggml_tensor *>> & cand_single, std::vector<std::vector<const ggml_tensor *>> & cand_skip) {
     ctx->mix_norm_fusions.clear();
 
-    static const bool disabled = getenv("GGML_VK_DISABLE_MIX_NORM_FUSION") != nullptr;
-    if (disabled || ctx->device->disable_fusion || !ctx->device->pipeline_res_mix_norm[0][0]) {
+    if (ctx->device->disable_fusion || !ctx->device->pipeline_res_mix_norm[0][0]) {
         return;
     }
 
@@ -17716,10 +17690,9 @@ static void ggml_vk_find_mix_norm(ggml_backend_vk_context * ctx, ggml_cgraph * c
 // the mix-norm analysis, reused for an equal graph (the same nodes, shapes and memory: the server decodes the same
 // graph for every token)
 static void ggml_vk_find_mix_norm_cached(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
-    static const bool no_cache = getenv("GGML_VK_DISABLE_FUSION_CACHE") != nullptr;
     auto & cache = ctx->fusion_cache;
     const uint64_t sig = ggml_vk_graph_signature(cgraph);
-    if (!no_cache && cache.valid && cache.nodes == cgraph->nodes && cache.n_nodes == cgraph->n_nodes && cache.sig == sig) {
+    if (cache.valid && cache.nodes == cgraph->nodes && cache.n_nodes == cgraph->n_nodes && cache.sig == sig) {
         ctx->mix_norm_fusions = cache.mix_norm_fusions;
         for (const ggml_tensor * t : cache.skip) {
             ctx->fused_skip.insert(t);
@@ -17988,7 +17961,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (!getenv_disable_mmid_mul_mul() && ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_MUL })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_MUL_MUL";
                 op_srcs_fused_elementwise[0] = false;
@@ -18601,7 +18574,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     // MUL_MAT_ID + MUL + MUL: the second scale (routing weights) may sit behind views
-                    !(!getenv_disable_mmid_mul_mul() && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_MUL &&
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_MUL &&
                       graph->nodes[c]->src[0]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->src[0] == graph->nodes[c] &&
                       empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -18781,8 +18754,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     // GATED_DELTA_NET evaluates its gate ops itself (ggml_vk_find_gdn_fusions) once their inputs are
     // kept alive up to it; the tag tells the compute pass that they are.
-    static const bool gates_disabled = getenv("GGML_VK_DISABLE_GDN_GATES_FUSION") != nullptr;
-    if (!gates_disabled && params && params->add_alloc_dep) {
+    if (params && params->add_alloc_dep) {
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * g = graph->nodes[i];
             if (g->op != GGML_OP_GATED_DELTA_NET) {

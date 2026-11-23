@@ -235,8 +235,11 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #endif // GGML_VULKAN_DEBUG
 
 #define MAX_PARAMETER_COUNT 12
-// bindings of the shared descriptor set layout (the pipelines with more buffers than MAX_PARAMETER_COUNT: res_mix_norm)
-#define VK_MAX_BINDINGS 24
+// bindings of the shared descriptor set layout: the widest pipeline (res_mix_norm) has 17, the others at most
+// MAX_PARAMETER_COUNT; device->n_bindings is this clamped to the device limit
+#define VK_MAX_BINDINGS 17
+// queries of res_mix_norm (Inkling: 1 for the FFN input, 3 for the attention inputs of the full-attention layers)
+#define VK_RES_MIX_NORM_MAX_Q 3
 #define VK_RES_MIX_MAX_STATES 9
 #define VK_RES_MIX_MAX_Q 4
 
@@ -853,6 +856,7 @@ struct vk_device_struct {
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
 
     vk::DescriptorSetLayout dsl;
+    uint32_t n_bindings = MAX_PARAMETER_COUNT;   // of dsl
 
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
     matmul_tile_selector_t matmul_tile_selector;
@@ -1010,7 +1014,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_loop_up_f32;
     vk_pipeline pipeline_rot_gate_f32;
     vk_pipeline pipeline_short_conv_rs_f32[9]; // by n_conv
-    vk_pipeline pipeline_res_mix_norm[9][3]; // RES_MIX + RMS_NORM_MUL of its rows, by states and queries
+    vk_pipeline pipeline_res_mix_norm[9][VK_RES_MIX_NORM_MAX_Q]; // RES_MIX + RMS_NORM_MUL of its rows, by states and queries
     vk_pipeline pipeline_reduce_long[2][2];  // SUM / ARGMAX of a few long rows, by mode and pass
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
@@ -1055,8 +1059,8 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
-    // RDNA4 prefill / verification flash attention (flash_attn_pf_rdna4.comp), keyed by G | QB << 8 | SPLIT << 16,
-    // and the reduce of its KV splits
+    // RDNA4 prefill / verification flash attention (flash_attn_pf_rdna4.comp), keyed by
+    // G | QB << 8 | SPLIT << 16 | (head size / 64) << 20 | q8_0 K/V << 24, and the reduce of its KV splits
     std::map<uint32_t, vk_pipeline> pipeline_fa_pf_rdna4;
     vk_pipeline pipeline_fa_pf_rdna4_reduce;
     // RDNA4 prefill GEMM (mul_mm_rdna4.comp) and its split-K reduce
@@ -1233,63 +1237,6 @@ struct vk_buffer_copy_region {
     size_t size;
 };
 
-// use counts of a few tensors of a graph (as srcs of its nodes): a small open-addressing table of the tensors, then one
-// pass over the srcs of every node. The fusion analysis runs before the first submit, so it has to be cheap (counting
-// every tensor of an Inkling token, ~6k nodes, costs ~0.1-0.3 ms of GPU idle time)
-struct vk_graph_uses {
-    std::vector<const ggml_tensor *> keys;
-    std::vector<int32_t>             counts;
-    size_t                           mask = 0;
-
-    static size_t hash(const ggml_tensor * t) {
-        uint64_t x = (uint64_t) (uintptr_t) t;
-        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
-        return (size_t) x;
-    }
-    // counts the uses of the tensors ts
-    void count(const ggml_cgraph * cgraph, const std::vector<const ggml_tensor *> & ts) {
-        size_t cap = 64;
-        while (cap < ts.size()*4) {
-            cap <<= 1;
-        }
-        keys.assign(cap, nullptr);
-        counts.assign(cap, 0);
-        mask = cap - 1;
-        for (const ggml_tensor * t : ts) {
-            size_t h = hash(t) & mask;
-            while (keys[h] && keys[h] != t) {
-                h = (h + 1) & mask;
-            }
-            keys[h] = t;
-        }
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            for (const ggml_tensor * s : cgraph->nodes[i]->src) {
-                if (!s) {
-                    continue;
-                }
-                size_t h = hash(s) & mask;
-                while (keys[h]) {
-                    if (keys[h] == s) {
-                        counts[h]++;
-                        break;
-                    }
-                    h = (h + 1) & mask;
-                }
-            }
-        }
-    }
-    int32_t get(const ggml_tensor * t) const {
-        size_t h = hash(t) & mask;
-        while (keys[h]) {
-            if (keys[h] == t) {
-                return counts[h];
-            }
-            h = (h + 1) & mask;
-        }
-        return 0;
-    }
-};
-
 struct vk_context_struct {
     vk_submission * s;
     std::vector<vk_sequence> seqs;
@@ -1445,10 +1392,9 @@ struct ggml_backend_vk_context {
         const ggml_tensor * fout_rows = nullptr;
     };
     std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
-    std::unordered_set<const ggml_tensor *> gdn_fused_skip;
-    vk_graph_uses graph_uses;
+    std::unordered_set<const ggml_tensor *> fused_skip;
     // RES_MIX + RMS_NORM * weight of its rows (ggml_vk_find_mix_norm_fusions): one res_mix_norm dispatch at the RES_MIX,
-    // the RMS_NORM and MUL nodes in gdn_fused_skip
+    // the RMS_NORM and MUL nodes in fused_skip
     struct vk_mix_norm_fusion {
         const ggml_tensor * mix = nullptr;
         const ggml_tensor * norm_w[3]   = {};
@@ -1457,7 +1403,7 @@ struct ggml_backend_vk_context {
         uint32_t norm_mask = 0;
     };
     std::unordered_map<const ggml_tensor *, vk_mix_norm_fusion> mix_norm_fusions;
-    // the last result of ggml_vk_find_fusions_counted, for an equal graph
+    // the last result of ggml_vk_find_mix_norm, for an equal graph (ggml_vk_find_mix_norm_cached)
     struct {
         bool valid = false;
         ggml_tensor ** nodes = nullptr;
@@ -1467,7 +1413,7 @@ struct ggml_backend_vk_context {
         std::vector<const ggml_tensor *> skip;
     } fusion_cache;
     // runs of CPY nodes done in one dispatch by the first (ggml_vk_find_cpy_groups); the rest are in
-    // gdn_fused_skip
+    // fused_skip
     std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> cpy_groups;
     // SWIGLU nodes writing the f16 B operand of the following mul_mm_rdna4 into prealloc_y;
     // value: whether the f32 result is written too
@@ -1477,15 +1423,6 @@ struct ggml_backend_vk_context {
     // the last node of an RMS_NORM + MUL / ADD + RMS_NORM + MUL whose next compute node is a mul_mmv_rdna4 matmul
     // reading its result (ggml_vk_find_norm_to_f16): it also writes the matmul's f16 B operand into prealloc_y
     std::unordered_set<const ggml_tensor *> norm_to_f16;
-    // SWIGLU done in the epilogue of the later of its two mul_mm_rdna4 inputs (key), which writes the f16
-    // result into the GLU tensor's own buffer; the consuming matmul reads its B from there
-    struct vk_swiglu_epi {
-        const ggml_tensor * glu   = nullptr;
-        const ggml_tensor * other = nullptr;   // the input computed earlier, read in the epilogue
-        uint32_t            mode  = 0;         // 1: the key is the up half, 2: the gate half
-    };
-    std::unordered_map<const ggml_tensor *, vk_swiglu_epi> swiglu_epi;
-    std::unordered_set<const ggml_tensor *> swiglu_epi_glu;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),

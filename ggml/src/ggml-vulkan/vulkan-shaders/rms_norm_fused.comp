@@ -5,8 +5,8 @@
 // RMS_NORM fused with what consumes it, one workgroup per row:
 //   MODE 0, RMS_NORM + SCALE:     d = (x * inversesqrt(mean(x^2) + eps)) * s + b   (the gated-delta-net l2 norm)
 //   MODE 1, RMS_NORM + MUL + MUL: d = (inversesqrt(mean(x^2) + eps) * x * w) * c   (the gated norm)
-// Same per-element expressions and the same reduction tree as rms_norm.comp, so the results are
-// bit-identical: with BLOCK < 512 the tree skips only rms_norm.comp's leading steps, which add zeros.
+// The per-element expressions are rms_norm.comp's; the sum of squares is reduced by a shared-memory tree, in
+// another order than the subgroup sums rms_norm.comp uses where they are available (rounding only).
 
 layout (constant_id = 0) const uint BLOCK = 512;
 layout (constant_id = 1) const uint MODE = 0;

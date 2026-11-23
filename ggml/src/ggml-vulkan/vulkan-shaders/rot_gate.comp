@@ -15,6 +15,7 @@ layout (binding = 2) writeonly buffer D {float data_d[];};
 layout (push_constant) uniform parameter {
     uint ne0, ne1, nba1, nbg1;
     uint a_offset, g_offset, d_offset, n_rot;
+    float rot_scale;
 } p;
 
 shared float blk[MAX_BLOCK];
@@ -54,7 +55,7 @@ void main() {
         }
         barrier();
     }
-    const float sc = inversesqrt(float(n));
+    const float sc = p.rot_scale;
     for (uint k = tid; k < n; k += 64) {
         data_d[db + k] = blk[k]*sc/(1.0 + exp(-data_g[gb + k]));
     }

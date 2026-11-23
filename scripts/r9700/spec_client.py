@@ -6,7 +6,8 @@ base = f"http://127.0.0.1:{port}"
 def post(path, body):
     req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(req, timeout=1800))
-src = open("/home/hxcliff/src/llama.cpp-b12588-r9700-inkling/src/llama-context.cpp").read()[:60000]
+import os
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../src/llama-context.cpp")).read()[:60000]
 cases = [
     ("code",  "Write a Python function that parses an ISO 8601 duration string such as P3DT4H5M6S into total seconds, with input validation and a few doctests."),
     ("chat",  "用通俗的语言解释一下为什么天空是蓝色的，再说说为什么日落时是红色的。"),

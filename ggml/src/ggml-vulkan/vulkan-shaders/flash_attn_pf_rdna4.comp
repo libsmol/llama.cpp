@@ -143,9 +143,9 @@ uvec4 q8_0_staged(const uint r, const uint c8, const bool is_v) {
 const uint MR = (BC + 8) / 2;
 shared uint Msh[BQ * MR];
 
-// O^T accumulates in f16. Every FLUSH_STEPS blocks each lane adds it into an f32 partial in the part
-// of the output buffer it owns and restarts from zero, which bounds the f16 rounding at any context length.
-// 16 blocks (512 keys) measure as accurate as flushing every block; 128 blocks lost measurably.
+// O^T accumulates in f32 (the graph asks for f32 precision; the f16 P and V products are exact in it). Every
+// FLUSH_STEPS blocks each lane adds it into an f32 partial in the part of the output buffer it owns and restarts
+// from zero.
 #ifndef FLUSH_STEPS
 #define FLUSH_STEPS 16
 #endif
@@ -195,11 +195,10 @@ void main() {
         }
     }
 
-    // f16 as in the coopmat1 kernel (4 VGPRs per tile), but bounded by FLUSH_STEPS; S^T, the softmax
-    // statistics and L are f32
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oacc[NT];
+    // O^T, S^T, the softmax statistics and L are f32
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oacc[NT];
     [[unroll]] for (uint t = 0; t < NT; ++t) {
-        Oacc[t] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        Oacc[t] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     }
     float Mf = NEG_FLT_MAX_OVER_2;
     float Lf = 0.0;   // partial: this lane's key half; combined with lane^16 at the end
@@ -452,11 +451,8 @@ void main() {
             // ---- O^T = O^T * eM + V^T * P^T --------------------------------------------------------------
             // unconditional: eM is exactly 1 when the max is unchanged, and a branch would cost a 16-bit
             // move per packed half on every block
-            {
-                const float16_t eM16 = float16_t(eM);
-                [[unroll]] for (uint t = 0; t < NT; ++t) {
-                    Oacc[t] = Oacc[t] * eM16;
-                }
+            [[unroll]] for (uint t = 0; t < NT; ++t) {
+                Oacc[t] = Oacc[t] * eM;
             }
             [[unroll]] for (uint t = 0; t < NT; ++t) {
                 [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
@@ -500,7 +496,7 @@ void main() {
             has_partial = true;
             Sm = 1.0;
             [[unroll]] for (uint t = 0; t < NT; ++t) {
-                Oacc[t] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                Oacc[t] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
             }
         }
     }

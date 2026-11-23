@@ -2544,28 +2544,42 @@ struct test_rel_bias_mask : public test_case {
     const int64_t n_kv, n_rows, n_head, extent;
     const bool with_sinks;
     const int clip; // 0: none, 1: clip with scale, 2: clip with scale and tau
+    const bool chunk; // r, sinks, q_pos and tau are row views at an offset too, as in a query chunk of the graph
 
     std::string vars() override {
-        return VARS_TO_STR7(mask_type, n_kv, n_rows, n_head, extent, with_sinks, clip);
+        return VARS_TO_STR8(mask_type, n_kv, n_rows, n_head, extent, with_sinks, clip, chunk);
     }
 
-    test_rel_bias_mask(ggml_type mask_type = GGML_TYPE_F16, int64_t n_kv = 512, int64_t n_rows = 3, int64_t n_head = 24, int64_t extent = 64, bool with_sinks = true, int clip = 0)
-        : mask_type(mask_type), n_kv(n_kv), n_rows(n_rows), n_head(n_head), extent(extent), with_sinks(with_sinks), clip(clip) {}
+    test_rel_bias_mask(ggml_type mask_type = GGML_TYPE_F16, int64_t n_kv = 512, int64_t n_rows = 3, int64_t n_head = 24, int64_t extent = 64, bool with_sinks = true, int clip = 0,
+                       bool chunk = false)
+        : mask_type(mask_type), n_kv(n_kv), n_rows(n_rows), n_head(n_head), extent(extent), with_sinks(with_sinks), clip(clip), chunk(chunk) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // mask rows are a view of a padded mask, as the graph slices them
         ggml_tensor * mask_full = ggml_new_tensor_2d(ctx, mask_type, n_kv, n_rows + 5);
         ggml_tensor * mask  = ggml_view_2d(ctx, mask_full, n_kv, n_rows, mask_full->nb[1], 2*mask_full->nb[1]);
         ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, extent);
-        ggml_tensor * r     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, n_head, n_rows);
-        ggml_tensor * sinks = with_sinks ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_rows) : nullptr;
-        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
-        ggml_set_name(q_pos, "q_pos");
+        // the per-row inputs: whole tensors, or rows [r0, r0 + n_rows) of longer ones
+        const int64_t r0 = chunk ? 3 : 0, n_all = n_rows + (chunk ? 5 : 0);
+        ggml_tensor * r_all = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, n_head, n_all);
+        ggml_tensor * r     = chunk ? ggml_view_3d(ctx, r_all, 16, n_head, n_rows, r_all->nb[1], r_all->nb[2], r0*r_all->nb[2]) : r_all;
+        ggml_tensor * sinks = nullptr;
+        if (with_sinks) {
+            ggml_tensor * s_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_all);
+            sinks = chunk ? ggml_view_2d(ctx, s_all, n_head, n_rows, s_all->nb[1], r0*s_all->nb[1]) : s_all;
+        }
+        ggml_tensor * q_all = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_all);
+        ggml_set_name(q_all, "q_pos");
+        ggml_tensor * q_pos = chunk ? ggml_view_1d(ctx, q_all, n_rows, r0*ggml_element_size(q_all)) : q_all;
         ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
         ggml_set_name(kv_pos, "kv_pos");
         if (clip) {
             ggml_tensor * rs  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, n_head);
-            ggml_tensor * tau = clip == 2 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, n_rows) : nullptr;
+            ggml_tensor * tau = nullptr;
+            if (clip == 2) {
+                ggml_tensor * t_all = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_all);
+                tau = chunk ? ggml_view_1d(ctx, t_all, n_rows, r0*ggml_element_size(t_all)) : t_all;
+            }
             return ggml_rel_bias_mask_clip(ctx, mask, bias, r, rs, tau, 8.0f, sinks, q_pos, kv_pos);
         }
         return ggml_rel_bias_mask(ctx, mask, bias, r, sinks, q_pos, kv_pos);
@@ -2575,6 +2589,9 @@ struct test_rel_bias_mask : public test_case {
         std::random_device rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
                 if (strcmp(t->name, "kv_pos") == 0) {
@@ -3404,14 +3421,15 @@ struct test_rms_norm_mul_rope : public test_case {
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool ties; // few distinct values, and rows of -inf: the index of a tie must be the CPU's (the last)
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, ties);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, bool ties = false)
+        : type(type), ne(ne), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -3427,7 +3445,16 @@ struct test_argmax : public test_case {
         std::random_device rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_F32) {
+            if (t->type == GGML_TYPE_F32 && ties) {
+                std::uniform_int_distribution<int> dist(0, 3);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<float> data(t->ne[0]);
+                    for (auto & v : data) {
+                        v = r % 3 == 2 ? -INFINITY : (float) dist(rng);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                }
+            } else if (t->type == GGML_TYPE_F32) {
                 // initialize with unique values to avoid ties
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
@@ -11950,6 +11977,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, with_sinks));
             test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, with_sinks, 1));
             test_cases.emplace_back(new test_rel_bias_mask(mt, 512, 1, 24, 1024, with_sinks, 2));
+            test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, with_sinks, 0, true));
+            test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, with_sinks, 2, true));
         }
     }
     test_cases.emplace_back(new test_loop_gate(2304, 77));
@@ -12481,6 +12510,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // long rows (vocabulary): the multi-workgroup reduction
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {201024, 1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {201024, 8, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {201024, 3, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 6, 1, 1}, true));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {20000,  3, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));

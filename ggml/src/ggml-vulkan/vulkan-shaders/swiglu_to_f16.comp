@@ -20,7 +20,7 @@ layout (push_constant) uniform parameter {
 
 layout (binding = 0) readonly buffer G {vec4 data_g[];};
 layout (binding = 1) readonly buffer U {vec4 data_u[];};
-layout (binding = 2) writeonly buffer D {vec4 data_d[];};
+layout (binding = 2) buffer D {vec4 data_d[];};   // read back by the f16 overflow pass
 layout (binding = 3) writeonly buffer H {f16vec4 data_h[];};
 layout (binding = 3) writeonly buffer HS {float data_hs[];};
 
@@ -83,8 +83,9 @@ void main() {
         }
         const float down = uintBitsToFloat((127u - e) << 23);
         scale = uintBitsToFloat((127u + e) << 23);
+        // with the f32 result stored, read it back: g or u may be the same memory (in-place)
         for (uint i = tid; i < n4; i += 256) {
-            data_h[b0 + i] = f16vec4(op4(b0 + i) * down);
+            data_h[b0 + i] = f16vec4((p.write_f32 != 0 ? data_d[b0 + i] : op4(b0 + i)) * down);
         }
     }
     if (tid == 0) {

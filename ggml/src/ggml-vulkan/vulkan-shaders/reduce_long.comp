@@ -3,8 +3,8 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // SUM / ARGMAX of a few long rows (e.g. the vocabulary): pass 1 reduces chunks of each row in parallel workgroups to
-// partials (value bits, index), pass 2 reduces the partials of each row in one workgroup. ARGMAX returns the first
-// index of the maximum, like the CPU.
+// partials (value bits, index), pass 2 reduces the partials of each row in one workgroup. ARGMAX returns the last
+// index of the maximum, like the CPU (ggml_vec_argmax_f32), n - 1 for a row of -inf.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout (constant_id = 0) const uint MODE = 0; // 0: sum, 1: argmax
@@ -21,7 +21,6 @@ layout (push_constant) uniform parameter {
     uint d_offset;
     uint chunk;
     uint n_chunks;
-    float weight;
 } p;
 
 shared float sv[256];
@@ -33,7 +32,7 @@ void combine(const uint tid, const uint s) {
     } else {
         const float vb = sv[tid + s];
         const uint  ib = si[tid + s];
-        if (vb > sv[tid] || (vb == sv[tid] && ib < si[tid])) {
+        if (vb > sv[tid] || (vb == sv[tid] && ib > si[tid])) {
             sv[tid] = vb;
             si[tid] = ib;
         }
@@ -45,18 +44,19 @@ void main() {
     const uint row = gl_WorkGroupID.y;
 
     float v   = MODE == 0 ? 0.0 : uintBitsToFloat(0xFF800000u);
-    uint  idx = 0xFFFFFFFFu;
+    uint  idx = 0u;
 
     if (PASS == 1) {
         const uint beg = gl_WorkGroupID.x * p.chunk;
         const uint end = min(beg + p.chunk, p.n_cols);
         const uint base = p.a_offset + row * p.row_stride;
-        idx = beg;
+        // an invocation without elements keeps -inf at index 0, below every element of the chunk on a tie
+        idx = 0u;
         for (uint i = beg + tid; i < end; i += 256u) {
             const float x = data_a[base + i];
             if (MODE == 0) {
                 v += x;
-            } else if (x > v) {
+            } else if (x >= v) {
                 v   = x;
                 idx = i;
             }
@@ -68,7 +68,7 @@ void main() {
             const uint  ic = data_t[o + 1u];
             if (MODE == 0) {
                 v += vc;
-            } else if (vc > v || (vc == v && ic < idx)) {
+            } else if (vc > v || (vc == v && ic > idx)) {
                 v   = vc;
                 idx = ic;
             }
@@ -91,7 +91,7 @@ void main() {
             data_t[o]      = floatBitsToUint(sv[0]);
             data_t[o + 1u] = si[0];
         } else {
-            data_d[p.d_offset + row] = MODE == 0 ? floatBitsToUint(sv[0] * p.weight) : si[0];
+            data_d[p.d_offset + row] = MODE == 0 ? floatBitsToUint(sv[0]) : si[0];
         }
     }
 }

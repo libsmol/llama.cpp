@@ -1,5 +1,8 @@
 #version 450
 
+#if RMS_NORM_F16_OUT
+#define D_READ_BACK 1   // the f16 overflow pass reads the f32 result back
+#endif
 #include "generic_binary_head.glsl"
 #include "types.glsl"
 
@@ -58,6 +61,7 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout (binding = 4) writeonly buffer H {float16_t data_h[];};
 layout (binding = 4) writeonly buffer HS {float data_hs[];};
+
 // the smallest magnitude that rounds to infinity as f16
 const float F16_OVERFLOW = 65520.0;
 // the largest row maximum >= F16_OVERFLOW (as bits, which order non-negative floats), else 0
@@ -225,9 +229,8 @@ void rms_norm(uint num_iters) {
                         if (col >= ncols) {
                             continue;
                         }
-                        const FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
-                        const float hv = uintBitsToFloat(floatBitsToUint(float(value)) | f16_zero);
-                        data_h[row * ncols + col] = float16_t(hv * down);
+                        // the f32 result this invocation stored above: x may be the same memory (in-place)
+                        data_h[row * ncols + col] = float16_t(float(data_d[d_offset + col]) * down);
                     }
                 }
                 if (tid == 0) {

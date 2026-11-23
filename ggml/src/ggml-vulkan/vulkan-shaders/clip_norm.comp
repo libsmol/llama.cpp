@@ -23,6 +23,7 @@ layout (push_constant) uniform parameter {
     uint a_offset, s_offset, c_offset, d_offset;
     float max_norm, eps;
     uint n_rot, rms;
+    float rot_scale;
 } p;
 
 shared float sumsh[BLOCK_SIZE];
@@ -84,9 +85,9 @@ void main() {
             }
             barrier();
         }
-        factor *= inversesqrt(float(p.n_rot));
+        // the CPU order: the orthonormal rotation, then the factor
         for (uint i0 = tid; i0 < p.ne0; i0 += BLOCK_SIZE) {
-            data_d[db + i0] = row[i0]*factor;
+            data_d[db + i0] = (row[i0]*p.rot_scale)*factor;
         }
     } else {
         for (uint i0 = tid; i0 < p.ne0; i0 += BLOCK_SIZE) {

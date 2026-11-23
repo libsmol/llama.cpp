@@ -286,7 +286,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
     void set_sampler_raw_logits(llama_seq_id seq_id, bool keep);
-    bool has_raw_logits() const { return sampling.samplers.empty() || sampling.raw_logits_copied; }
+    // the logits of output i (as llama_get_logits_ith) are the raw ones
+    bool has_raw_logits(int32_t i);
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -371,8 +372,8 @@ private:
         std::map<llama_seq_id, llama_sampler *> samplers;
         // sequences with a backend sampler whose raw logits are copied too (llama_set_sampler_raw_logits)
         std::set<llama_seq_id> raw_logits;
-        // the raw logits of the last batch were copied (with backend samplers: not for every batch)
-        bool raw_logits_copied = false;
+        // by output row of the last batch: its raw logits were copied (with backend samplers: not for every ubatch)
+        std::vector<uint8_t> raw_logits_copied;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

@@ -5,9 +5,19 @@
 #include <string>
 #include <vector>
 
-// max elements of the per-head F16 mask per attention call, and max query chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+// max query chunks per layer of the fused-mask attention
 static constexpr int64_t n_kq_chunk_max = 64;
+
+// about the max elements of its per-head F16 mask per attention call (2 GiB; chunks are whole multiples of 64 rows).
+// LLAMA_INKLING_KQ_MASK_MAX lowers it, to test the chunked path at a short context.
+static int64_t n_kq_mask_max() {
+    static const int64_t n = getenv("LLAMA_INKLING_KQ_MASK_MAX") ? std::max<int64_t>(1, atoll(getenv("LLAMA_INKLING_KQ_MASK_MAX"))) : int64_t(1) << 30;
+    return n;
+}
+
+static bool is_f32(const ggml_tensor * t) {
+    return t == nullptr || t->type == GGML_TYPE_F32;
+}
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -188,7 +198,7 @@ bool llama_model_inkling2::graph::fuse(const char * name) const {
 
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale; post: optional per-row multiplier
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * post) {
-    if (fuse("clip")) {
+    if (fuse("clip") && is_f32(scale) && is_f32(post)) {
         return ggml_clip_norm(ctx0, cur, scale, post, threshold, 1e-6f);
     }
 
@@ -260,7 +270,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    if (fuse("convrs") && cparams.n_rs_seq == 0) {
+    // the fused op stores the new inputs through a view of the state that is not its result, so it has to run where the
+    // state is: the scheduler places it by its weight, and hands it a copy of a state elsewhere (-nkvo, -ot); weight
+    // may be a view of a weight, which has no buffer yet
+    const ggml_tensor * w_root = weight->view_src ? weight->view_src : weight;
+    const ggml_tensor * s_root = state->view_src  ? state->view_src  : state;
+    const bool state_with_op = s_root->buffer && w_root->buffer &&
+        (ggml_backend_buffer_is_host(s_root->buffer) ? ggml_backend_buffer_is_host(w_root->buffer) :
+                                                       ggml_backend_buffer_get_type(s_root->buffer) == ggml_backend_buffer_get_type(w_root->buffer));
+    if (fuse("convrs") && cparams.n_rs_seq == 0 && state_with_op) {
         // reads the past inputs from the history and stores the new ones in the cell, as build_conv_state_store()
         const size_t row_size = state->nb[1];
         ggml_tensor * cell = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, n_seqs, row_size,
@@ -309,7 +327,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
     // matrix-vector form for short batches (decode, speculative verification)
-    if (fuse("ctrl") && n_tokens <= 16 && loras->empty()) {
+    if (fuse("ctrl") && n_tokens <= 16 && loras->empty() &&
+        is_f32(loop.ctrl_down[ctrl]) && is_f32(loop.ctrl_gain[ctrl]) && is_f32(loop.ctrl_forget[ctrl])) {
         ggml_tensor * h = ggml_loop_down(ctx0, cur, message, loop.ctrl_down[ctrl], 1e-6f);
         return ggml_loop_up(ctx0, cur, message, h, loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl]);
     }
@@ -361,7 +380,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         return ggml_is_contiguous(t) ? ggml_reshape_3d(ctx0, t, ne0, ne1, n_tokens) :
             ggml_view_3d(ctx0, t, ne0, ne1, n_tokens, ne0*ggml_element_size(t), t->nb[1], 0);
     };
-    auto n_conv_k = [&]() { return (int64_t) hparams.n_shortconv_l_cache; };
+    const int64_t n_conv_k = hparams.n_shortconv_l_cache;
 
     const bool    is_swa       = hparams.is_swa(il);
     const int64_t n_head       = hparams.n_head(il);
@@ -467,8 +486,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
 
         // the short convolutions of K and V, in one call over both when their rows are next to each other (no dynamic taps)
-        ggml_tensor * k_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1], 0) : layer.attn_k_conv;
-        ggml_tensor * v_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k(), n_embd_k_gqa, layer.attn_kv_conv->nb[1],
+        ggml_tensor * k_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k, n_embd_k_gqa, layer.attn_kv_conv->nb[1], 0) : layer.attn_k_conv;
+        ggml_tensor * v_conv = layer.attn_kv_conv ? ggml_view_2d(ctx0, layer.attn_kv_conv, n_conv_k, n_embd_k_gqa, layer.attn_kv_conv->nb[1],
                 n_embd_k_gqa*layer.attn_kv_conv->nb[1]) : layer.attn_v_conv;
         if (KVcur && is_swa && fuse("kvconv")) {
             ggml_tensor * kv = convolve(KVcur, layer.attn_kv_conv, nullptr, state, history, recr, 0);
@@ -482,7 +501,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
 
         // the fused-mask attention: one stream, flash attention (F16 mask)
-        const bool fused_attn = fuse("mask") && n_stream == 1 && cparams.flash_attn;
+        const bool fused_attn = fuse("mask") && n_stream == 1 && cparams.flash_attn &&
+                                is_f32(layer.attn_rel_bias) && is_f32(layer.attn_rel_clip) && is_f32(layer.attn_q_clip);
 
         // the fused-mask attention takes Q, K and V already rotated for the quantized KV cache and returns the output rotated:
         // the norms apply the rotations, the output gate undoes the V rotation
@@ -538,7 +558,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
             // the mask is n_kv x n_rows x n_head: query rows are chunked past the budget, the first chunk stores K and V
             const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-            int64_t n_rows_max = std::max({ int64_t(1), 2*n_kq_bias_max/(n_kv_max*n_head), (n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
+            int64_t n_rows_max = std::max({ int64_t(1), n_kq_mask_max()/(n_kv_max*n_head), (n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_tokens) {
                 const int64_t n_chunks = (n_tokens + n_rows_max - 1)/n_rows_max;
                 n_rows_max = std::min<int64_t>(n_tokens, GGML_PAD((n_tokens + n_chunks - 1)/n_chunks, 64));
@@ -614,7 +634,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const bool block_start = ip % hparams.attn_res_block_size == 0;
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa,
                 block_start ? nullptr : inpSA);
-        cb(cur, "attn_out", il);
+        // (upstream's attn_out is the convolution output before the residual)
+        cb(cur, "attn_res", il);
     }
 
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks

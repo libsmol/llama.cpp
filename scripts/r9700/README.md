@@ -9,6 +9,6 @@ Inkling 2 Mini UD-Q4_K_XL (Unsloth file, arch inkling2 + num_loops):
 All three steps copy the tensor bytes unchanged.
 
 Quality gate (every change): test-backend-ops -b Vulkan0, test-inkling-fused, then
-`BASE=up-cpu64.bin CHUNKS=64 kldfull.sh <bin> <name> -ngl 99 [-b 1024 -ub 4 | -ub 1]` and `kldpair.py new:old`:
+`BASE=up-cpu64-tok2.bin kldfull.sh <bin> <name> -ngl 99 -b 1024 [-ub 512 | -ub 4 | -ub 1]` (one sequence per batch, as the server: with two the fused attention is not used; the KLD mode takes the chunk count of the base file) and `kldpair.py new:old`:
 the paired KLD difference must not be significantly positive (t < 2) on the batch, verification and decode paths.
 The model is sensitive to the rounding order (f32 FA on/off alone gives KLD ~0.002), so the whole-model KLD level is not a quality signal.

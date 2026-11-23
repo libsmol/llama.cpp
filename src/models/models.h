@@ -2549,7 +2549,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * residual = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
 
-        // LLAMA_INKLING_LEGACY: the plain op chains; LLAMA_INKLING_FUSE_OFF=a,b,...: single fusions off (A/B checks)
+        // LLAMA_INKLING_LEGACY: none of the fusions below (SITU, the router clamp and the scale gather of build_moe_ffn
+        // stay); LLAMA_INKLING_FUSE_OFF=a,b,...: single fusions off (A/B checks)
         const bool fused = getenv("LLAMA_INKLING_LEGACY") == nullptr;
         bool fuse(const char * name) const;
 

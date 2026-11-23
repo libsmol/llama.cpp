@@ -235,10 +235,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                // bounded by the snapshots of the last ubatch; lazy: also only into the last ubatch,
-                // whose factors are kept
-                const bool in_reach = !lazy || rollback <= (llama_pos) cell.lz_cnt;
-                if (!pending && in_reach && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
+                // bounded by the snapshots of the last ubatch (lazy: rs_max < lz_cnt, so the factors of the last
+                // ubatch, which are kept, reach as far)
+                GGML_ASSERT(!lazy || cell.rs_max < cell.lz_cnt || cell.rs_max == 0);
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -1487,6 +1487,8 @@ void llama_memory_recurrent_context::lazy_info(int32_t * data, int n_seqs) const
         data[0 * n_seqs + s] = c.src0 >= 0 ? c.src0 : (int32_t) i;
         data[1 * n_seqs + s] = set ? c.lz_fin  : (int32_t) (size + i);
         data[2 * n_seqs + s] = set ? c.lz_fout : (int32_t) (2 * size + i);
+        // the GDN replays the factors in while it writes the factors out: two different factor sets
+        GGML_ASSERT(data[1 * n_seqs + s] != data[2 * n_seqs + s]);
         data[3 * n_seqs + s] = (int32_t) i;
         data[4 * n_seqs + s] = set ? (int32_t) c.lz_rep : 0;
     }

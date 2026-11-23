@@ -1141,6 +1141,19 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+bool llama_context::has_raw_logits(int32_t i) {
+    if (sampling.samplers.empty()) {
+        return true;
+    }
+    output_reorder();
+    try {
+        const int64_t j = output_resolve_row(i);
+        return j >= 0 && (size_t) j < sampling.raw_logits_copied.size() && sampling.raw_logits_copied[j] != 0;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2315,8 +2328,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
-    // set when the raw logits of this batch are copied (llama_get_raw_logits_ith)
-    sampling.raw_logits_copied = false;
+    // the outputs whose raw logits are copied (llama_get_raw_logits_ith): with backend samplers, by ubatch
+    sampling.raw_logits_copied.assign(n_outputs_all, 0);
     int64_t n_tokens_prev  = 0;
 
     // ordering for the layer input device buffer
@@ -2432,7 +2445,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-                sampling.raw_logits_copied = true;
+                std::fill_n(sampling.raw_logits_copied.begin() + n_outputs_prev, n_outputs, 1);
             }
         }
 
@@ -2872,6 +2885,9 @@ void llama_context::output_reorder() {
             }
 
             std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
+            if (i1 < sampling.raw_logits_copied.size()) {
+                std::swap(sampling.raw_logits_copied[i0], sampling.raw_logits_copied[i1]);
+            }
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
@@ -4694,7 +4710,7 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
-    return ctx->has_raw_logits() ? ctx->get_logits_ith(i) : nullptr;
+    return ctx->has_raw_logits(i) ? ctx->get_logits_ith(i) : nullptr;
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

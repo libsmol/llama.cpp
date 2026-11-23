@@ -299,7 +299,7 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
-    GGML_ASSERT(descriptor_buffer_infos.size() <= VK_MAX_BINDINGS);
+    GGML_ASSERT(descriptor_buffer_infos.size() <= ctx->device->n_bindings);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 

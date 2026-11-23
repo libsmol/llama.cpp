@@ -32,13 +32,6 @@ layout (push_constant) uniform parameter {
     uint n_full;
     uint n_parts;
     uint k_part;
-    // epi 1 / 2: SwiGLU epilogue (one whole tile per workgroup). The accumulator is the up / gate half; the
-    // other half is read as f32 from binding 3 (rows of o_stride at o_off), and h = silu(gate) * up is
-    // written as f16 to binding 2 (rows of stride_d at h_off) instead of D. Offsets in elements.
-    uint epi;
-    uint o_stride;
-    uint o_off;
-    uint h_off;
     uint bs_off;     // the scales of B in binding 1, in floats
 } p;
 
@@ -48,8 +41,6 @@ layout (binding = 1) readonly buffer BS {float data_bs[];};  // only if flags bi
 layout (binding = 2) writeonly buffer D {float data_d[];};
 layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};  // only if flags bit 0 is set
 layout (binding = 3) writeonly buffer S {vec4 data_s4[];};   // split-tile partial sums, [tile][part - 1][n][m]
-layout (binding = 2) writeonly buffer H {f16vec4 data_h4[];}; // epi: the f16 SwiGLU output
-layout (binding = 3) readonly buffer O {vec4 data_o4[];};     // epi: the other half of the SwiGLU
 
 #if defined(DATA_A_Q4_K)
 const uint QBLK16 = 9;    // 144-byte blocks, in uvec4
@@ -641,36 +632,6 @@ void main() {
                 const uint si = sbase + ((wn * 64 + j * 16 + lane % 16) * BM + wm * 64 + i * 16 + half_ * 8) / 4;
                 data_s4[si]     = b_scaled(vec4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]), sc);
                 data_s4[si + 1] = b_scaled(vec4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]), sc);
-            }
-        }
-        return;
-    }
-    if (p.epi != 0) {
-        // same expression and f16 rounding as swiglu_to_f16.comp
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            const uint n = n0 + wn * 64 + j * 16 + lane % 16;
-            if (n >= p.N) {
-                continue;
-            }
-            const float sc = b_scale(n);
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                const uint m = m0 + wm * 64 + i * 16 + half_ * 8;
-                if (m + 8 <= p.M) {
-                    const uint oi = (p.o_off + n * p.o_stride + m) / 4;
-                    const vec4 o0 = data_o4[oi], o1 = data_o4[oi + 1];
-                    const vec4 a0 = b_scaled(vec4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]), sc);
-                    const vec4 a1 = b_scaled(vec4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]), sc);
-                    const vec4 g0 = p.epi == 1 ? o0 : a0, g1 = p.epi == 1 ? o1 : a1;
-                    const vec4 u0 = p.epi == 1 ? a0 : o0, u1 = p.epi == 1 ? a1 : o1;
-                    // the f32 product is rounded before the f16 conversion, as there: the OR with a runtime
-                    // zero keeps ACO from fusing both into one v_fma_mix that rounds only once
-                    const uvec4 z  = uvec4(p.epi >> 16);
-                    const vec4  r0 = uintBitsToFloat(floatBitsToUint(g0 / (1.0f + exp(-g0)) * u0) | z);
-                    const vec4  r1 = uintBitsToFloat(floatBitsToUint(g1 / (1.0f + exp(-g1)) * u1) | z);
-                    const uint hi = (p.h_off + n * p.stride_d + m) / 4;
-                    data_h4[hi]     = f16vec4(r0);
-                    data_h4[hi + 1] = f16vec4(r1);
-                }
             }
         }
         return;

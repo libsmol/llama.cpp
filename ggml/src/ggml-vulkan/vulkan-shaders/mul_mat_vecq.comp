@@ -175,9 +175,12 @@ void compute_outputs_flat(const uint32_t first_row, const uint32_t num_rows) {
     // a_offset in nvfp4 blocks, b_offset in q8_1 blocks
     b_offset /= QUANT_K_Q8_1;
 
+    // one column (MUL_MAT_ID: one token per dispatch)
     FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
-    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
-        temp[0][n] = FLOAT_TYPE(0.0f);
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
     }
 
     const uint spr   = p.ncols / 16;            // sub-blocks per row

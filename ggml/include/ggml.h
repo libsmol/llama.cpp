@@ -1330,7 +1330,7 @@ extern "C" {
             struct ggml_tensor  * w_f);
 
     // ggml_short_conv reading the past inputs from the recurrent state and storing the new ones:
-    //   cur: [C, n_t*n_s], past: [n_conv - 1, C, n_s], state: [(n_conv - 1)*C, n_s] (written, may alias past's source)
+    //   cur: [C, n_t*n_s], past: [n_conv - 1, C, n_s], state: [(n_conv - 1)*C, n_s] (written; must not overlap past)
     //   out: [C, n_t, n_s]; state[k + c*(n_conv - 1), s] = the k-th of the last n_conv - 1 inputs of channel c
     GGML_API struct ggml_tensor * ggml_short_conv_rs(
             struct ggml_context * ctx,

@@ -1230,7 +1230,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "short_conv(x, w, d)",
     "res_mix(q, states)",
     "loop_gate(a, m, g, f)",
-    "rel_bias_mask(mask, table, sinks, q_pos, kv_pos)",
+    "rel_bias_mask(mask, bias, sinks, q_pos, kv_pos, r)",
     "loop_down(a, m, w)",
     "loop_up(a, m, h, wg, wf)",
     "short_conv_rs(x, past, w, d, state)",
@@ -3336,6 +3336,7 @@ struct ggml_tensor * ggml_rel_bias_mask(
     GGML_ASSERT(ggml_is_matrix(mask) && mask->nb[0] == ggml_type_size(mask->type));
     GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_matrix(bias) && ggml_is_contiguous(bias));
     GGML_ASSERT(r->type == GGML_TYPE_F32 && r->nb[0] == sizeof(float) && ggml_is_3d(r) && r->ne[0] == bias->ne[0]);
+    GGML_ASSERT(r->ne[0] <= 64); // the clipped r of a row is staged in a fixed buffer (CPU) / shared memory
     GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && kv_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(q_pos) && ggml_is_contiguous(kv_pos));
 

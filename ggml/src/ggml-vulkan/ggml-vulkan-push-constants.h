@@ -85,10 +85,6 @@ struct vk_mm_rdna4_push_constants {
     uint32_t n_full;
     uint32_t n_parts;
     uint32_t k_part;
-    uint32_t epi;        // SwiGLU epilogue (mul_mm_rdna4.comp)
-    uint32_t o_stride;
-    uint32_t o_off;
-    uint32_t h_off;
     uint32_t bs_off;     // flags bit 2: the per-row scales of B (b_to_f16_rowscale.comp), in floats
 };
 
@@ -296,11 +292,13 @@ struct vk_op_clip_norm_push_constants {
     uint32_t a_offset, s_offset, c_offset, d_offset;
     float max_norm, eps;
     uint32_t n_rot, rms;
+    float rot_scale;   // 1/sqrt(n_rot) as the CPU computes it
 };
 
 struct vk_op_rot_gate_push_constants {
     uint32_t ne0, ne1, nba1, nbg1;
     uint32_t a_offset, g_offset, d_offset, n_rot;
+    float rot_scale;   // 1/sqrt(n_rot) as the CPU computes it
 };
 
 struct vk_op_short_conv_push_constants {
@@ -356,7 +354,6 @@ struct vk_op_reduce_long_push_constants {
     uint32_t d_offset;
     uint32_t chunk;
     uint32_t n_chunks;
-    float weight;
 };
 
 struct vk_op_res_mix_norm_push_constants {

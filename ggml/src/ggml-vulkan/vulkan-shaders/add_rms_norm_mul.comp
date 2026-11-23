@@ -4,9 +4,9 @@
 
 // ADD + RMS_NORM + MUL in one dispatch, one workgroup per row:
 //   s = a + b,   d = s * inversesqrt(mean(s^2) + eps) * w
-// Writes both s and d. Column striding and reduction tree match rms_norm.comp, so the results are
-// bit-identical to ADD followed by rms_norm.comp. (Upstream sends single rows through
-// rms_norm_partials instead, which sums in another order.)
+// Writes both s and d. The per-element expressions are rms_norm.comp's; the sum of squares is reduced by a
+// shared-memory tree, in another order than the subgroup sums rms_norm.comp uses where they are available
+// (rounding only; upstream's rms_norm_partials for single rows sums in yet another order).
 
 #define BLOCK_SIZE 512
 
@@ -23,7 +23,7 @@ layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) readonly buffer W {float data_w[];};
 layout (binding = 3) buffer S {float data_s[];};
-layout (binding = 4) writeonly buffer D {float data_d[];};
+layout (binding = 4) buffer D {float data_d[];};   // read back by the f16 overflow pass
 
 #if F16_OUT
 // d also as the f16 B operand of the consuming mul_mmv_rdna4 in binding 5, in the layout of b_to_f16_rowscale.comp
@@ -99,10 +99,9 @@ void main() {
         }
         const float down = uintBitsToFloat((127u - e) << 23);
         hscale = uintBitsToFloat((127u + e) << 23);
+        // the f32 results this invocation stored above: s and w may be the same memory as d (in-place)
         for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
-            const float dv = scale * data_s[s0 + col] * data_w[p.w_off + col];
-            const float hv = uintBitsToFloat(floatBitsToUint(dv) | f16_zero);
-            data_h[h0 + col] = float16_t(hv * down);
+            data_h[h0 + col] = float16_t(data_d[d0 + col] * down);
         }
     }
     if (tid == 0) {

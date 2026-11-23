@@ -35,6 +35,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    int32_t dspark_n_draft = 0;   // DSpark: the block positions the Markov head computes after the anchor, 0: all (llama_set_dspark_n_draft)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

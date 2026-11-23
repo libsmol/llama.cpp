@@ -314,9 +314,26 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * state = nullptr; // [R, n_blocks]
 
+    // the positions the caller reads (llama_set_dspark_n_draft): the Markov chain is causal, so the later positions
+    // only take the logits without the Markov term (and empty draws)
+    const int64_t i_markov_end = g.cparams.dspark_n_draft > 0 ? std::min<int64_t>(block_drafts, i_draft_beg + g.cparams.dspark_n_draft) : block_drafts;
+
     // TODO: without rnn_state the in-graph chain is greedy (argmax); sampling params affect only the final
     //       token pick, not the Markov conditioning path
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
+        if (i >= i_markov_end) {
+            ggml_tensor * col = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]));
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+            if (has_conf) {
+                ggml_tensor * conf = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks), 0.0f);
+                cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
+            }
+            if (rnn_state) {
+                ggml_tensor * none = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
+                cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, none, 1) : none;
+            }
+            continue;
+        }
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev); // [R, n_blocks]
         ggml_tensor * markov  = w1_prev;
 

@@ -1421,6 +1421,11 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+void llama_context::set_dspark_n_draft(int32_t n_draft) {
+    // a change rebuilds the graph (llm_graph_params::allow_reuse)
+    cparams.dspark_n_draft = std::max(0, n_draft);
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -4733,6 +4738,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_dspark_n_draft(llama_context * ctx, int32_t n_draft) {
+    ctx->set_dspark_n_draft(n_draft);
 }
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {

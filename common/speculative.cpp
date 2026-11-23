@@ -1662,6 +1662,9 @@ public:
             return;
         }
 
+        // the Markov head computes only the positions read below
+        llama_set_dspark_n_draft(ctx_dft, params.n_max);
+
         // decode all sequence's noise block in a single batch
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {

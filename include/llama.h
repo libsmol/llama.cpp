@@ -1187,6 +1187,10 @@ extern "C" {
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+    // DSpark drafts: the block positions after the anchor the Markov head computes, 0 for the whole block. The later
+    // positions get the logits without the Markov term and no draws.
+    LLAMA_API void llama_set_dspark_n_draft(struct llama_context * ctx, int32_t n_draft);
+
     // Select which appended NextN block the DECODER_MTP graph runs (offset past
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
     // chain multiple trained NextN heads. Default 0 (first head).

@@ -634,12 +634,28 @@ static llama_token common_sampler_resample_grammar(struct common_sampler * gsmpl
             llama_sampler_apply(gsmpl->grmr, &cur_p);
         }
 
-        // every sampler of the chain on the CPU (applying the chain skips the ones it ran on the backend)
+        // every sampler of the chain on the CPU (applying the chain skips the ones it ran on the backend), the final draw
+        // from a stream of its own: with more than one output per sequence (n_outputs_max_per_seq) the chain's dist would
+        // draw the uniform the backend drew for this position, which produced the token the grammar rejected
+        bool draw = false;
         for (int i = 0; i < llama_sampler_chain_n(gsmpl->chain); i++) {
             llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+            const char * name = llama_sampler_name(smpl);
+            if (name[0] == '+' || name[0] == '-') {
+                name++; // a sampler set on a context carries its backend support in the name
+            }
+            if (strcmp(name, "dist") == 0) {
+                draw = true;
+                continue;
+            }
             if (smpl->iface->apply) {
                 llama_sampler_apply(smpl, &cur_p);
             }
+        }
+        if (draw) {
+            llama_sampler * dist = llama_sampler_init_dist(gsmpl->rng());
+            llama_sampler_apply(dist, &cur_p);
+            llama_sampler_free(dist);
         }
     } else {
         gsmpl->set_logits(ctx, idx);
@@ -787,7 +803,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     // q by token id, so the residual pass over the vocabulary does not search q for every token
     static thread_local std::vector<float> q_by_id;
-    const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const size_t n_vocab = (size_t) llama_vocab_n_tokens(vocab);
     if (q_by_id.size() < n_vocab) {
         q_by_id.assign(n_vocab, 0.0f);
     }
@@ -875,7 +892,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
-        if (!keep || id != draft[i]) {
+        // a draft token after an accepted EOG is not output but would stay in the context (as in
+        // common_sampler_sample_and_accept_n, a trailing EOG is kept)
+        if (!keep || id != draft[i] || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }

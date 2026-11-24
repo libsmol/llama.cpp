@@ -107,7 +107,7 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         const std::vector<int> idxs = { -1, -1 };
 
         const std::vector<llama_token> result =
-            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, false);
+            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q);
 
         token_counts[result[0]]++;
     }

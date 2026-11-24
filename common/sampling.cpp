@@ -610,6 +610,54 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// the grammar accepts the token (as the next one)
+static bool common_sampler_grammar_allows(struct common_sampler * gsmpl, llama_token id) {
+    llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+    llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+    return single_token_data_array.data[0].logit != -INFINITY;
+}
+
+// sampling again after the grammar rejected the sampled token: the grammar applied to the logits, then the chain on the
+// CPU (with backend sampling: the raw logits, which the caller keeps for this sequence, llama_set_sampler_raw_logits)
+static llama_token common_sampler_resample_grammar(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    auto & cur_p = gsmpl->cur_p;
+
+    if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+        GGML_ASSERT(llama_get_raw_logits_ith(ctx, idx) != nullptr && "a grammar with backend sampling needs the raw logits");
+
+        gsmpl->set_logits(ctx, idx, true);
+
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(gsmpl->grmr, &cur_p);
+        }
+
+        // every sampler of the chain on the CPU (applying the chain skips the ones it ran on the backend)
+        for (int i = 0; i < llama_sampler_chain_n(gsmpl->chain); i++) {
+            llama_sampler * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+            if (smpl->iface->apply) {
+                llama_sampler_apply(smpl, &cur_p);
+            }
+        }
+    } else {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(gsmpl->rbudget, &cur_p);
+
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(gsmpl->grmr, &cur_p);
+        }
+
+        llama_sampler_apply(gsmpl->chain, &cur_p);
+    }
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -636,18 +684,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
             // a grammar checks the backend-sampled token, as below; a rejected token, or a grammar that applies first, is
-            // sampled on the CPU from the raw logits the caller keeps (llama_set_sampler_raw_logits)
-            bool valid = !grmr;
-            if (grmr && !grammar_first) {
-                llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-                llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
-                llama_sampler_apply(grmr, &single_token_data_array);
-
-                valid = single_token_data_array.data[0].logit != -INFINITY;
-            }
-
-            if (valid) {
+            // sampled on the CPU from the raw logits
+            if (!grmr || (!grammar_first && common_sampler_grammar_allows(gsmpl, id))) {
                 for (size_t i = 0; i < cur_p.size; ++i) {
                     if (cur_p.data[i].id == id) {
                         cur_p.selected = i;
@@ -658,25 +696,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 return id;
             }
 
-            GGML_ASSERT(llama_get_raw_logits_ith(ctx, idx) != nullptr && "a grammar with backend sampling needs the raw logits");
-
-            gsmpl->set_logits(ctx, idx, true);
-
-            if (grammar_should_apply(gsmpl)) {
-                llama_sampler_apply(grmr, &cur_p);
-            }
-
-            // every sampler of the chain on the CPU (applying the chain skips the ones it ran on the backend)
-            for (int i = 0; i < llama_sampler_chain_n(chain); i++) {
-                llama_sampler * smpl = llama_sampler_chain_get(chain, i);
-                if (smpl->iface->apply) {
-                    llama_sampler_apply(smpl, &cur_p);
-                }
-            }
-
-            GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-            return cur_p.data[cur_p.selected].id;
+            return common_sampler_resample_grammar(gsmpl, ctx, idx);
         }
     }
 
@@ -696,35 +716,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
-        llama_sampler_apply(grmr, &single_token_data_array);
-
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
-        }
+    if (common_sampler_grammar_allows(gsmpl, id)) {
+        return id;
     }
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
-
-    llama_sampler_apply(rbudget,  &cur_p);
-
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
-    }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-    id = cur_p.data[cur_p.selected].id;
-
-    return id;
+    return common_sampler_resample_grammar(gsmpl, ctx, idx);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -770,10 +768,12 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
-// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
-// Preserves the target distribution exactly, and accepts more often than matching does when the
-// draft samples instead of taking its argmax.
-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)): the token is then distributed as
+// p, the target's distribution without the grammar, and accepts more often than matching does when the draft samples
+// instead of taking its argmax. A grammar then checks that token as common_sampler_sample checks the sampled one, and a
+// rejected token is sampled again with the grammar applied: the result has the distribution of common_sampler_sample,
+// and the grammar sees one token per position (the vocabulary only on a rejection).
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
@@ -785,111 +785,103 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token_data> residual;
 
-    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+    // q by token id, so the residual pass over the vocabulary does not search q for every token
+    static thread_local std::vector<float> q_by_id;
+    const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (q_by_id.size() < n_vocab) {
+        q_by_id.assign(n_vocab, 0.0f);
+    }
+
+    auto & cur_p = gsmpl->cur_p;
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        // leaves the target distribution in the candidate array
-        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        // the target distribution p in the candidate array: the backend sampler's, or the chain on the CPU
+        llama_synchronize(ctx);
+        {
+            const auto tm = gsmpl->tm();
 
-        // unsorted: the test and the residual need the probabilities, not their order (a sort of the whole vocabulary
-        // per position costs more than the verification)
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
-        const auto & q     = draft_q[i];
+            gsmpl->set_logits(ctx, idxs[i]);
 
-        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
-        if (masked) {
-            cand.assign(cur_p->data, cur_p->data + cur_p->size);
-            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
-            llama_sampler_apply(gsmpl->grmr, &arr);
-        }
-
-        // a candidate the grammar rejects carries no probability, whatever the target thinks
-        auto p_raw = [&](size_t k) {
-            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
-        };
-
-        // masking drops probability mass, so rescale what is left or the residual is over-weighted
-        float p_sum = 0.0f;
-        if (masked) {
-            for (size_t k = 0; k < cur_p->size; ++k) {
-                p_sum += p_raw(k);
+            const llama_token id_backend = llama_get_sampled_token_ith(ctx, idxs[i]);
+            if (id_backend != LLAMA_TOKEN_NULL) {
+                GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+                for (size_t k = 0; k < cur_p.size; ++k) {
+                    if (cur_p.data[k].id == id_backend) {
+                        cur_p.selected = k;
+                        break;
+                    }
+                }
+            } else {
+                llama_sampler_apply(gsmpl->rbudget, &cur_p);
+                llama_sampler_apply(gsmpl->chain,   &cur_p);
             }
         }
 
-        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
-
-        auto p_of = [&](size_t k) {
-            return p_raw(k)*p_norm;
-        };
+        const auto & q = draft_q[i];
 
         // q_x is never 0 for a token the draft produced, but guard the divide
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
+        const float p_x = prob_of(cur_p.data, cur_p.size, draft[i]);
 
-        float p_x = 0.0f;
-        for (size_t k = 0; k < cur_p->size; ++k) {
-            if (cur_p->data[k].id == draft[i]) {
-                p_x = p_of(k);
-                break;
-            }
-        }
-
+        llama_token id = LLAMA_TOKEN_NULL;
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
-            common_sampler_accept(gsmpl, draft[i], true);
-            result.push_back(draft[i]);
-            continue;
-        }
-
-        // rejected: tokens outside q's support keep all of p. q by token id, so the pass over the vocabulary does not
-        // search q for every token (the first entry of a token wins, as in prob_of)
-        static thread_local std::vector<float> q_by_id;
-        const size_t n_vocab = (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-        if (q_by_id.size() < n_vocab) {
-            q_by_id.assign(n_vocab, 0.0f);
-        }
-        for (size_t k = q.size(); k-- > 0;) {
-            if (q[k].id >= 0 && (size_t) q[k].id < n_vocab) {
-                q_by_id[q[k].id] = q[k].p;
-            }
-        }
-        residual.clear();
-        float sum = 0.0f;
-        for (size_t k = 0; k < cur_p->size; ++k) {
-            const llama_token id_k = cur_p->data[k].id;
-            const float r = p_of(k) - (id_k >= 0 && (size_t) id_k < n_vocab ? q_by_id[id_k] : 0.0f);
-            if (r > 0.0f) {
-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
-                sum += r;
-            }
-        }
-
-        for (const auto & e : q) {
-            if (e.id >= 0 && (size_t) e.id < n_vocab) {
-                q_by_id[e.id] = 0.0f;
-            }
-        }
-
-        llama_token id = id_tgt;
-        if (sum > 0.0f) {
-            float u = uni(gsmpl->rng) * sum;
-            id = residual.back().id;
-            for (const auto & e : residual) {
-                u -= e.p;
-                if (u <= 0.0f) {
-                    id = e.id;
-                    break;
+            id = draft[i];
+        } else {
+            // tokens outside q's support keep all of p (the first entry of a token wins, as in prob_of)
+            for (size_t k = q.size(); k-- > 0;) {
+                if (q[k].id >= 0 && (size_t) q[k].id < n_vocab) {
+                    q_by_id[q[k].id] = q[k].p;
                 }
             }
+            residual.clear();
+            float sum = 0.0f;
+            for (size_t k = 0; k < cur_p.size; ++k) {
+                const llama_token id_k = cur_p.data[k].id;
+                const float r = cur_p.data[k].p - (id_k >= 0 && (size_t) id_k < n_vocab ? q_by_id[id_k] : 0.0f);
+                if (r > 0.0f) {
+                    residual.push_back({ id_k, 0.0f, r });
+                    sum += r;
+                }
+            }
+            for (const auto & e : q) {
+                if (e.id >= 0 && (size_t) e.id < n_vocab) {
+                    q_by_id[e.id] = 0.0f;
+                }
+            }
+
+            // no residual mass (p == q): the target's own sample
+            GGML_ASSERT(cur_p.selected != -1);
+            id = cur_p.data[cur_p.selected].id;
+            if (sum > 0.0f) {
+                float u = uni(gsmpl->rng) * sum;
+                id = residual.back().id;
+                for (const auto & e : residual) {
+                    u -= e.p;
+                    if (u <= 0.0f) {
+                        id = e.id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const bool keep = !grammar_should_apply(gsmpl) || common_sampler_grammar_allows(gsmpl, id);
+        if (!keep) {
+            const auto tm = gsmpl->tm();
+            id = common_sampler_resample_grammar(gsmpl, ctx, idxs[i]);
         }
 
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
-        break;
+        if (!keep || id != draft[i]) {
+            break;
+        }
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i]);
 
         common_sampler_accept(gsmpl, id, true);
 

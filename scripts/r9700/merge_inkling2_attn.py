@@ -3,6 +3,8 @@
 # per layer: blk.N.attn_qgrkv.weight = rows of attn_q, attn_gate, attn_rel, attn_k, attn_v (same type, same n_embd),
 #            blk.N.attn_kv_conv.weight = rows of attn_k_conv, attn_v_conv
 # the bytes of every row are copied unchanged; the separate tensors are dropped
+# BF16 loop controls (blk.N.loop_*_ctrl_*.weight, as in UD-Q8_K_XL) are widened to F32, exactly: the fused loop ops
+# take F32 controls
 import sys, numpy as np
 sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "../../gguf-py"))
 import gguf
@@ -53,6 +55,10 @@ for t in r.tensors:
         name = f"blk.{p[1]}.{'attn_qgrkv' if group is QGRKV else 'attn_kv_conv'}.weight"
         out.append((name, data, ty, (rows, ne0)))
         merged_from[name] = [x.name for x in parts]
+        continue
+    if p[0] == "blk" and p[2].startswith("loop_") and "_ctrl_" in p[2] and t.tensor_type == gguf.GGMLQuantizationType.BF16:
+        bf16 = np.asarray(t.data).view(np.uint16).reshape(int(t.shape[1]), int(t.shape[0]))
+        out.append((t.name, (bf16.astype(np.uint32) << 16).view(np.float32), gguf.GGMLQuantizationType.F32, None))
         continue
     out.append((t.name, t.data, t.tensor_type, None))
 

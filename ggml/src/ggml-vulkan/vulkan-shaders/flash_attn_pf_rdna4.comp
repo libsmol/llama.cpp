@@ -25,8 +25,9 @@
 // query block w / G. All waves share each 32-key K/V tile through LDS, and the next tile is prefetched
 // into registers while the current one is computed.
 //
-// REL (ggml_flash_attn_rel, SPLIT == 0): the mask is mask + table[b, head, query] per head (f16 values, added in f32),
-// b the distance q_pos - kv_pos within the band and the band size past it, and the softmax has a sink logit of 0.
+// REL (ggml_flash_attn_rel): the mask is mask + table[b, head, query] per head (f16 values, added in f32), b the distance
+// q_pos - kv_pos within the band and the band size past it, and the softmax has a sink logit of 0 (applied at the
+// normalization, by flash_attn_pf_rdna4_reduce.comp with SPLIT).
 //
 // Everything is computed transposed so the softmax stays in registers:
 //   S^T (keys x queries) = K * Q^T,     O^T (d x queries) += V^T * P^T
@@ -385,12 +386,12 @@ void main() {
                 }
             }
 #if defined(REL)
-            // a zero mask still takes the table (BC keys: the first wave)
-            if (tid < BC) {
-                const int kp = j * BC + tid < p.KV ? data_kp[j * BC + tid] : KP_NONE;
-                KPsh[tid] = kp;
+            // a zero mask still takes the table (BC keys: a lane each of the first wave)
+            if (wave == 0) {
+                const int kp = j * BC + lane < p.KV ? data_kp[j * BC + lane] : KP_NONE;
+                KPsh[lane] = kp;
                 const int kmax = subgroupMax(kp);
-                if (tid == 0) {
+                if (lane == 0) {
                     KPmax = kmax;
                 }
             }

@@ -2,6 +2,7 @@
 
 // Combines the KV splits of flash_attn_pf_rdna4.comp (SPLIT = 1) into O[pos][head][d]:
 //   O = sum_s exp2(M_s - M) O_s / sum_s exp2(M_s - M) L_s,  M = max_s M_s
+// sink (ggml_flash_attn_rel): with a sink logit of 0 in the softmax, the sums relative to max(M, 0)
 // One workgroup per (head, pos, batch), one vec4 of d per invocation (head size up to 256).
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -13,6 +14,7 @@ layout (push_constant) uniform parameter {
     uint k_num;   // splits
     uint ne3;
     uint D4;      // head size / 4
+    uint sink;
 } p;
 
 layout (binding = 0) readonly buffer PO {vec4 data_po4[];};
@@ -47,6 +49,11 @@ void main() {
             L = fma(ml.y, w, L);
         }
     }
-    const float rcp = L == 0.0 ? 0.0 : 1.0 / L;
+    float rcp = L == 0.0 ? 0.0 : 1.0 / L;
+    if (p.sink != 0) {
+        const float Ms = max(M, 0.0);
+        const float es = exp2(M - Ms);
+        rcp = es / (L * es + exp2(-Ms));
+    }
     data_ov4[((b * p.N + pos) * p.H + h) * D4 + d4] = acc * rcp;
 }

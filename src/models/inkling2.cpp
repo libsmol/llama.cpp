@@ -501,9 +501,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_kv = rel_pos->ne[0];
 
         // one F16 mask per head: mask + attn_rel_bias[:, q_pos - kv_pos] . Rcur - sink, the bias in F32; made in the
-        // attention from the bias by distance where the device has that, else stored and read by flash attention
+        // attention from the bias by distance where the device has that (faster from about 64 rows), else stored and read
+        // by flash attention (faster for fewer rows). The stored masks of fewer rows are kept while they are at most half
+        // the KQ mask of a full ubatch over the whole cache, which the reserved prompt graph holds, so the buffers fit them
+        const int64_t n_kv_cache = (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size();
+        const bool    rel_rows   = n_tokens >= 64 || 2*n_tokens*n_head*n_kv > n_kv_cache*(int64_t) cparams.n_ubatch;
         ggml_tensor * attn_rel = nullptr;
-        if (fused_attn) {
+        if (fused_attn && rel_rows) {
             ggml_tensor * table = ggml_rel_bias_table(ctx0, layer.attn_rel_bias, Rcur, layer.attn_rel_clip, tau_l,
                     hparams.f_relative_clip, ggml_reshape_2d(ctx0, sinks, n_head, n_tokens));
             attn_rel = build_attn_rel(inp, Qcur, Kcur, Vcur, table, inp_pos, 1.0f/sqrtf(n_embd_head), il);
@@ -524,7 +528,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             GGML_ASSERT(mask_raw->ne[0] == n_kv);
 
             // the mask is n_kv x n_rows x n_head: query rows are chunked past the budget, the first chunk stores K and V
-            const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
+            const int64_t n_kv_max = std::max<int64_t>(n_kv, n_kv_cache);
             int64_t n_rows_max = std::max({ int64_t(1), n_kq_mask_max/(n_kv_max*n_head), (n_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_tokens) {
                 const int64_t n_chunks = (n_tokens + n_rows_max - 1)/n_rows_max;

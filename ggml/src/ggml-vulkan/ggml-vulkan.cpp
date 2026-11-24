@@ -9789,7 +9789,8 @@ static bool ggml_vk_fa_pf_rdna4_supported(const vk_device & device, const ggml_t
         mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 1 && mask->ne[1] >= q->ne[1] &&
         mask->nb[1] == (size_t) k->ne[1] * sizeof(ggml_fp16_t) &&
         (mask->ne[3] == 1 || (mask->ne[3] == q->ne[3] && mask->nb[3] == (size_t) mask->ne[1] * mask->nb[1])) &&
-        (q->nb[1] % 16) == 0 && (q->nb[2] % 16) == 0 && (q->nb[3] % 16) == 0;
+        (q->nb[1] % 16) == 0 && (q->nb[2] % 16) == 0 && (q->nb[3] % 16) == 0 &&
+        (uint64_t) ggml_nelements(mask) <= UINT32_MAX; // the shader's mask index
 }
 #endif
 
@@ -9939,9 +9940,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // verify_min_kv keys the coopmat1 path is used then.
         const uint32_t n_cu    = std::max(1u, ctx->device->shader_core_count);
         const bool     few_wgs = 2 * CEIL_DIV(NQ, 16 * fa_pf_qb) * nek2 * neq3 < n_cu;
-        const bool pf_prefill = pf_common && (rel || (NQ >= 32 && !few_wgs));
-        const bool pf_verify  = pf_common && !rel && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
+        // ggml_flash_attn_rel has no other kernel: the KV split takes few rows whatever the keys, the prefill kernel the rest
+        const bool pf_verify  = pf_common && NQ >= 1 && (NQ <= 16 || few_wgs) && (rel || KV >= verify_min_kv) &&
                                 ctx->device->pipeline_fa_pf_rdna4_reduce != nullptr;
+        const bool pf_prefill = pf_common && !pf_verify && (rel || (NQ >= 32 && !few_wgs));
         if (pf_prefill || pf_verify) {
             const uint32_t QB    = pf_verify ? 1 : fa_pf_qb;
             const uint32_t SPLIT = pf_verify ? 1 : 0;
@@ -10037,7 +10039,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             }
             if (pf_verify) {
                 ggml_vk_sync_buffers(ctx, subctx);
-                const vk_flash_attn_pf_reduce_push_constants red_pc = { (uint32_t) ne1, (uint32_t) ne2, rows_slot, k_num, (uint32_t) ne3, HSV / 4 };
+                const vk_flash_attn_pf_reduce_push_constants red_pc = { (uint32_t) ne1, (uint32_t) ne2, rows_slot, k_num, (uint32_t) ne3, HSV / 4,
+                                                                         rel ? 1u : 0u };
                 ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_pf_rdna4_reduce, { part_buf, dst_buf }, red_pc,
                                           { (uint32_t) ne1, (uint32_t) ne2, (uint32_t) ne3 });
                 ctx->prealloc_split_k_need_sync = true;
@@ -19658,15 +19661,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_LOOP_GATE:
             return true;
         case GGML_OP_REL_BIAS_MASK:
+            // (the shader indexes the mask rows it reads, row0 .. row0 + n_rows, in elements)
             return op->src[1]->ne[0] <= 16 && op->ne[1] <= 65535 && (ggml_get_op_params_f32(op, 0) <= 0.0f || op->src[6] != nullptr) &&
-                   (uint64_t) ggml_nelements(op->src[0]) <= UINT32_MAX && (uint64_t) ggml_nelements(op) <= UINT32_MAX;
+                   (uint64_t) (ggml_get_op_params_i32(op, 1) + op->ne[1]) * (op->src[0]->nb[1] / ggml_element_size(op->src[0])) <= UINT32_MAX &&
+                   (uint64_t) ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_REL_BIAS_TABLE:
             return op->src[0]->ne[0] <= 16 && op->ne[2] <= 65535 && (uint64_t) ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_REL:
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            // (it has no KV split: with fewer workgroups than half the CUs the caller's split attention is faster)
             return ggml_vk_fa_pf_rdna4_supported(device, op->src[0], op->src[1], op->src[2], op->src[3]) && device->subgroup_arithmetic &&
-                   2 * CEIL_DIV(op->src[0]->ne[1], 16 * fa_pf_qb) * op->src[1]->ne[2] >= std::max(1u, device->shader_core_count) &&
+                   device->pipeline_fa_pf_rdna4_reduce != nullptr &&
                    device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_rel_push_constants) &&
                    (uint64_t) ggml_nelements(op->src[6]) <= UINT32_MAX;
 #else

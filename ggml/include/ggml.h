@@ -1321,7 +1321,8 @@ extern "C" {
     //   bias: [n_rel, n_band], r: [n_rel, n_head, n_rows], rs, tau: as ggml_rel_bias_mask_clip, sinks: [n_head, n_rows]
     //   out: F16 [n_band + 1, n_head, n_rows], out[d, h, i] = bias[:, d] . r'[:, h, i] - sinks[h, i] for d < n_band and
     //   -sinks[h, i] at d = n_band, in F32, with r' = ggml_clip_norm(r, rs, tau, max_norm, 1e-6), or r for max_norm <= 0
-    //   (with a mask of 0 and -inf, mask + out is the ggml_rel_bias_mask_clip mask)
+    //   (with a mask of 0 and -inf, mask + out is the ggml_rel_bias_mask_clip mask: on the CPU exactly, a backend may round
+    //   the bias in the last bit differently)
     GGML_API struct ggml_tensor * ggml_rel_bias_table(
             struct ggml_context * ctx,
             struct ggml_tensor  * bias,

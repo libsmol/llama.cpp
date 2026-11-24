@@ -2696,13 +2696,15 @@ struct test_rel_bias_table : public test_case {
 struct test_flash_attn_rel : public test_case {
     const ggml_type type_KV;
     const int64_t hs, n_head, n_head_kv, n_kv, n_rows, n_band;
+    const bool masked_row; // query row 1 sees no key: the output is 0
 
     std::string vars() override {
-        return VARS_TO_STR7(type_KV, hs, n_head, n_head_kv, n_kv, n_rows, n_band);
+        return VARS_TO_STR8(type_KV, hs, n_head, n_head_kv, n_kv, n_rows, n_band, masked_row);
     }
 
+    // the kernel's own error (f16 Q, K, V and P) is below 1e-7 here: a key off the band edge or a lost sink is far above this
     double max_nmse_err() override {
-        return 5e-4;
+        return 1e-6;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -2711,8 +2713,8 @@ struct test_flash_attn_rel : public test_case {
     }
 
     test_flash_attn_rel(ggml_type type_KV = GGML_TYPE_F16, int64_t hs = 128, int64_t n_head = 24, int64_t n_head_kv = 8,
-                        int64_t n_kv = 512, int64_t n_rows = 128, int64_t n_band = 64)
-        : type_KV(type_KV), hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_rows(n_rows), n_band(n_band) {}
+                        int64_t n_kv = 512, int64_t n_rows = 128, int64_t n_band = 64, bool masked_row = false)
+        : type_KV(type_KV), hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_rows(n_rows), n_band(n_band), masked_row(masked_row) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // Q, K and V in the layouts the graph passes: heads of a row together, permuted to [hs, rows, heads]
@@ -2752,7 +2754,7 @@ struct test_flash_attn_rel : public test_case {
                 std::vector<ggml_fp16_t> m(ggml_nelements(t));
                 for (int64_t i = 0; i < n_rows; ++i) {
                     for (int64_t j = 0; j < n_kv; ++j) {
-                        const bool visible = kp[j] != INT32_MIN && kp[j] <= qp[i] && (j*7 + i) % 13 != 0;
+                        const bool visible = kp[j] != INT32_MIN && kp[j] <= qp[i] && (j*7 + i) % 13 != 0 && !(masked_row && i == 1);
                         m[i*n_kv + j] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
@@ -14940,9 +14942,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rel_bias_table(3, 24, 64));
     test_cases.emplace_back(new test_rel_bias_table(70, 24, 1024, 1));
     test_cases.emplace_back(new test_rel_bias_table(70, 24, 1024, 2));
+    test_cases.emplace_back(new test_rel_bias_table(5, 40, 33, 2));
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 512, 128, 64));
-        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 1100, 200, 1024));
+        // prefill: band edges in and past the blocks, a row without keys, the whole band; the KV split: few rows on
+        // short and long caches, more rows on a long one; head size 256 with 8 query heads per KV head
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8,   512, 128,   64, true));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8,   300, 130,   33));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8,  1100, 200, 1024));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8,    20,   8,   16, true));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8,   300,   4,   33));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 20000,   6, 1024, true));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 20000,  64, 1024));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 256, 16, 2,   700,  96,   40));
     }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (bool split : {false, true}) {

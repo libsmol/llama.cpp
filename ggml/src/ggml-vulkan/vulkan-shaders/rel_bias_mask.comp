@@ -106,7 +106,8 @@ void main() {
                     }
                 }
 #if defined(TABLE)
-                // t*f rounded on its own: the mask with m = 0 adds it to 0 (or fuses it into an fma with 0) first
+                // (precise keeps the dot product unfused too: a value can differ from the mask's in the last bit, as with a
+                // different flash attention kernel; the prefill path is validated by KLD so)
                 precise float tf = t*fsh[hh];
                 data_d[p.d_offset + j + p.n_kv*(h0 + hh + p.n_head*i)] = float16_t(tf - ssh[hh]);
 #else

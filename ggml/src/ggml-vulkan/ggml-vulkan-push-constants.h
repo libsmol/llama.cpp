@@ -115,7 +115,7 @@ struct vk_swiglu_to_f16_push_constants {
 
 // flash_attn_pf_rdna4_reduce.comp
 struct vk_flash_attn_pf_reduce_push_constants {
-    uint32_t H; uint32_t N; uint32_t BQ; uint32_t k_num; uint32_t ne3; uint32_t D4;
+    uint32_t H; uint32_t N; uint32_t BQ; uint32_t k_num; uint32_t ne3; uint32_t D4; uint32_t sink;
 };
 
 struct vk_mat_vec_push_constants {

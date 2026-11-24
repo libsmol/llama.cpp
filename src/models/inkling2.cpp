@@ -511,6 +511,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
             ggml_tensor * mask_raw = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
             ggml_tensor * kv_pos   = is_swa ? inp->self_kv_pos_swa : inp->self_kv_pos;
+            GGML_ASSERT(mask_raw->ne[0] == n_kv);
 
             // the mask is n_kv x n_rows x n_head: query rows are chunked past the budget, the first chunk stores K and V
             const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
@@ -527,14 +528,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
                 ggml_tensor * q_c = all ? Qcur : ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, nr, Qcur->nb[1], Qcur->nb[2], r0*Qcur->nb[2]);
 
-                ggml_tensor * mask_c  = ggml_view_2d(ctx0, mask_raw, n_kv, nr, mask_raw->nb[1], r0*mask_raw->nb[1]);
                 ggml_tensor * rcur_c  = ggml_view_3d(ctx0, Rcur, Rcur->ne[0], n_head, nr, Rcur->nb[1], Rcur->nb[2], r0*Rcur->nb[2]);
                 ggml_tensor * sinks_c = ggml_view_2d(ctx0, sinks_t, n_head, nr, sinks_t->nb[1], r0*sinks_t->nb[1]);
-                ggml_tensor * qpos_c  = ggml_view_1d(ctx0, inp_pos, nr, r0*ggml_element_size(inp_pos));
 
-                ggml_tensor * kq_mask = ggml_rel_bias_mask_clip(ctx0, mask_c, layer.attn_rel_bias, rcur_c, layer.attn_rel_clip,
+                // the whole mask and positions, rows from r0: a view of these inputs would be a separate copy to the device
+                // for every chunk and layer
+                ggml_tensor * kq_mask = ggml_rel_bias_mask_clip(ctx0, mask_raw, layer.attn_rel_bias, rcur_c, layer.attn_rel_clip,
                         tau_l ? ggml_view_1d(ctx0, tau_l, nr, r0*ggml_element_size(tau_l)) : nullptr, hparams.f_relative_clip,
-                        sinks_c, qpos_c, kv_pos);
+                        sinks_c, inp_pos, kv_pos, r0);
                 cb(kq_mask, "kq_mask_rel", il);
 
                 // the mask before the K/V stores in the graph: it then runs with them, its output allocated before their

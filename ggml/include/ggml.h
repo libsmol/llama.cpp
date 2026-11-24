@@ -1285,10 +1285,11 @@ extern "C" {
             float                 eps,
             float                 scale);
 
-    // per-head attention mask with a relative-position bias and a per-query sink:
-    //   mask: [n_kv, n_rows] (F16/F32), bias: [n_rel, extent], r: [n_rel, n_head, n_rows], sinks: NULL or [n_head, n_rows],
-    //   q_pos: I32 [n_rows], kv_pos: I32 [n_kv]; d = q_pos[i] - kv_pos[j]
-    //   out: F16 [n_kv, n_rows, n_head] = mask[j, i] + (0 <= d < extent ? bias[:, d] . r[:, h, i] : 0) - sinks[h, i], in F32
+    // per-head attention mask with a relative-position bias and a per-query sink, for the query rows row0 .. row0 + n_rows
+    // of a batch (the mask and the positions are the batch's whole inputs, so a chunked caller needs no views of them):
+    //   mask: [n_kv, >= row0 + n_rows] (F16/F32), bias: [n_rel, extent], r: [n_rel, n_head, n_rows], sinks: NULL or
+    //   [n_head, n_rows], q_pos: I32 [>= row0 + n_rows], kv_pos: I32 [n_kv]; d = q_pos[row0 + i] - kv_pos[j]
+    //   out: F16 [n_kv, n_rows, n_head] = mask[j, row0 + i] + (0 <= d < extent ? bias[:, d] . r[:, h, i] : 0) - sinks[h, i], in F32
     GGML_API struct ggml_tensor * ggml_rel_bias_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
@@ -1296,7 +1297,8 @@ extern "C" {
             struct ggml_tensor  * r,
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * q_pos,
-            struct ggml_tensor  * kv_pos);
+            struct ggml_tensor  * kv_pos,
+            int64_t               row0);
 
     // ggml_rel_bias_mask with r first clipped as ggml_clip_norm(r, rs, tau, max_norm, 1e-6)
     // rs: [n_rel, n_head] or NULL, tau: [1, 1, n_rows] or NULL
@@ -1310,7 +1312,8 @@ extern "C" {
             float                 max_norm,
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * q_pos,
-            struct ggml_tensor  * kv_pos);
+            struct ggml_tensor  * kv_pos,
+            int64_t               row0);
 
     // loop message controller, matrix-vector form for short batches:
     //   ggml_loop_down: h = w_down*[rms_norm(a); rms_norm(m)], a, m: [n_embd, n_t], w_down: [2*n_embd, n_rank] -> h: [n_rank, n_t]

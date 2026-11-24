@@ -3336,7 +3336,8 @@ struct ggml_tensor * ggml_rel_bias_mask(
         struct ggml_tensor  * r,
         struct ggml_tensor  * sinks,
         struct ggml_tensor  * q_pos,
-        struct ggml_tensor  * kv_pos) {
+        struct ggml_tensor  * kv_pos,
+        int64_t               row0) {
     GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_matrix(mask) && mask->nb[0] == ggml_type_size(mask->type));
     GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_matrix(bias) && ggml_is_contiguous(bias));
@@ -3346,10 +3347,11 @@ struct ggml_tensor * ggml_rel_bias_mask(
     GGML_ASSERT(ggml_is_contiguous(q_pos) && ggml_is_contiguous(kv_pos));
 
     const int64_t n_kv   = mask->ne[0];
-    const int64_t n_rows = mask->ne[1];
+    const int64_t n_rows = r->ne[2];
     const int64_t n_head = r->ne[1];
 
-    GGML_ASSERT(r->ne[2] == n_rows && ggml_nelements(q_pos) == n_rows && ggml_nelements(kv_pos) == n_kv);
+    GGML_ASSERT(row0 >= 0 && row0 + n_rows <= mask->ne[1] && row0 + n_rows <= ggml_nelements(q_pos) && row0 <= INT32_MAX);
+    GGML_ASSERT(ggml_nelements(kv_pos) == n_kv);
     if (sinks) {
         GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->nb[0] == sizeof(float) && sinks->ne[0] == n_head && sinks->ne[1] == n_rows);
     }
@@ -3357,6 +3359,7 @@ struct ggml_tensor * ggml_rel_bias_mask(
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_rows, n_head);
 
     ggml_set_op_params_f32(result, 0, 0.0f); // max_norm, 0: no clip
+    ggml_set_op_params_i32(result, 1, (int32_t) row0);
 
     result->op     = GGML_OP_REL_BIAS_MASK;
     result->src[0] = mask;
@@ -3379,7 +3382,8 @@ struct ggml_tensor * ggml_rel_bias_mask_clip(
         float                 max_norm,
         struct ggml_tensor  * sinks,
         struct ggml_tensor  * q_pos,
-        struct ggml_tensor  * kv_pos) {
+        struct ggml_tensor  * kv_pos,
+        int64_t               row0) {
     GGML_ASSERT(max_norm > 0.0f);
     if (rs) {
         GGML_ASSERT(rs->type == GGML_TYPE_F32 && rs->ne[0] == r->ne[0] && rs->ne[1] == r->ne[1] && rs->nb[0] == sizeof(float));
@@ -3387,7 +3391,7 @@ struct ggml_tensor * ggml_rel_bias_mask_clip(
     if (tau) {
         GGML_ASSERT(tau->type == GGML_TYPE_F32 && ggml_nelements(tau) == r->ne[2] && ggml_is_contiguous(tau));
     }
-    struct ggml_tensor * result = ggml_rel_bias_mask(ctx, mask, bias, r, sinks, q_pos, kv_pos);
+    struct ggml_tensor * result = ggml_rel_bias_mask(ctx, mask, bias, r, sinks, q_pos, kv_pos, row0);
     ggml_set_op_params_f32(result, 0, max_norm);
     result->src[6] = rs;
     result->src[7] = tau;

@@ -12984,7 +12984,8 @@ void ggml_compute_forward_rel_bias_mask(const ggml_compute_params * params, ggml
     const ggml_tensor * rs     = dst->src[6];
     const ggml_tensor * tau    = dst->src[7];
 
-    const float max_norm = ggml_get_op_params_f32(dst, 0);
+    const float   max_norm = ggml_get_op_params_f32(dst, 0);
+    const int64_t row0     = ggml_get_op_params_i32(dst, 1);
 
     const int64_t n_kv   = dst->ne[0];
     const int64_t n_rows = dst->ne[1];
@@ -12992,7 +12993,7 @@ void ggml_compute_forward_rel_bias_mask(const ggml_compute_params * params, ggml
     const int64_t n_rel  = bias->ne[0];
     const int64_t extent = bias->ne[1];
 
-    const int32_t * qp = (const int32_t *) q_pos->data;
+    const int32_t * qp = (const int32_t *) q_pos->data + row0;
     const int32_t * kp = (const int32_t *) kv_pos->data;
     const float   * bp = (const float *) bias->data;
 
@@ -13006,7 +13007,7 @@ void ggml_compute_forward_rel_bias_mask(const ggml_compute_params * params, ggml
         const int64_t h = ir/n_rows;
         const int64_t i = ir - h*n_rows;
 
-        const char  * mrow = (const char *) mask->data + i*mask->nb[1];
+        const char  * mrow = (const char *) mask->data + (row0 + i)*mask->nb[1];
         const float * rv0  = (const float *) ((const char *) r->data + h*r->nb[1] + i*r->nb[2]);
         const float   sink = sinks ? *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + i*sinks->nb[1]) : 0.0f;
 

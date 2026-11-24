@@ -2581,7 +2581,7 @@ struct test_rel_bias_mask : public test_case {
     const int64_t n_kv, n_rows, n_head, extent;
     const bool with_sinks;
     const int clip; // 0: none, 1: clip with scale, 2: clip with scale and tau
-    const bool chunk; // r, sinks, q_pos and tau are row views at an offset too, as in a query chunk of the graph
+    const bool chunk; // rows from an offset: of the whole mask and q_pos (row0), and views of r, sinks and tau, as a query chunk
 
     std::string vars() override {
         return VARS_TO_STR8(mask_type, n_kv, n_rows, n_head, extent, with_sinks, clip, chunk);
@@ -2592,12 +2592,12 @@ struct test_rel_bias_mask : public test_case {
         : mask_type(mask_type), n_kv(n_kv), n_rows(n_rows), n_head(n_head), extent(extent), with_sinks(with_sinks), clip(clip), chunk(chunk) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // mask rows are a view of a padded mask, as the graph slices them
-        ggml_tensor * mask_full = ggml_new_tensor_2d(ctx, mask_type, n_kv, n_rows + 5);
-        ggml_tensor * mask  = ggml_view_2d(ctx, mask_full, n_kv, n_rows, mask_full->nb[1], 2*mask_full->nb[1]);
-        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, extent);
         // the per-row inputs: whole tensors, or rows [r0, r0 + n_rows) of longer ones
         const int64_t r0 = chunk ? 3 : 0, n_all = n_rows + (chunk ? 5 : 0);
+        // the mask: the whole one with row0 = r0, or a row view of a padded one
+        ggml_tensor * mask_full = ggml_new_tensor_2d(ctx, mask_type, n_kv, n_all + 2);
+        ggml_tensor * mask  = chunk ? mask_full : ggml_view_2d(ctx, mask_full, n_kv, n_rows, mask_full->nb[1], 2*mask_full->nb[1]);
+        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, extent);
         ggml_tensor * r_all = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, n_head, n_all);
         ggml_tensor * r     = chunk ? ggml_view_3d(ctx, r_all, 16, n_head, n_rows, r_all->nb[1], r_all->nb[2], r0*r_all->nb[2]) : r_all;
         ggml_tensor * sinks = nullptr;
@@ -2605,9 +2605,8 @@ struct test_rel_bias_mask : public test_case {
             ggml_tensor * s_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_all);
             sinks = chunk ? ggml_view_2d(ctx, s_all, n_head, n_rows, s_all->nb[1], r0*s_all->nb[1]) : s_all;
         }
-        ggml_tensor * q_all = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_all);
-        ggml_set_name(q_all, "q_pos");
-        ggml_tensor * q_pos = chunk ? ggml_view_1d(ctx, q_all, n_rows, r0*ggml_element_size(q_all)) : q_all;
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_all);
+        ggml_set_name(q_pos, "q_pos");
         ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
         ggml_set_name(kv_pos, "kv_pos");
         if (clip) {
@@ -2617,9 +2616,9 @@ struct test_rel_bias_mask : public test_case {
                 ggml_tensor * t_all = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_all);
                 tau = chunk ? ggml_view_1d(ctx, t_all, n_rows, r0*ggml_element_size(t_all)) : t_all;
             }
-            return ggml_rel_bias_mask_clip(ctx, mask, bias, r, rs, tau, 8.0f, sinks, q_pos, kv_pos);
+            return ggml_rel_bias_mask_clip(ctx, mask, bias, r, rs, tau, 8.0f, sinks, q_pos, kv_pos, r0);
         }
-        return ggml_rel_bias_mask(ctx, mask, bias, r, sinks, q_pos, kv_pos);
+        return ggml_rel_bias_mask(ctx, mask, bias, r, sinks, q_pos, kv_pos, r0);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -2644,7 +2643,7 @@ struct test_rel_bias_mask : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-            } else if (t->type == GGML_TYPE_F16 || (t->type == GGML_TYPE_F32 && t->ne[0] == n_kv && t->ne[1] == n_rows + 5)) {
+            } else if (t->type == GGML_TYPE_F16 || (t->type == GGML_TYPE_F32 && t->ne[0] == n_kv && t->ne[1] == n_rows + (chunk ? 5 : 0) + 2)) {
                 // mask: zeros and -inf
                 std::vector<float> data(ggml_nelements(t));
                 std::uniform_int_distribution<int> coin(0, 3);

@@ -8745,7 +8745,8 @@ void ggml_vk_rel_bias_mask(ggml_backend_vk_context * ctx, vk_context& subctx, gg
     const ggml_tensor * r      = dst->src[5];
     const ggml_tensor * rs     = dst->src[6];
     const ggml_tensor * tau    = dst->src[7];
-    const float max_norm = ggml_get_op_params_f32(dst, 0);
+    const float    max_norm = ggml_get_op_params_f32(dst, 0);
+    const uint32_t row0     = (uint32_t) ggml_get_op_params_i32(dst, 1);
 
     vk_pipeline pipeline = ctx->device->pipeline_rel_bias_mask[mask->type == GGML_TYPE_F32 ? 1 : 0];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -8761,8 +8762,8 @@ void ggml_vk_rel_bias_mask(ggml_backend_vk_context * ctx, vk_context& subctx, gg
     vk_op_rel_bias_mask_push_constants pc = {
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) bias->ne[1], (uint32_t) bias->ne[0],
         ggml_vk_stride_elems(mask, 1), ggml_vk_stride_elems(r, 1), ggml_vk_stride_elems(r, 2), ggml_vk_stride_elems(sinks, 0), ggml_vk_stride_elems(sinks, 1), sinks ? 1u : 0u,
-        ggml_vk_elem_offset(ctx, mask), ggml_vk_elem_offset(ctx, bias), ggml_vk_elem_offset(ctx, sinks),
-        ggml_vk_elem_offset(ctx, q_pos), ggml_vk_elem_offset(ctx, kv_pos), ggml_vk_elem_offset(ctx, r), ggml_vk_elem_offset(ctx, dst),
+        ggml_vk_elem_offset(ctx, mask) + row0*ggml_vk_stride_elems(mask, 1), ggml_vk_elem_offset(ctx, bias), ggml_vk_elem_offset(ctx, sinks),
+        ggml_vk_elem_offset(ctx, q_pos) + row0, ggml_vk_elem_offset(ctx, kv_pos), ggml_vk_elem_offset(ctx, r), ggml_vk_elem_offset(ctx, dst),
         max_norm > 0.0f ? 1u : 0u, rs ? ggml_vk_stride_elems(rs, 1) : 0u, ggml_vk_elem_offset(ctx, rs), tau ? 1u : 0u, ggml_vk_elem_offset(ctx, tau),
         max_norm,
     };
@@ -19579,7 +19580,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_LOOP_GATE:
             return true;
         case GGML_OP_REL_BIAS_MASK:
-            return op->src[1]->ne[0] <= 16 && op->ne[1] <= 65535 && (ggml_get_op_params_f32(op, 0) <= 0.0f || op->src[6] != nullptr);
+            return op->src[1]->ne[0] <= 16 && op->ne[1] <= 65535 && (ggml_get_op_params_f32(op, 0) <= 0.0f || op->src[6] != nullptr) &&
+                   (uint64_t) ggml_nelements(op->src[0]) <= UINT32_MAX && (uint64_t) ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_LOOP_DOWN:
             return device->subgroup_arithmetic && device->subgroup_size >= 8 && op->ne[0] <= 65535 && op->ne[1] <= 65535;
         case GGML_OP_LOOP_UP:

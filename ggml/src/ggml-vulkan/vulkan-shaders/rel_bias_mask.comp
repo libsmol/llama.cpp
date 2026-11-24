@@ -6,9 +6,17 @@
 // per-head attention mask with a relative-position bias and a per-query sink, one invocation per (cell, row, HB heads)
 // the bias of distance d is bias[:, d] . r[:, h, i], in F32; r is optionally clipped first (as ggml_clip_norm, with a
 // per-channel scale rs and a per-row multiplier tau)
+// TABLE: the bias by distance instead (ggml_rel_bias_table), a workgroup per (row, HB heads) whose invocations step
+// over the distances: F16 [extent + 1, n_head, n_rows], the bias minus the sink, the sink alone at d = extent; rounded
+// as in the mask
 #define MAX_REL 16
+#if defined(TABLE)
+#define HB 32
+#else
 #define HB 4
-layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#endif
+#define WG 256
+layout (local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly  buffer M  {MASK_TYPE data_m[];};
 layout (binding = 1) readonly  buffer B  {float data_b[];};
@@ -33,20 +41,19 @@ shared float ssh[HB];
 shared float fsh[HB];
 
 void main() {
-    const uint j  = gl_GlobalInvocationID.x;
     const uint i  = gl_GlobalInvocationID.y;
     const uint h0 = gl_WorkGroupID.z*HB;
     const uint tid = gl_LocalInvocationID.x;
     const uint nh = min(HB, p.n_head - h0);
 
-    if (tid < nh*p.n_rel) {
-        const uint hh = tid/p.n_rel;
-        const uint k  = tid - hh*p.n_rel;
+    for (uint idx = tid; idx < nh*p.n_rel; idx += WG) {
+        const uint hh = idx/p.n_rel;
+        const uint k  = idx - hh*p.n_rel;
         float x = data_r[p.r_offset + (h0 + hh)*p.nbr1 + i*p.nbr2 + k];
         if (p.clip != 0) {
             x *= data_rs[p.rs_offset + (h0 + hh)*p.nbrs1 + k];
         }
-        rsh[tid] = x;
+        rsh[idx] = x;
     }
     barrier();
     if (tid < nh) {
@@ -66,32 +73,46 @@ void main() {
     }
     barrier();
 
+#if defined(TABLE)
+    for (uint j = tid; j < p.n_kv; j += WG) {
+        const int d = int(j);
+        const bool in_band = j < p.extent;
+#else
+    const uint j = gl_GlobalInvocationID.x;
     if (j >= p.n_kv) {
         return;
     }
+    {
+        const float m = float(data_m[p.m_offset + i*p.nbm1 + j]);
+        const int d = data_qp[p.qp_offset + i] - data_kp[p.kp_offset + j];
+        const bool in_band = d >= 0 && uint(d) < p.extent;
+        const uint hs = p.n_kv*p.n_rows;
+        const uint db = p.d_offset + j + p.n_kv*i + h0*hs;
+#endif
 
-    const float m = float(data_m[p.m_offset + i*p.nbm1 + j]);
-    const int d = data_qp[p.qp_offset + i] - data_kp[p.kp_offset + j];
-    const bool in_band = d >= 0 && uint(d) < p.extent;
+        float bv[MAX_REL];
+        [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
+            bv[k] = in_band && k < p.n_rel ? data_b[p.b_offset + uint(d)*p.n_rel + k] : 0.0;
+        }
 
-    float bv[MAX_REL];
-    [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
-        bv[k] = in_band && k < p.n_rel ? data_b[p.b_offset + uint(d)*p.n_rel + k] : 0.0;
-    }
-
-    const uint hs = p.n_kv*p.n_rows;
-    const uint db = p.d_offset + j + p.n_kv*i + h0*hs;
-    [[unroll]] for (uint hh = 0; hh < HB; ++hh) {
-        if (hh < nh) {
-            float t = 0.0;
-            if (in_band) {
-                [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
-                    if (k < p.n_rel) {
-                        t += bv[k]*rsh[hh*p.n_rel + k];
+        [[unroll]] for (uint hh = 0; hh < HB; ++hh) {
+            if (hh < nh) {
+                float t = 0.0;
+                if (in_band) {
+                    [[unroll]] for (uint k = 0; k < MAX_REL; ++k) {
+                        if (k < p.n_rel) {
+                            t += bv[k]*rsh[hh*p.n_rel + k];
+                        }
                     }
                 }
+#if defined(TABLE)
+                // t*f rounded on its own: the mask with m = 0 adds it to 0 (or fuses it into an fma with 0) first
+                precise float tf = t*fsh[hh];
+                data_d[p.d_offset + j + p.n_kv*(h0 + hh + p.n_head*i)] = float16_t(tf - ssh[hh]);
+#else
+                data_d[db + hh*hs] = float16_t(m + t*fsh[hh] - ssh[hh]);
+#endif
             }
-            data_d[db + hh*hs] = float16_t(m + t*fsh[hh] - ssh[hh]);
         }
     }
 }

@@ -426,6 +426,8 @@ extern "C" {
         GGML_OP_ROT_GATE,
         GGML_OP_DFLASH_CONV,
         GGML_OP_GATED_DELTA_NET_LAZY,
+        GGML_OP_REL_BIAS_TABLE,
+        GGML_OP_FLASH_ATTN_REL,
 
         GGML_OP_UNARY,
 
@@ -1314,6 +1316,36 @@ extern "C" {
             struct ggml_tensor  * q_pos,
             struct ggml_tensor  * kv_pos,
             int64_t               row0);
+
+    // the relative-position bias of ggml_rel_bias_mask_clip by distance, with the sink, for ggml_flash_attn_rel:
+    //   bias: [n_rel, n_band], r: [n_rel, n_head, n_rows], rs, tau: as ggml_rel_bias_mask_clip, sinks: [n_head, n_rows]
+    //   out: F16 [n_band + 1, n_head, n_rows], out[d, h, i] = bias[:, d] . r'[:, h, i] - sinks[h, i] for d < n_band and
+    //   -sinks[h, i] at d = n_band, in F32, with r' = ggml_clip_norm(r, rs, tau, max_norm, 1e-6), or r for max_norm <= 0
+    //   (with a mask of 0 and -inf, mask + out is the ggml_rel_bias_mask_clip mask)
+    GGML_API struct ggml_tensor * ggml_rel_bias_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * rs,
+            struct ggml_tensor  * tau,
+            float                 max_norm,
+            struct ggml_tensor  * sinks);
+
+    // flash attention with a per-head mask from a ggml_rel_bias_table and a sink logit of 0:
+    //   q: [D, n_rows, n_head], k, v: [D, n_kv, n_head_kv] (as ggml_flash_attn_ext), mask: F16 [n_kv, n_rows],
+    //   table: F16 [n_band + 1, n_head, n_rows], q_pos: I32 [n_rows], kv_pos: I32 [n_kv]; d = q_pos[i] - kv_pos[j]
+    //   logit[j, h, i] = scale * q[:, i, h] . k[:, j, h / (n_head / n_head_kv)] + mask[j, i] + table[b, h, i] in F32,
+    //   b = d for 0 <= d < n_band, else n_band; out: F32 [D, n_head, n_rows], softmax over the n_kv logits and the sink
+    GGML_API struct ggml_tensor * ggml_flash_attn_rel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * kv_pos,
+            float                 scale);
 
     // loop message controller, matrix-vector form for short batches:
     //   ggml_loop_down: h = w_down*[rms_norm(a); rms_norm(m)], a, m: [n_embd, n_t], w_down: [2*n_embd, n_rank] -> h: [n_rank, n_t]

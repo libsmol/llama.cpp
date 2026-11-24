@@ -9,6 +9,9 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
+#if defined(REL)
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
 
 // Prefill flash attention for RDNA4 (wave32 WMMA): head size D (128 or 256), f16 or (KV_Q8_0) q8_0 K/V, GQA.
 //
@@ -21,6 +24,9 @@
 // A workgroup has G * QB waves; wave w handles query head kv_head * G + w % G for the 16 positions of
 // query block w / G. All waves share each 32-key K/V tile through LDS, and the next tile is prefetched
 // into registers while the current one is computed.
+//
+// REL (ggml_flash_attn_rel, SPLIT == 0): the mask is mask + table[b, head, query] per head (f16 values, added in f32),
+// b the distance q_pos - kv_pos within the band and the band size past it, and the softmax has a sink logit of 0.
 //
 // Everything is computed transposed so the softmax stays in registers:
 //   S^T (keys x queries) = K * Q^T,     O^T (d x queries) += V^T * P^T
@@ -77,6 +83,9 @@ layout (push_constant) uniform parameter {
     uint32_t gqa_ratio;
     uint32_t split_kv;
     uint32_t k_num;
+#if defined(REL)
+    uint32_t n_band;
+#endif
 } p;
 
 layout (binding = 0) readonly buffer Q   {vec4 data_qv4[];};
@@ -93,6 +102,11 @@ layout (binding = 5) buffer O  {vec4 data_ov4[];};   // also holds the f32 parti
 layout (binding = 6) readonly buffer MO  {uint32_t data_mask_opt[];};
 layout (binding = 7) buffer PO {vec4 data_po4[];};    // SPLIT: [split][head][R][D] O, then [split][head][R] (M, L)
 layout (binding = 7) buffer PL {vec2 data_pml[];};
+#if defined(REL)
+layout (binding = 8)  readonly buffer TB {float16_t data_t[];};   // [query][head][n_band + 1]
+layout (binding = 9)  readonly buffer QP {int data_qp[];};
+layout (binding = 10) readonly buffer KP {int data_kp[];};
+#endif
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -142,6 +156,12 @@ uvec4 q8_0_staged(const uint r, const uint c8, const bool is_v) {
 // mask block [query][key] (+8 halves of padding), as packed half pairs
 const uint MR = (BC + 8) / 2;
 shared uint Msh[BQ * MR];
+#if defined(REL)
+// the cache positions of the block's keys, and the latest of them
+shared int KPsh[BC];
+shared int KPmax;
+const int KP_NONE = int(0x80000000u);   // past the cache: below every position
+#endif
 
 // O^T accumulates in f32 (the graph asks for f32 precision; the f16 P and V products are exact in it). Every
 // FLUSH_STEPS blocks each lane adds it into an f32 partial in the part of the output buffer it owns and restarts
@@ -228,6 +248,13 @@ void main() {
     const uint j_begin  = isplit * (p.split_kv / BC);
     const uint n_blocks = SPLIT != 0 ? min((p.KV + BC - 1) / BC, j_begin + p.split_kv / BC) : (p.KV + BC - 1) / BC;
     const bool use_mask = p.nem1 != 0;
+
+#if defined(REL)
+    // this lane's table row (query pos, head iq2); its last entry is the sink alone, for the keys past the band
+    const uint  t_row = pos < p.N ? (pos * p.neq2 + iq2) * (p.n_band + 1) : 0;
+    const int   q_pos = pos < p.N ? data_qp[pos] : 0;
+    const float t_far = float(data_t[t_row + p.n_band]);
+#endif
 
     // K: thread owns 16-byte chunks tid + i * WG_SIZE of the row-major tile.
     const uint K_CHUNKS = BC * D / 8;
@@ -357,7 +384,20 @@ void main() {
                     }
                 }
             }
+#if defined(REL)
+            // a zero mask still takes the table (BC keys: the first wave)
+            if (tid < BC) {
+                const int kp = j * BC + tid < p.KV ? data_kp[j * BC + tid] : KP_NONE;
+                KPsh[tid] = kp;
+                const int kmax = subgroupMax(kp);
+                if (tid == 0) {
+                    KPmax = kmax;
+                }
+            }
+            {
+#else
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+#endif
                 for (uint idx = tid; idx < BQ * BC / 2; idx += WG_SIZE) {
                     const uint r = idx / (BC / 2);
                     const uint c = (idx % (BC / 2)) * 2;
@@ -398,6 +438,31 @@ void main() {
 
             // ---- mask, online softmax (lane-local per query), P^T ------------------------------------
             // (real branches: the mask is only needed on the diagonal, the tail only on the last block)
+#if defined(REL)
+            // a block wholly past the band for this query takes the last entry of the table row
+            [[dont_flatten]] if (KPmax <= q_pos - int(p.n_band)) {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    const uint mb = (qsub * 16 + q) * MR + kt * 8 + half_ * 4;
+                    [[unroll]] for (uint c = 0; c < 4; ++c) {
+                        const vec2 m2 = unpackHalf2x16(Msh[mb + c]);
+                        Sacc[kt][2 * c]     = fma(m2.x + t_far, LOG2E, Sacc[kt][2 * c]);
+                        Sacc[kt][2 * c + 1] = fma(m2.y + t_far, LOG2E, Sacc[kt][2 * c + 1]);
+                    }
+                }
+            } else {
+                [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
+                    const uint mb = (qsub * 16 + q) * MR + kt * 8 + half_ * 4;
+                    [[unroll]] for (uint c = 0; c < 4; ++c) {
+                        const vec2 m2 = unpackHalf2x16(Msh[mb + c]);
+                        [[unroll]] for (uint e = 0; e < 2; ++e) {
+                            const uint  d = uint(q_pos - KPsh[kt * 16 + half_ * 8 + 2 * c + e]);
+                            const float t = d < p.n_band ? float(data_t[t_row + d]) : t_far;
+                            Sacc[kt][2 * c + e] = fma(m2[e] + t, LOG2E, Sacc[kt][2 * c + e]);
+                        }
+                    }
+                }
+            }
+#else
             [[dont_flatten]] if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
                     const uint mb = (qsub * 16 + q) * MR + kt * 8 + half_ * 4;
@@ -408,6 +473,7 @@ void main() {
                     }
                 }
             }
+#endif
             [[dont_flatten]] if (tail) {
                 [[unroll]] for (uint kt = 0; kt < KT; ++kt) {
                     [[unroll]] for (uint e = 0; e < 8; ++e) {
@@ -518,7 +584,14 @@ void main() {
         }
         return;
     }
+#if defined(REL)
+    // the sink logit 0 (log2 units like S): O and L are relative to Mf, rescaled to max(Mf, 0)
+    const float Ms  = max(Mf, 0.0);
+    const float es  = exp2(Mf - Ms);
+    const float rcp = es / (Lf * es + exp2(-Ms));
+#else
     const float rcp = Lf == 0.0 ? 0.0 : 1.0 / Lf;
+#endif
     if (pos < p.N) {
         [[unroll]] for (uint t = 0; t < NT; ++t) {
             const uint d0 = t * 16 + half_ * 8;

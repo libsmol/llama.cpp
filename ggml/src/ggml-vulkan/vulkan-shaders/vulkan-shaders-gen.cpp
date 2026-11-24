@@ -961,6 +961,8 @@ void process_shaders() {
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_pf_rdna4", "flash_attn_pf_rdna4.comp", {}, true, true, false, false);
     string_to_spv("flash_attn_pf_rdna4_q8_0", "flash_attn_pf_rdna4.comp", {{"KV_Q8_0", "1"}}, true, true, false, false);
+   string_to_spv("flash_attn_pf_rdna4_rel", "flash_attn_pf_rdna4.comp", {{"REL", "1"}}, true, true, false, false);
+   string_to_spv("flash_attn_pf_rdna4_q8_0_rel", "flash_attn_pf_rdna4.comp", {{"KV_Q8_0", "1"}, {"REL", "1"}}, true, true, false, false);
     string_to_spv("flash_attn_pf_rdna4_reduce", "flash_attn_pf_rdna4_reduce.comp", {});
     string_to_spv("mul_mm_rdna4_q4_k", "mul_mm_rdna4.comp", {{"DATA_A_Q4_K", "1"}}, true, true, false, false);
     string_to_spv("mul_mm_rdna4_q5_k", "mul_mm_rdna4.comp", {{"DATA_A_Q5_K", "1"}}, true, true, false, false);
@@ -1117,6 +1119,7 @@ void process_shaders() {
     string_to_spv("loop_gate_f32",  "loop_gate.comp",  {});
     string_to_spv("rel_bias_mask_f16", "rel_bias_mask.comp", {{"MASK_TYPE", "float16_t"}});
     string_to_spv("rel_bias_mask_f32", "rel_bias_mask.comp", {{"MASK_TYPE", "float"}});
+    string_to_spv("rel_bias_table", "rel_bias_mask.comp", {{"MASK_TYPE", "float16_t"}, {"TABLE", "1"}});
     string_to_spv("loop_down_f32", "loop_down.comp", {});
     string_to_spv("loop_up_f32", "loop_up.comp", {});
     string_to_spv("short_conv_rs_f32", "short_conv_rs.comp", {});

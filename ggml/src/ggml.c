@@ -1110,6 +1110,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROT_GATE",
     "DFLASH_CONV",
     "GATED_DELTA_NET_LAZY",
+    "REL_BIAS_TABLE",
+    "FLASH_ATTN_REL",
 
     "UNARY",
 
@@ -1131,7 +1133,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGMOID_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1238,6 +1240,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rot_gate(a, g)",
     "dflash_conv(x, dynamic, base)",
     "gated_delta_net_lazy(q, k, v, g, beta, s, f, n)",
+    "rel_bias_table(bias, r, rs, tau, sinks)",
+    "flash_attn_rel(q, k, v, mask, table, q_pos, kv_pos)",
 
     "unary(x)",
 
@@ -1259,7 +1263,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sigmoid_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3395,6 +3399,83 @@ struct ggml_tensor * ggml_rel_bias_mask_clip(
     ggml_set_op_params_f32(result, 0, max_norm);
     result->src[6] = rs;
     result->src[7] = tau;
+
+    return result;
+}
+
+// ggml_rel_bias_table
+
+struct ggml_tensor * ggml_rel_bias_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * rs,
+        struct ggml_tensor  * tau,
+        float                 max_norm,
+        struct ggml_tensor  * sinks) {
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_matrix(bias) && ggml_is_contiguous(bias));
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && r->nb[0] == sizeof(float) && ggml_is_3d(r) && r->ne[0] == bias->ne[0]);
+    GGML_ASSERT(r->ne[0] <= 16); // the clipped r of a row is staged in a fixed buffer
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->nb[0] == sizeof(float) && sinks->ne[0] == r->ne[1] && sinks->ne[1] == r->ne[2]);
+    if (max_norm > 0.0f) {
+        GGML_ASSERT(rs && rs->type == GGML_TYPE_F32 && rs->ne[0] == r->ne[0] && rs->ne[1] == r->ne[1] && rs->nb[0] == sizeof(float));
+        if (tau) {
+            GGML_ASSERT(tau->type == GGML_TYPE_F32 && ggml_nelements(tau) == r->ne[2] && ggml_is_contiguous(tau));
+        }
+    } else {
+        GGML_ASSERT(!rs && !tau);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, bias->ne[1] + 1, r->ne[1], r->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, max_norm);
+
+    result->op     = GGML_OP_REL_BIAS_TABLE;
+    result->src[0] = bias;
+    result->src[1] = r;
+    result->src[2] = rs;
+    result->src[3] = tau;
+    result->src[4] = sinks;
+
+    return result;
+}
+
+// ggml_flash_attn_rel
+
+struct ggml_tensor * ggml_flash_attn_rel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * kv_pos,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2] && q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && ggml_is_matrix(mask));
+    GGML_ASSERT(mask->ne[0] == k->ne[1] && mask->ne[1] == q->ne[1]);
+    GGML_ASSERT(table->type == GGML_TYPE_F16 && ggml_is_contiguous(table) && table->ne[0] >= 1);
+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[2] == q->ne[1]);
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && ggml_is_contiguous(kv_pos));
+    GGML_ASSERT(ggml_nelements(q_pos) == q->ne[1] && ggml_nelements(kv_pos) == k->ne[1]);
+
+    // the layout and the op params of ggml_flash_attn_ext: scale, max_bias = 0, logit_softcap = 0, F32 precision
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 3, GGML_PREC_F32);
+
+    result->op     = GGML_OP_FLASH_ATTN_REL;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[6] = table;
+    result->src[7] = q_pos;
+    result->src[8] = kv_pos;
 
     return result;
 }

@@ -1117,7 +1117,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SHORT_CONV_RS:
             case GGML_OP_ROT_GATE:
             case GGML_OP_DFLASH_CONV:
-            case GGML_OP_GATED_DELTA_NET_LAZY: {
+            case GGML_OP_GATED_DELTA_NET_LAZY:
+            case GGML_OP_REL_BIAS_TABLE:
+            case GGML_OP_FLASH_ATTN_REL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

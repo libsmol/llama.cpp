@@ -1009,6 +1009,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_res_mix_f32[VK_RES_MIX_MAX_STATES][VK_RES_MIX_MAX_Q];
     vk_pipeline pipeline_loop_gate_f32;
     vk_pipeline pipeline_rel_bias_mask[2]; // mask F16, F32
+    vk_pipeline pipeline_rel_bias_table;
     vk_pipeline pipeline_loop_down_f32;
     vk_pipeline pipeline_loop_up_f32;
     vk_pipeline pipeline_rot_gate_f32;

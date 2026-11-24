@@ -227,6 +227,13 @@ struct vk_flash_attn_push_constants {
 
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
 
+// flash_attn_pf_rdna4.comp with REL: the band size of the table after the common constants, past the 128 bytes every
+// device has (supports_op checks the limit)
+struct vk_flash_attn_rel_push_constants {
+    vk_flash_attn_push_constants fa;
+    uint32_t n_band;
+};
+
 struct vk_xe_fa_push_constants {
     uint32_t neq1;
     uint32_t neq2;

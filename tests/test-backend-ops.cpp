@@ -2664,6 +2664,109 @@ struct test_rel_bias_mask : public test_case {
     }
 };
 
+// GGML_OP_REL_BIAS_TABLE
+struct test_rel_bias_table : public test_case {
+    const int64_t n_rows, n_head, n_band;
+    const int clip; // 0: none, 1: clip with scale, 2: clip with scale and tau
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_rows, n_head, n_band, clip);
+    }
+
+    test_rel_bias_table(int64_t n_rows = 3, int64_t n_head = 24, int64_t n_band = 64, int clip = 0)
+        : n_rows(n_rows), n_head(n_head), n_band(n_band), clip(clip) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, n_band);
+        ggml_tensor * r     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, n_head, n_rows);
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_rows);
+        ggml_tensor * rs    = clip ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, n_head) : nullptr;
+        ggml_tensor * tau   = clip == 2 ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_rows) : nullptr;
+        return ggml_rel_bias_table(ctx, bias, r, rs, tau, clip ? 8.0f : 0.0f, sinks);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_REL
+struct test_flash_attn_rel : public test_case {
+    const ggml_type type_KV;
+    const int64_t hs, n_head, n_head_kv, n_kv, n_rows, n_band;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_KV, hs, n_head, n_head_kv, n_kv, n_rows, n_band);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4 * n_head * n_rows * hs * n_kv;
+    }
+
+    test_flash_attn_rel(ggml_type type_KV = GGML_TYPE_F16, int64_t hs = 128, int64_t n_head = 24, int64_t n_head_kv = 8,
+                        int64_t n_kv = 512, int64_t n_rows = 128, int64_t n_band = 64)
+        : type_KV(type_KV), hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_rows(n_rows), n_band(n_band) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // Q, K and V in the layouts the graph passes: heads of a row together, permuted to [hs, rows, heads]
+        ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, n_head, n_rows), 0, 2, 1, 3);
+        ggml_tensor * k = ggml_permute(ctx, ggml_new_tensor_3d(ctx, type_KV, hs, n_head_kv, n_kv), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, ggml_new_tensor_3d(ctx, type_KV, hs, n_head_kv, n_kv), 0, 2, 1, 3);
+        ggml_tensor * mask   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_rows);
+        ggml_tensor * table  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_band + 1, n_head, n_rows);
+        ggml_tensor * q_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+        ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_set_name(mask,   "mask");
+        ggml_set_name(table,  "table");
+        ggml_set_name(q_pos,  "q_pos");
+        ggml_set_name(kv_pos, "kv_pos");
+        return ggml_flash_attn_rel(ctx, q, k, v, mask, table, q_pos, kv_pos, 1.0f/sqrtf((float) hs));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // a cache in ring order with an empty cell, the batch at its end, a causal mask with holes
+        std::vector<int32_t> qp(n_rows), kp(n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            kp[j] = (int32_t) ((j + n_kv/3) % n_kv);
+        }
+        kp[n_kv/2] = INT32_MIN;
+        for (int64_t i = 0; i < n_rows; ++i) {
+            qp[i] = (int32_t) (n_kv - n_rows + i);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "q_pos") == 0) {
+                ggml_backend_tensor_set(t, qp.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                ggml_backend_tensor_set(t, kp.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<ggml_fp16_t> m(ggml_nelements(t));
+                for (int64_t i = 0; i < n_rows; ++i) {
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const bool visible = kp[j] != INT32_MIN && kp[j] <= qp[i] && (j*7 + i) % 13 != 0;
+                        m[i*n_kv + j] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "table") == 0) {
+                // below the sink logit 0, so that the sink takes a share of the softmax
+                init_tensor_uniform(t, -7.0f, -1.0f);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_LOOP_DOWN / GGML_OP_LOOP_UP
 struct test_loop_down_up : public test_case {
     const bool up;
@@ -14833,6 +14936,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, true, 1));
         test_cases.emplace_back(new test_rel_bias_mask(mt, 512, 1, 24, 1024, true, 2));
         test_cases.emplace_back(new test_rel_bias_mask(mt, 1536, 70, 24, 1024, true, 2, true));
+    }
+    test_cases.emplace_back(new test_rel_bias_table(3, 24, 64));
+    test_cases.emplace_back(new test_rel_bias_table(70, 24, 1024, 1));
+    test_cases.emplace_back(new test_rel_bias_table(70, 24, 1024, 2));
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 512, 128, 64));
+        test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 1100, 200, 1024));
     }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (bool split : {false, true}) {

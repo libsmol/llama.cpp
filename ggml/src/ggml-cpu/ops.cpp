@@ -13048,6 +13048,151 @@ void ggml_compute_forward_rel_bias_mask(const ggml_compute_params * params, ggml
     }
 }
 
+// ggml_compute_forward_rel_bias_table
+
+void ggml_compute_forward_rel_bias_table(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * bias  = dst->src[0];
+    const ggml_tensor * r     = dst->src[1];
+    const ggml_tensor * rs    = dst->src[2];
+    const ggml_tensor * tau   = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const float max_norm = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n_band = dst->ne[0] - 1;
+    const int64_t n_head = dst->ne[1];
+    const int64_t n_rows = dst->ne[2];
+    const int64_t n_rel  = bias->ne[0];
+
+    const float * bp = (const float *) bias->data;
+
+    // threads split the (row, head) pairs; the clip and the dot products as in ggml_compute_forward_rel_bias_mask
+    const int64_t nr  = n_rows*n_head;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i = ir/n_head;
+        const int64_t h = ir - i*n_head;
+
+        const float * rv0  = (const float *) ((const char *) r->data + h*r->nb[1] + i*r->nb[2]);
+        const float   sink = *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + i*sinks->nb[1]);
+
+        float rbuf[16]; // n_rel <= 16 (ggml_rel_bias_table)
+        const float * rv = rv0;
+        if (max_norm > 0.0f) {
+            double ss = 0.0;
+            for (int64_t k = 0; k < n_rel; ++k) {
+                rbuf[k] = rv0[k]*((const float *) ((const char *) rs->data + h*rs->nb[1]))[k];
+                ss += (double) rbuf[k]*rbuf[k];
+            }
+            float f = std::min(max_norm/((float) sqrt(ss) + 1e-6f), 1.0f);
+            if (tau) {
+                f *= ((const float *) tau->data)[i];
+            }
+            for (int64_t k = 0; k < n_rel; ++k) {
+                rbuf[k] *= f;
+            }
+            rv = rbuf;
+        }
+
+        ggml_fp16_t * drow = (ggml_fp16_t *) ((char *) dst->data + h*dst->nb[1] + i*dst->nb[2]);
+        for (int64_t d = 0; d < n_band; ++d) {
+            const float * brow = bp + d*n_rel;
+            float t = 0.0f;
+            for (int64_t k = 0; k < n_rel; ++k) {
+                t += brow[k]*rv[k];
+            }
+            drow[d] = GGML_CPU_FP32_TO_FP16(t - sink);
+        }
+        drow[n_band] = GGML_CPU_FP32_TO_FP16(-sink);
+    }
+}
+
+// ggml_compute_forward_flash_attn_rel
+
+void ggml_compute_forward_flash_attn_rel(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q      = dst->src[0];
+    const ggml_tensor * k      = dst->src[1];
+    const ggml_tensor * v      = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+    const ggml_tensor * table  = dst->src[6];
+    const ggml_tensor * q_pos  = dst->src[7];
+    const ggml_tensor * kv_pos = dst->src[8];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t D      = q->ne[0];
+    const int64_t DV     = v->ne[0];
+    const int64_t n_rows = q->ne[1];
+    const int64_t n_head = q->ne[2];
+    const int64_t n_kv   = k->ne[1];
+    const int64_t G      = n_head/k->ne[2];
+    const int64_t n_band = table->ne[0] - 1;
+
+    const int32_t * qp = (const int32_t *) q_pos->data;
+    const int32_t * kp = (const int32_t *) kv_pos->data;
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
+    GGML_ASSERT(k_to_float && v_to_float);
+
+    std::vector<float> logit(n_kv), krow(D), vrow(DV), acc(DV);
+
+    // threads split the (row, head) pairs; a reference: the logits in F32, then the softmax with the sink logit 0
+    const int64_t nr  = n_rows*n_head;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i  = ir/n_head;
+        const int64_t h  = ir - i*n_head;
+        const int64_t hk = h/G;
+
+        const float       * qrow = (const float *) ((const char *) q->data + i*q->nb[1] + h*q->nb[2]);
+        const ggml_fp16_t * mrow = (const ggml_fp16_t *) ((const char *) mask->data + i*mask->nb[1]);
+        const ggml_fp16_t * trow = (const ggml_fp16_t *) ((const char *) table->data + h*table->nb[1] + i*table->nb[2]);
+
+        float lmax = 0.0f; // the sink
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t d = (int64_t) qp[i] - kp[j];
+            const float   m = GGML_CPU_FP16_TO_FP32(mrow[j]) + GGML_CPU_FP16_TO_FP32(trow[d >= 0 && d < n_band ? d : n_band]);
+            if (m == -INFINITY) {
+                logit[j] = -INFINITY;
+                continue;
+            }
+            k_to_float((const char *) k->data + j*k->nb[1] + hk*k->nb[2], krow.data(), D);
+            float s = 0.0f;
+            for (int64_t c = 0; c < D; ++c) {
+                s += qrow[c]*krow[c];
+            }
+            logit[j] = s*scale + m;
+            lmax = std::max(lmax, logit[j]);
+        }
+
+        float sum = expf(-lmax);
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (logit[j] == -INFINITY) {
+                continue;
+            }
+            const float w = expf(logit[j] - lmax);
+            sum += w;
+            v_to_float((const char *) v->data + j*v->nb[1] + hk*v->nb[2], vrow.data(), DV);
+            for (int64_t c = 0; c < DV; ++c) {
+                acc[c] += w*vrow[c];
+            }
+        }
+
+        float * orow = (float *) ((char *) dst->data + h*dst->nb[1] + i*dst->nb[2]);
+        for (int64_t c = 0; c < DV; ++c) {
+            orow[c] = acc[c]/sum;
+        }
+    }
+}
+
 // ggml_compute_forward_loop_down
 
 void ggml_compute_forward_loop_down(const ggml_compute_params * params, ggml_tensor * dst) {

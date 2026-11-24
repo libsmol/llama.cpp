@@ -4507,6 +4507,50 @@ ggml_tensor * llm_graph_context::build_attn_masked(
     return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il, true);
 }
 
+ggml_tensor * llm_graph_context::build_attn_rel(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * q_pos,
+              float   kq_scale,
+                int   il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * attn = inp->get_attn();
+    const auto * mctx_cur = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    if (mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || v->nb[1] > v->nb[2]) {
+        return nullptr;
+    }
+
+    ggml_tensor * cur = ggml_flash_attn_rel(ctx0,
+            ggml_permute(ctx0, q_cur, 0, 2, 1, 3), ggml_permute(ctx0, k, 0, 2, 1, 3), ggml_permute(ctx0, v, 0, 2, 1, 3),
+            is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw, table, q_pos,
+            is_swa ? inp->self_kv_pos_swa : inp->self_kv_pos, kq_scale);
+
+    // a GPU of the cache runs it (the CPU has a reference implementation only)
+    const ggml_tensor * k_root = k->view_src ? k->view_src : k;
+    ggml_backend_dev_t dev = k_root->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(k_root->buffer)) : nullptr;
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || !ggml_backend_dev_supports_op(dev, cur)) {
+        return nullptr;
+    }
+
+    // the K and V of the batch are stored first, the attention reads them from the cache
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+
+    cb(cur, "kqv_out", il);
+
+    return ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+}
+
 void llm_graph_context::build_dense_out(
     ggml_tensor * dense_2,
     ggml_tensor * dense_2_b,

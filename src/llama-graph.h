@@ -1574,6 +1574,19 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // as build_attn_masked, the per-head mask made in the attention from the KQ mask, the positions and a
+    // ggml_rel_bias_table (ggml_flash_attn_rel); nullptr, with nothing added to the graph, if the device of the KV
+    // cache has no such attention
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table, // F32 [n_band + 1, n_head_q, n_tokens]
+            ggml_tensor * q_pos, // I32 [n_tokens]
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //

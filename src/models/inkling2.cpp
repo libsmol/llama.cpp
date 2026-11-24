@@ -500,8 +500,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         const int64_t n_kv = rel_pos->ne[0];
 
+        // one F16 mask per head: mask + attn_rel_bias[:, q_pos - kv_pos] . Rcur - sink, the bias in F32; made in the
+        // attention from the bias by distance where the device has that, else stored and read by flash attention
+        ggml_tensor * attn_rel = nullptr;
         if (fused_attn) {
-            // one F16 mask per head: mask + attn_rel_bias[:, q_pos - kv_pos] . Rcur - sink, the bias in F32
+            ggml_tensor * table = ggml_rel_bias_table(ctx0, layer.attn_rel_bias, Rcur, layer.attn_rel_clip, tau_l,
+                    hparams.f_relative_clip, ggml_reshape_2d(ctx0, sinks, n_head, n_tokens));
+            attn_rel = build_attn_rel(inp, Qcur, Kcur, Vcur, table, inp_pos, 1.0f/sqrtf(n_embd_head), il);
+        }
+
+        if (attn_rel) {
+            cur = attn_rel;
+        } else if (fused_attn) {
             ggml_tensor * sinks_t = ggml_reshape_2d(ctx0, sinks, n_head, n_tokens);
 
             ggml_tensor *& zero_sinks = inp->zero_sinks;

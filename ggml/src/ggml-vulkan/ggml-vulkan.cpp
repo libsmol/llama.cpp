@@ -221,7 +221,7 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const uint64_t size_N = node->ne[3] / OC * node->ne[0] * node->ne[1] * node->ne[2];
         return OC * size_N * (size_K + (size_K - 1));
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_REL) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
@@ -3685,9 +3685,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef CREATE_MMV_RDNA4
     }
     for (auto &it : device->pipeline_fa_pf_rdna4) {
-        // key: G | QB << 8 | SPLIT << 16 | (head size / 64) << 20 | q8_0 K/V << 24
+        // key: G | QB << 8 | SPLIT << 16 | (head size / 64) << 20 | q8_0 K/V << 24 | ggml_flash_attn_rel << 25
         const uint32_t G = it.first & 0xFF, QB = (it.first >> 8) & 0xFF, SPLIT = (it.first >> 16) & 0xF, D = ((it.first >> 20) & 0xF) * 64;
-        const bool q8 = (it.first >> 24) & 1;
+        const bool q8  = (it.first >> 24) & 1;
+        const bool rel = (it.first >> 25) & 1;
+        if (rel) {
+            ggml_vk_create_pipeline(device, it.second, q8 ? "flash_attn_pf_rdna4_q8_0_rel" : "flash_attn_pf_rdna4_rel",
+                                    q8 ? flash_attn_pf_rdna4_q8_0_rel_cm1_len : flash_attn_pf_rdna4_rel_cm1_len,
+                                    q8 ? flash_attn_pf_rdna4_q8_0_rel_cm1_data : flash_attn_pf_rdna4_rel_cm1_data, "main", 11,
+                                    sizeof(vk_flash_attn_rel_push_constants), {1, 1, 1}, {G, G * QB * 32, QB, SPLIT, D}, 1, true, true, 32);
+            continue;
+        }
         ggml_vk_create_pipeline(device, it.second, q8 ? "flash_attn_pf_rdna4_q8_0" : "flash_attn_pf_rdna4",
                                 q8 ? flash_attn_pf_rdna4_q8_0_cm1_len : flash_attn_pf_rdna4_cm1_len,
                                 q8 ? flash_attn_pf_rdna4_q8_0_cm1_data : flash_attn_pf_rdna4_cm1_data, "main", 8,
@@ -4208,6 +4216,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_loop_gate_f32,  "loop_gate_f32",  loop_gate_f32_len,  loop_gate_f32_data,  "main", 5,  sizeof(vk_op_loop_gate_push_constants),  {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rel_bias_mask[0], "rel_bias_mask_f16", rel_bias_mask_f16_len, rel_bias_mask_f16_data, "main", 9, sizeof(vk_op_rel_bias_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rel_bias_mask[1], "rel_bias_mask_f32", rel_bias_mask_f32_len, rel_bias_mask_f32_data, "main", 9, sizeof(vk_op_rel_bias_mask_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_rel_bias_table, "rel_bias_table", rel_bias_table_len, rel_bias_table_data, "main", 9, sizeof(vk_op_rel_bias_mask_push_constants), {256, 1, 1}, {}, 1);
     if (device->subgroup_arithmetic && device->subgroup_size >= 8) {
         ggml_vk_create_pipeline(device, device->pipeline_loop_down_f32, "loop_down_f32", loop_down_f32_len, loop_down_f32_data, "main", 4, sizeof(vk_op_loop_down_push_constants), {1, 1, 1}, {256}, 1, false, true);
     }
@@ -8775,6 +8784,38 @@ void ggml_vk_rel_bias_mask(ggml_backend_vk_context * ctx, vk_context& subctx, gg
         { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], CEIL_DIV((uint32_t) dst->ne[2], 4u) });
 }
 
+void ggml_vk_rel_bias_table(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * bias  = dst->src[0];
+    const ggml_tensor * r     = dst->src[1];
+    const ggml_tensor * rs    = dst->src[2];
+    const ggml_tensor * tau   = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const float max_norm = ggml_get_op_params_f32(dst, 0);
+
+    vk_pipeline pipeline = ctx->device->pipeline_rel_bias_table;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, bias,  true);
+    const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, sinks, true);
+    const vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, r,     true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,   true);
+
+    // the mask shader's push constants: one cell per distance (n_kv = extent + 1), no mask and positions; a workgroup
+    // per (row, 32 heads)
+    vk_op_rel_bias_mask_push_constants pc = {
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[2], (uint32_t) dst->ne[1], (uint32_t) bias->ne[1], (uint32_t) bias->ne[0],
+        0u, ggml_vk_stride_elems(r, 1), ggml_vk_stride_elems(r, 2), ggml_vk_stride_elems(sinks, 0), ggml_vk_stride_elems(sinks, 1), 1u,
+        0u, ggml_vk_elem_offset(ctx, bias), ggml_vk_elem_offset(ctx, sinks),
+        0u, 0u, ggml_vk_elem_offset(ctx, r), ggml_vk_elem_offset(ctx, dst),
+        max_norm > 0.0f ? 1u : 0u, rs ? ggml_vk_stride_elems(rs, 1) : 0u, ggml_vk_elem_offset(ctx, rs), tau ? 1u : 0u, ggml_vk_elem_offset(ctx, tau),
+        max_norm,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { b_buf, b_buf, s_buf, b_buf, b_buf, r_buf, d_buf,
+        rs ? ggml_vk_tensor_subbuffer(ctx, rs, true) : b_buf, tau ? ggml_vk_tensor_subbuffer(ctx, tau, true) : b_buf }, pc,
+        { 256u, (uint32_t) dst->ne[2], CEIL_DIV((uint32_t) dst->ne[1], 32u) });
+}
+
 void ggml_vk_loop_down(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * a = dst->src[0];
     const ggml_tensor * m = dst->src[1];
@@ -9727,6 +9768,31 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+// the operands flash_attn_pf_rdna4.comp takes: head size 128 or 256, f16 or q8_0 K/V (q8_0 rows whole blocks on
+// 8-byte strides, f16 rows on 16-byte strides), 1 to 8 query heads per KV head and an f16 mask shared by all heads
+static bool ggml_vk_fa_pf_rdna4_supported(const vk_device & device, const ggml_tensor * q, const ggml_tensor * k,
+                                          const ggml_tensor * v, const ggml_tensor * mask) {
+    if (device->vendor_id != VK_VENDOR_ID_AMD || device->architecture != AMD_RDNA4 || !device->coopmat_support ||
+        !device->subgroup_size_control || device->subgroup_min_size > 32 || device->subgroup_max_size < 32) {
+        return false;
+    }
+    const size_t q8 = ggml_type_size(GGML_TYPE_Q8_0);
+    const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+        k->nb[1] % q8 == 0 && v->nb[1] % q8 == 0 && ((k->nb[1] | k->nb[2] | k->nb[3] | v->nb[1] | v->nb[2] | v->nb[3]) % 8) == 0 &&
+        k->nb[0] == q8 && v->nb[0] == q8;
+    const bool kv_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        ((k->nb[1] | k->nb[2] | k->nb[3] | v->nb[1] | v->nb[2] | v->nb[3]) % 16) == 0;
+    const int64_t G = q->ne[2] / k->ne[2];
+    return k->ne[0] == v->ne[0] && (k->ne[0] == 128 || k->ne[0] == 256) && q->type == GGML_TYPE_F32 && (kv_q8 || kv_f16) &&
+        G >= 1 && G <= 8 && q->ne[2] == k->ne[2] * G && k->ne[2] == v->ne[2] && q->ne[3] % k->ne[3] == 0 && q->ne[3] % v->ne[3] == 0 &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[2] == 1 && mask->ne[1] >= q->ne[1] &&
+        mask->nb[1] == (size_t) k->ne[1] * sizeof(ggml_fp16_t) &&
+        (mask->ne[3] == 1 || (mask->ne[3] == q->ne[3] && mask->nb[3] == (size_t) mask->ne[1] * mask->nb[1])) &&
+        (q->nb[1] % 16) == 0 && (q->nb[2] % 16) == 0 && (q->nb[3] % 16) == 0;
+}
+#endif
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -9846,7 +9912,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     // RDNA4 (flash_attn_pf_rdna4.comp): head size 128 or 256, f16 or q8_0 K/V. Prefill: one workgroup per KV head and 32
     // query rows. Speculative verification (<= 16 rows) on a long context: one workgroup per KV head and KV
-    // split, combined by flash_attn_pf_rdna4_reduce.comp.
+    // split, combined by flash_attn_pf_rdna4_reduce.comp. ggml_flash_attn_rel runs the prefill kernel only.
     {
         // verification from 16K keys on: below that the coopmat1 path is measurably (~3e-7 KLD) closer to f32
         const uint32_t verify_min_kv = 16384;
@@ -9855,40 +9921,31 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         memcpy(&pf_softcap,  (const float *) dst->op_params + 2, sizeof(float));
         const uint32_t G  = qk_ratio;
         const uint32_t NQ = (uint32_t) neq1;   // query rows (N may have been folded into the GQA ratio above)
-        // q8_0 K/V: fetched raw and dequantized from LDS; rows must be whole blocks on 8-byte offsets
-        // (the shader indexes 8-byte units from the bound offset of K / V, so only the strides need 8-byte multiples)
-        const bool pf_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
-            (nbk1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 && (nbv1 % ggml_type_size(GGML_TYPE_Q8_0)) == 0 &&
-            ((nbk1 | nbk2 | nbk3 | nbv1 | nbv2 | nbv3) % 8) == 0 &&
-            k->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && v->nb[0] == ggml_type_size(GGML_TYPE_Q8_0);
-        const bool pf_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-            (nbk1 % 16) == 0 && (nbk2 % 16) == 0 && (nbk3 % 16) == 0 &&
-            (nbv1 % 16) == 0 && (nbv2 % 16) == 0 && (nbv3 % 16) == 0;
-        const bool pf_common =
-            ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA4 &&
-            ctx->device->coopmat_support && ctx->device->subgroup_size_control &&
-            ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32 &&
-            HSK == HSV && (HSK == 128 || HSK == 256) && q->type == GGML_TYPE_F32 && (pf_f16 || pf_q8) &&
-            G >= 1 && G <= 8 && neq2 == nek2 * G && nek2 == nev2 && neq3 % nek3 == 0 && neq3 % nev3 == 0 &&
-            mask != nullptr && mask->type == GGML_TYPE_F16 && nem0 == KV && nem2 == 1 && nem1 >= NQ &&
-            mask->nb[1] == (size_t) KV * sizeof(ggml_fp16_t) &&
-            (nem3 == 1 || (nem3 == neq3 && mask->nb[3] == (size_t) nem1 * mask->nb[1])) &&
+        // q8_0 K/V: fetched raw and dequantized from LDS (the shader indexes 8-byte units from the bound offset of K / V)
+        const bool pf_q8 = k->type == GGML_TYPE_Q8_0;
+        const bool rel   = dst->op == GGML_OP_FLASH_ATTN_REL;
+        const ggml_tensor * rel_table  = rel ? dst->src[6] : nullptr;
+        const ggml_tensor * rel_q_pos  = rel ? dst->src[7] : nullptr;
+        const ggml_tensor * rel_kv_pos = rel ? dst->src[8] : nullptr;
+        const bool pf_common = ggml_vk_fa_pf_rdna4_supported(ctx->device, q, k, v, mask) &&
             sinks == nullptr && pf_max_bias == 0.0f && pf_softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0 &&
-            (nbq1 % 16) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
             get_misalign_bytes(ctx, q) == 0 && get_misalign_bytes(ctx, k) == 0 && get_misalign_bytes(ctx, v) == 0 &&
-            get_misalign_bytes(ctx, dst) == 0 && get_misalign_bytes(ctx, mask) == 0;
+            get_misalign_bytes(ctx, dst) == 0 && get_misalign_bytes(ctx, mask) == 0 &&
+            (!rel || (get_misalign_bytes(ctx, rel_table) == 0 && get_misalign_bytes(ctx, rel_q_pos) == 0 &&
+                      get_misalign_bytes(ctx, rel_kv_pos) == 0));
+        GGML_ASSERT((pf_common || !rel) && "ggml_flash_attn_rel: operands at an offset the shader does not take");
         // Prefill runs one workgroup per KV head and 32 query rows. With fewer of those than half the CUs (a short
         // prompt after a long context) KV is split over workgroups instead, as for verification; below
         // verify_min_kv keys the coopmat1 path is used then.
         const uint32_t n_cu    = std::max(1u, ctx->device->shader_core_count);
         const bool     few_wgs = 2 * CEIL_DIV(NQ, 16 * fa_pf_qb) * nek2 * neq3 < n_cu;
-        const bool pf_prefill = pf_common && NQ >= 32 && !few_wgs;
-        const bool pf_verify  = pf_common && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
+        const bool pf_prefill = pf_common && (rel || (NQ >= 32 && !few_wgs));
+        const bool pf_verify  = pf_common && !rel && NQ >= 1 && (NQ <= 16 || few_wgs) && KV >= verify_min_kv &&
                                 ctx->device->pipeline_fa_pf_rdna4_reduce != nullptr;
         if (pf_prefill || pf_verify) {
             const uint32_t QB    = pf_verify ? 1 : fa_pf_qb;
             const uint32_t SPLIT = pf_verify ? 1 : 0;
-            const uint32_t key   = G | (QB << 8) | (SPLIT << 16) | ((HSK / 64) << 20) | ((pf_q8 ? 1u : 0u) << 24);
+            const uint32_t key   = G | (QB << 8) | (SPLIT << 16) | ((HSK / 64) << 20) | ((pf_q8 ? 1u : 0u) << 24) | ((rel ? 1u : 0u) << 25);
             const uint32_t pf_Br = 16 * QB, pf_Bc = fa_pf_bc;
             vk_pipeline pf_pipeline, pf_mask_opt;
             {
@@ -9965,9 +10022,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 (uint32_t)(pf_q8 ? nbk1 : nbk1 / sizeof(ggml_fp16_t)), (uint32_t)nbk2, (uint32_t)nbk3,
                 (uint32_t)(pf_q8 ? nbv1 : nbv1 / sizeof(ggml_fp16_t)), (uint32_t)nbv2, (uint32_t)nbv3,
                 pf_scale, 0.0f, 0.0f, 0, 0.0f, 0.0f, G, split_kv, k_num };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pf_pipeline,
-                                      { q_buf, k_buf, v_buf, mask_buf, q_buf, dst_buf, mo_buf, part_buf },
-                                      pf_pc, { pf_verify ? k_num * n_qblk : n_qblk, (uint32_t)nek2, (uint32_t)neq3 });
+            const std::array<uint32_t, 3> pf_wgs = { pf_verify ? k_num * n_qblk : n_qblk, (uint32_t)nek2, (uint32_t)neq3 };
+            if (rel) {
+                const vk_flash_attn_rel_push_constants rel_pc = { pf_pc, (uint32_t) (rel_table->ne[0] - 1) };
+                ggml_vk_dispatch_pipeline(ctx, subctx, pf_pipeline,
+                                          { q_buf, k_buf, v_buf, mask_buf, q_buf, dst_buf, mo_buf, part_buf,
+                                            ggml_vk_tensor_subbuffer(ctx, rel_table), ggml_vk_tensor_subbuffer(ctx, rel_q_pos),
+                                            ggml_vk_tensor_subbuffer(ctx, rel_kv_pos) },
+                                          rel_pc, pf_wgs);
+            } else {
+                ggml_vk_dispatch_pipeline(ctx, subctx, pf_pipeline,
+                                          { q_buf, k_buf, v_buf, mask_buf, q_buf, dst_buf, mo_buf, part_buf },
+                                          pf_pc, pf_wgs);
+            }
             if (pf_verify) {
                 ggml_vk_sync_buffers(ctx, subctx);
                 const vk_flash_attn_pf_reduce_push_constants red_pc = { (uint32_t) ne1, (uint32_t) ne2, rows_slot, k_num, (uint32_t) ne3, HSV / 4 };
@@ -9983,6 +10050,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 #endif
+    GGML_ASSERT(dst->op != GGML_OP_FLASH_ATTN_REL && "ggml_flash_attn_rel needs flash_attn_pf_rdna4");
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -15208,6 +15276,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_REL:
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, nullptr, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -15259,6 +15332,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_REL_BIAS_MASK:
         ggml_vk_rel_bias_mask(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_REL_BIAS_TABLE:
+        ggml_vk_rel_bias_table(ctx, compute_ctx, node);
 
         break;
 
@@ -19582,6 +19660,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_REL_BIAS_MASK:
             return op->src[1]->ne[0] <= 16 && op->ne[1] <= 65535 && (ggml_get_op_params_f32(op, 0) <= 0.0f || op->src[6] != nullptr) &&
                    (uint64_t) ggml_nelements(op->src[0]) <= UINT32_MAX && (uint64_t) ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_REL_BIAS_TABLE:
+            return op->src[0]->ne[0] <= 16 && op->ne[2] <= 65535 && (uint64_t) ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_FLASH_ATTN_REL:
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            // (it has no KV split: with fewer workgroups than half the CUs the caller's split attention is faster)
+            return ggml_vk_fa_pf_rdna4_supported(device, op->src[0], op->src[1], op->src[2], op->src[3]) && device->subgroup_arithmetic &&
+                   2 * CEIL_DIV(op->src[0]->ne[1], 16 * fa_pf_qb) * op->src[1]->ne[2] >= std::max(1u, device->shader_core_count) &&
+                   device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_rel_push_constants) &&
+                   (uint64_t) ggml_nelements(op->src[6]) <= UINT32_MAX;
+#else
+            return false;
+#endif
         case GGML_OP_LOOP_DOWN:
             return device->subgroup_arithmetic && device->subgroup_size >= 8 && op->ne[0] <= 65535 && op->ne[1] <= 65535;
         case GGML_OP_LOOP_UP:
@@ -20264,7 +20354,7 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + ")";
         return fusion_str + name;
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_REL) {
         const ggml_tensor * dst = node;
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];

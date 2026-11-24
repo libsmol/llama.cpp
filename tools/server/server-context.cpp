@@ -389,6 +389,23 @@ struct server_spec_adaptive {
         t_begin = t_us;
     }
 
+    // the state of choose(): a step drafted by another drafter restores the one before its choice
+    struct choice {
+        int n_cur          = 0;
+        int probe_left     = 0;
+        int steps_no_draft = 0;
+    };
+
+    choice saved() const {
+        return { n_cur, probe_left, steps_no_draft };
+    }
+
+    void restore(const choice & c) {
+        n_cur          = c.n_cur;
+        probe_left     = c.probe_left;
+        steps_no_draft = c.steps_no_draft;
+    }
+
     // the tracked step was not this drafter's: not counted, and the next step (which may rebuild graphs) not timed
     void cancel() {
         t_begin = -1;
@@ -470,6 +487,7 @@ struct server_slot {
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     server_spec_adaptive spec_adapt; // --spec-draft-adaptive
     bool spec_adaptive = false;
+    server_spec_adaptive::choice spec_adapt_choice; // before the choice of the current step
 
     // --spec-draft-adaptive with n-gram drafters: their drafts take the lead and are limited to spec_ngram_cap tokens,
     // doubled after a whole acceptance and halved below half of it, between 4 and spec_ngram_cap_max
@@ -496,10 +514,12 @@ struct server_slot {
         spec_ngram_steps++;
         spec_ngram_drafted  += n_draft;
         spec_ngram_accepted += n_acc;
+        // the model drafter's choice of this step was not used
+        spec_adapt.restore(spec_adapt_choice);
         if (n_acc == n_draft) {
             spec_ngram_cap = std::min(2*spec_ngram_cap, spec_ngram_cap_max);
         } else if (2*n_acc < n_draft) {
-            spec_ngram_cap = std::max(spec_ngram_cap/2, spec_ngram_cap_min);
+            spec_ngram_cap = std::min(std::max(spec_ngram_cap/2, spec_ngram_cap_min), spec_ngram_cap_max);
         }
     }
     llama_tokens spec_prompt;
@@ -1766,8 +1786,12 @@ private:
                                  common_speculative_n_max_of(spec.get(), false) > 0;
             if (slot.spec_adaptive) {
                 slot.spec_adapt.init(params_base.speculative.draft.n_min, common_speculative_n_max_of(spec.get(), false));
+                // n-gram drafts within the recurrent snapshots, so that a partly accepted one needs no checkpoint
                 slot.spec_ngram_cap_max = common_speculative_n_max_of(spec.get(), true);
-                slot.spec_ngram_cap     = std::min(server_slot::spec_ngram_cap_init, slot.spec_ngram_cap_max);
+                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    slot.spec_ngram_cap_max = std::min(slot.spec_ngram_cap_max, (int) llama_n_rs_seq(ctx_tgt));
+                }
+                slot.spec_ngram_cap = std::min(server_slot::spec_ngram_cap_init, slot.spec_ngram_cap_max);
             }
 
             slot.mctx                   = mctx;
@@ -4053,8 +4077,9 @@ private:
                 int n_draft_ngram = -1;
                 if (slot.spec_adaptive && slot.spec_draft.empty()) {
                     if (n_draft_max > 0) {
-                        n_draft_ngram = std::min(n_draft_max, slot.spec_ngram_cap);
-                        n_draft_max   = std::min(n_draft_max, slot.spec_adapt.choose());
+                        n_draft_ngram          = std::min(n_draft_max, slot.spec_ngram_cap);
+                        slot.spec_adapt_choice = slot.spec_adapt.saved();
+                        n_draft_max            = std::min(n_draft_max, slot.spec_adapt.choose());
                     }
                     slot.spec_adapt.begin(ggml_time_us());
                 }

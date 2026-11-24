@@ -1518,7 +1518,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
 
         if (has_markov_context) {
-            ctx_rows = (size_t) block_size + 1;
+            // the rows of a whole verification batch: a long n-gram draft accepted in part still leaves its last token's
+            ctx_rows = (size_t) std::max(block_size, params.ngram_n_max()) + 1;
             ctx_embd.resize((size_t) n_seq * ctx_rows * (size_t) n_embd_dec);
             ctx_pos.assign((size_t) n_seq * ctx_rows, -1);
             block_state.reserve((size_t) n_seq * block_size * n_embd_dec);
@@ -1558,7 +1559,7 @@ protected:
         if (!state) {
             return;
         }
-        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+        const llama_pos pos_min = std::max<llama_pos>(0, batch_inject.tokens.back().pos[0] - (llama_pos) (ctx_rows - 1));
         for (int32_t i = 0; i < n_chunk; ++i) {
             const llama_pos pos = batch_inject.tokens[i].pos[0];
             if (pos < pos_min) {
@@ -3052,9 +3053,7 @@ static common_ngram_map get_common_ngram_map(
 static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq) {
-    uint16_t n_draft = 8; // TODO get from config?
-
-    return std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, n_draft);
+    return std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, common_params_speculative_ngram_cache::n_draft);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {

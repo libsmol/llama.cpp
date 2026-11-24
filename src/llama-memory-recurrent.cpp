@@ -49,6 +49,9 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (lazy) {
             lz_s_v = s_v;
             lz_h   = h;
+        } else if (arch_ok && n_rs_seq > 0 && 3 * (n_rs_seq + 1) > s_v) {
+            LLAMA_LOG_WARN("%s: n_rs_seq = %u leaves no room for lazy snapshots (at most %u): each snapshot is a whole state\n",
+                    __func__, n_rs_seq, s_v/3 - 1);
         }
     }
 

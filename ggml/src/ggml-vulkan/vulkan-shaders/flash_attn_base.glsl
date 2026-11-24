@@ -79,6 +79,8 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
+// one query row with GQA: the mask has a row per Q head (ne1 == 1, ne2 == n_head), row r of the workgroup is head iq2 + r
+#define MASK_HEAD_ROWS_BIT (1<<25)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -157,7 +159,8 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, sparse_base;
+         q_stride, k_stride, v_stride, m_stride, m_rows, sparse_base;
+bool m_rows_check;
 
 void init_indices()
 {
@@ -221,6 +224,15 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    // the mask rows that exist past the tile's first: the query rows, or with MASK_HEAD_ROWS_BIT the workgroup's heads
+    // (each a row of KV, after the head offset of iq2)
+    const bool m_head_rows = p.gqa_ratio > 1 && (p.mask_n_head_log2 & MASK_HEAD_ROWS_BIT) != 0;
+    if (m_head_rows) {
+        m_stride = KV;
+    }
+    m_rows       = m_head_rows ? p.gqa_ratio : p.nem1;
+    m_rows_check = (!(p.gqa_ratio > 1) || m_head_rows) && (m_rows % Br) != 0;
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.

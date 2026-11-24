@@ -14955,6 +14955,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_rel(type_KV, 128, 24, 8, 20000,  64, 1024));
         test_cases.emplace_back(new test_flash_attn_rel(type_KV, 256, 16, 2,   700,  96,   40));
     }
+    // one query row with a mask row per Q head (Inkling's decode): the GQA heads fold into rows that read their heads' masks
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {512, 1100, 20000}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV,
+                                                            {0, 2, 1, 3}, false, false, 0, 0, 24));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 700, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV,
+                                                        {0, 2, 1, 3}, false, false, 0, 0, 16));
+    }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (bool split : {false, true}) {
             test_cases.emplace_back(new test_situ(type, { 1152, 8, 2, 1 }, split, 4.0f, 25.0f));

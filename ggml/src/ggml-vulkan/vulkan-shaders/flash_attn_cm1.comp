@@ -232,8 +232,6 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
-
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                     uint32_t c = (idx + tid) / (Br / 4);
@@ -248,25 +246,25 @@ void main() {
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);
                                 max_mask = max(max_mask, float(mv));
-                            } else if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
+                            } else if (!m_rows_check || i * Br + r * 4 + 3 < m_rows) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
-                            } else if (i * Br + r * 4 + 2 < p.nem1) {
+                            } else if (i * Br + r * 4 + 2 < m_rows) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
-                            } else if (i * Br + r * 4 + 1 < p.nem1) {
+                            } else if (i * Br + r * 4 + 1 < m_rows) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
-                            } else if (i * Br + r * 4 < p.nem1) {
+                            } else if (i * Br + r * 4 < m_rows) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             0.0,
                                             0.0,

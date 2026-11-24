@@ -9898,8 +9898,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
+    // one query row with a mask row per Q head (contiguous, ne1 == 1): the folded rows read the rows of their heads
+    // (MASK_HEAD_ROWS_BIT), so the heads of a KV head still share its K and V
+    const bool mask_head_rows = mask != nullptr && N == 1 && nem1 == 1 && nem2 == neq2 && nem3 <= 1 && nem0 == KV &&
+                                mask->nb[1] == (size_t) KV * sizeof(ggml_fp16_t) && mask->nb[2] == mask->nb[1] &&
+                                !ctx->device->coopmat2;
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
-        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+        qk_ratio * nek2 == neq2 && nek2 == nev2 && (nem2 <= 1 || mask_head_rows)) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
         // and change addressing calculations to index Q's dimension 2.
@@ -9908,7 +9913,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    // the folded heads of one query row with their own mask rows take the scalar kernel: it streams K and V at ~90% of
+    // the bandwidth there, coopmat1 at ~75% (RDNA4, 131K q8_0 keys)
+    tuning_params = gqa_ratio > 1 && nem2 > 1 ? get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc)
+                                              : get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     // RDNA4 (flash_attn_pf_rdna4.comp): head size 128 or 256, f16 or q8_0 K/V. Prefill: one workgroup per KV head and 32
@@ -10433,7 +10441,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         v_buf = v_dst;
     }
 
-    uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+    uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | ((gqa_ratio > 1 && nem2 > 1) << 25) | n_head_log2;
 
     if (use_mask_opt)
     {

@@ -3222,6 +3222,41 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     return n_max;
 }
 
+bool common_speculative_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int32_t common_speculative_n_max_of(const common_speculative * spec, bool ngram) {
+    int32_t n_max = 0;
+
+    if (spec == nullptr) {
+        return n_max;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (common_speculative_type_is_ngram(impl->type) == ngram) {
+            n_max = std::max(n_max, std::max(0, impl->n_max));
+        }
+    }
+
+    return n_max;
+}
+
+common_speculative_type common_speculative_last_type(const common_speculative * spec, llama_seq_id seq_id) {
+    const common_speculative_impl * impl = spec ? spec->impl_last[seq_id] : nullptr;
+
+    return impl ? impl->type : COMMON_SPECULATIVE_TYPE_NONE;
+}
+
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {
     const bool has_length = spec->synth_len != -1.0;
     const bool has_rates  = !spec->synth_rates.empty();
@@ -3758,7 +3793,25 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // the limits of the calls: n_max, and n_max_ngram for the n-gram drafters; a limit of 0 skips the drafter
+    std::vector<int32_t> n_max_call(dparams.size());
+    for (size_t s = 0; s < dparams.size(); ++s) {
+        n_max_call[s] = dparams[s].n_max;
+    }
+
     for (auto & impl : spec->impls) {
+        const bool ngram = common_speculative_type_is_ngram(impl->type);
+
+        std::vector<bool> skipped(dparams.size(), false);
+        for (size_t s = 0; s < dparams.size(); ++s) {
+            auto & dp = dparams[s];
+            dp.n_max = ngram && dp.n_max_ngram >= 0 ? dp.n_max_ngram : n_max_call[s];
+            if (dp.drafting && dp.n_max == 0) {
+                dp.drafting = false;
+                skipped[s]  = true;
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3769,6 +3822,12 @@ void common_speculative_draft(common_speculative * spec) {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
+
+            if (skipped[seq_id]) {
+                dp.drafting = true;
+                n_drafting++;
+                continue;
+            }
 
             if (!dp.drafting) {
                 continue;
@@ -3813,6 +3872,10 @@ void common_speculative_draft(common_speculative * spec) {
         if (n_drafting == 0) {
             break;
         }
+    }
+
+    for (size_t s = 0; s < dparams.size(); ++s) {
+        dparams[s].n_max = n_max_call[s];
     }
 
     // these sequences failed to generate a draft

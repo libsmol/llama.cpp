@@ -4212,7 +4212,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-adaptive"},
         "server with one slot: the draft length of every step (0: no draft, else --spec-draft-n-min..--spec-draft-n-max) "
-        "with the highest expected throughput, from the measured acceptance per draft position and step times (default: off)",
+        "with the highest expected throughput, from the measured acceptance per draft position and step times; the drafts "
+        "of n-gram drafters listed with the model drafter start at 8 tokens, doubled after a whole acceptance and halved "
+        "below half of it (default: off)",
         [](common_params & params) {
             params.speculative.draft.adaptive = true;
         }

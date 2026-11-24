@@ -155,6 +155,13 @@ llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf -np 1 \
     --spec-draft-sampling probabilistic --spec-draft-adaptive -fa on --jinja
 ```
 
+An n-gram drafter listed with it (`--spec-type ngram-simple,draft-dspark`) drafts first: where the last tokens occur
+earlier in the context (code or text copied from the prompt), their continuation is the draft, else DSpark drafts.
+With `--spec-draft-adaptive` the n-gram drafts start at 8 tokens, double after a whole acceptance and halve below
+half of it (4 to `--spec-ngram-simple-size-m`); the target keeps a recurrent snapshot per token of the longest draft,
+so a partly accepted one rolls back without a replay. The target verifies an n-gram draft by its own samples, so the
+output distribution does not depend on it either.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 

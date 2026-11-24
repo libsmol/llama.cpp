@@ -416,6 +416,8 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
+    // the recurrent snapshots of the target with a draft model: one per token of the longest draft of the enabled types,
+    // so that a partly accepted draft of an n-gram drafter rolls back without a replay too
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
@@ -425,8 +427,22 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
+        if (!needs_rs_seq) {
+            return 0u;
+        }
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        int32_t n = draft.n_max;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  n = std::max<int32_t>(n, ngram_simple.size_m);  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   n = std::max<int32_t>(n, ngram_map_k.size_m);   break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n = std::max<int32_t>(n, ngram_map_k4v.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     n = std::max<int32_t>(n, ngram_mod.n_max);      break;
+                default: break;
+            }
+        }
+
+        return (uint32_t) n;
     }
 };
 

@@ -84,9 +84,21 @@ struct common_speculative_draft_params {
     int32_t top_k = 0;
     float   top_p = 1.0f;
     float   min_p = 0.0f;
+
+    // the limit of the n-gram drafters instead of n_max (-1: n_max)
+    int32_t n_max_ngram = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+
+// an n-gram drafter: drafts from the token history, without a model
+bool common_speculative_type_is_ngram(enum common_speculative_type type);
+
+// the longest draft of the n-gram drafters (ngram = true) or of the drafters with a model
+int32_t common_speculative_n_max_of(const common_speculative * spec, bool ngram);
+
+// the type of the implementation that made the last draft of the sequence (COMMON_SPECULATIVE_TYPE_NONE before any)
+enum common_speculative_type common_speculative_last_type(const common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);

@@ -30,6 +30,13 @@ uint row_index(uint r, uint lane) {
 
 layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 
+// flags (GGML_VK_GDN_FLAG_*)
+#define FLAG_USE_IDX   1u
+#define FLAG_GATES_RAW 2u
+#define FLAG_LAZY      4u
+#define FLAG_FI_ROWS   8u
+#define FLAG_FO_ROWS   16u
+
 layout(push_constant) uniform Parameters {
     uint H;
     uint n_tokens;
@@ -42,6 +49,16 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    uint so_off, so_seq, so_slot;
+    uint si_row, flags;
+    // lazy snapshots (ggml_gated_delta_net_lazy): the base state and the factors out go to binding 7, the
+    // factors in come from binding 11 or (FI_ROWS) the cache in binding 5. Factors at a fixed offset, or
+    // (FI_ROWS / FO_ROWS) at row idx[seq] * f_row + off. Binding 8 holds every index: the state rows at si_off,
+    // the factor rows at fii_off / foi_off, the replay counts at rp_off.
+    uint fi_off, fii_off;
+    uint fo_off, foi_off;
+    uint f_row;
+    uint rp_off, si_off;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -51,6 +68,13 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+// state snapshots go to binding 7: either the snapshot area of dst, or (fused) the recurrent cache
+layout(binding = 7)           buffer SOutBuf  { FLOAT_TYPE data_state_out[]; };
+layout(binding = 8) readonly  buffer SIdxBuf  { int data_state_idx[]; };
+// gates_raw: data_g / data_beta hold alpha / beta before the gate ops, with these per-head terms
+layout(binding = 9)  readonly buffer DtBuf    { FLOAT_TYPE data_dt[]; };
+layout(binding = 10) readonly buffer ABuf     { FLOAT_TYPE data_a[];  };
+layout(binding = 11) readonly buffer FinBuf   { FLOAT_TYPE data_fin[]; };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -113,10 +137,11 @@ void main() {
 
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
-    // output state layout per slot: same per-(seq,head) offset as the single-slot case.
-    const uint state_out_base      = (seq_id * H + head_id) * state_size;
-    const uint state_size_per_snap = state_size * H * n_seqs;
+    // (fused) the initial state is read straight from the cache row idx[seq].
+    const uint state_in_base       = (flags & FLAG_USE_IDX) != 0u ? uint(data_state_idx[si_off + seq_id]) * si_row + head_id * state_size
+                                                   : (seq_id * H + head_id) * state_size;
+    // output state layout per slot: per-seq stride so_seq, per-slot stride so_slot.
+    const uint state_out_base      = so_off + seq_id * so_seq + head_id * state_size;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
@@ -126,26 +151,106 @@ void main() {
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
+    // lazy: factor slot t holds k [S_V, H], delta [S_V, H], g [H] (padded to S_V * H) of one token, and
+    // the state is s_t = fma(k_t, delta_t, g_t * s_{t-1}) exactly as in the loop below
+    const uint SH = S_V * H;
+    const uint m  = (flags & FLAG_LAZY) != 0u ? min(n_tokens, K) : 0u;
+    uint fo_base = 0u;
+    if ((flags & FLAG_LAZY) != 0u) {
+        const uint n_rep   = uint(data_state_idx[rp_off + seq_id]);
+        const uint fi_base = (flags & FLAG_FI_ROWS) != 0u ? uint(data_state_idx[fii_off + seq_id]) * f_row + fi_off : fi_off + seq_id * 3u * K * SH;
+        for (uint t = 0; t < n_rep; t++) {
+            const uint fb = fi_base + t * 3u * SH;
+            const bool fc = (flags & FLAG_FI_ROWS) != 0u;
+            const FLOAT_TYPE g_t = fc ? data_state[fb + 2u * SH + head_id]       : data_fin[fb + 2u * SH + head_id];
+            const FLOAT_TYPE d_t = fc ? data_state[fb + SH + head_id * S_V + col] : data_fin[fb + SH + head_id * S_V + col];
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = fb + head_id * S_V + row_index(r, lane);
+                s_shard[r] = fma(fc ? data_state[i] : data_fin[i], d_t, g_t * s_shard[r]);
+            }
+        }
+        if (n_tokens <= K) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_state_out[state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+            }
+        }
+        fo_base = (flags & FLAG_FO_ROWS) != 0u ? uint(data_state_idx[foi_off + seq_id]) * f_row + fo_off : fo_off + seq_id * 3u * K * SH;
+        // the unused slots and the g padding are zero, so that the factors are fully determined
+        for (uint t = m; t < K; t++) {
+            if (col == 0u) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    data_state_out[fo_base + t * 3u * SH + head_id * S_V + row_index(r, lane)] = FLOAT_TYPE(0);
+                }
+            }
+            if (lane == 0u) {
+                data_state_out[fo_base + t * 3u * SH + SH + head_id * S_V + col] = FLOAT_TYPE(0);
+                if (col == 0u) {
+                    data_state_out[fo_base + t * 3u * SH + 2u * SH + head_id] = FLOAT_TYPE(0);
+                }
+            }
+        }
+        {
+            // spread over all threads of the sequence: at most one element per slot each
+            const uint n_thr = H * (S_V / COLS_PER_WG) * SUBGROUP_SIZE;
+            const uint gi    = (head_id * (S_V / COLS_PER_WG) + gl_WorkGroupID.z) * SUBGROUP_SIZE + gl_LocalInvocationID.x;
+            for (uint t = 0; t < K; t++) {
+                for (uint e = gi; e < SH - H; e += n_thr) {
+                    data_state_out[fo_base + t * 3u * SH + 2u * SH + H + e] = FLOAT_TYPE(0);
+                }
+            }
+        }
+    }
+
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
 
-    for (uint t = 0; t < n_tokens; t++) {
-        const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const uint k_off = iq3 * sk3 + t * sk2 + iq1 * sk1;
-        const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
-        const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+    // the inputs of token t + 1 are loaded while token t is computed
+    FLOAT_TYPE nk[ROWS_PER_LANE], nq[ROWS_PER_LANE];
+    FLOAT_TYPE nbeta = FLOAT_TYPE(0), ng = FLOAT_TYPE(0), nv = FLOAT_TYPE(0);
+#define LOAD_TOKEN(tt) { \
+        const uint q_off_  = iq3 * sq3 + (tt) * sq2 + iq1 * sq1; \
+        const uint k_off_  = iq3 * sk3 + (tt) * sk2 + iq1 * sk1; \
+        const uint gb_off_ = seq_id * sb3 + (tt) * sb2 + head_id * sb1; \
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) { \
+            nk[r] = FLOAT_TYPE(data_k[k_off_ + row_index(r, lane)]); \
+            nq[r] = FLOAT_TYPE(data_q[q_off_ + row_index(r, lane)]); \
+        } \
+        nbeta = FLOAT_TYPE(data_beta[gb_off_]); \
+        if (KDA == 0) { ng = FLOAT_TYPE(data_g[gb_off_]); } \
+        nv = FLOAT_TYPE(data_v[seq_id * sv3 + (tt) * sv2 + head_id * sv1 + col]); \
+    }
+    if (n_tokens > 0u) {
+        LOAD_TOKEN(0u)
+    }
 
+    for (uint t = 0; t < n_tokens; t++) {
+        const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            const uint i = row_index(r, lane);
-            k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
-            q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+            k_reg[r] = nk[r];
+            q_reg[r] = nq[r];
+        }
+        const FLOAT_TYPE beta_raw = nbeta;
+        const FLOAT_TYPE g_raw    = ng;
+        const FLOAT_TYPE v_val    = nv;
+        if (t + 1u < n_tokens) {
+            LOAD_TOKEN(t + 1u)
         }
 
+        // gates_raw: the expressions of the unary sigmoid / softplus shaders and the binary add / mul
+        const FLOAT_TYPE beta_val = (flags & FLAG_GATES_RAW) != 0u ? FLOAT_TYPE(1.0f / (1.0f + exp(-float(beta_raw))))
+                                                    : beta_raw;
+
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
+        FLOAT_TYPE g_val = FLOAT_TYPE(0);
         if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            FLOAT_TYPE g_in = g_raw;
+            if ((flags & FLAG_GATES_RAW) != 0u) {
+                const float x  = float(g_in) + float(data_dt[head_id]);
+                const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+                g_in = FLOAT_TYPE(sp * float(data_a[head_id]));
+            }
+            g_val = exp(g_in);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }
@@ -157,11 +262,12 @@ void main() {
             }
         }
 
-        const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
-
+        // gs = g * s is rounded once and shared by the k . s sum and the state update
+        FLOAT_TYPE gs[ROWS_PER_LANE];
         FLOAT_TYPE kv_shard = 0.0;
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+            gs[r] = g_exp[r] * s_shard[r];
+            kv_shard += gs[r] * k_reg[r];
         }
         FLOAT_TYPE kv_col = reduce_partial(kv_shard);
 
@@ -169,10 +275,32 @@ void main() {
 
         FLOAT_TYPE attn_partial = 0.0;
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
+            s_shard[r] = fma(k_reg[r], delta_col, gs[r]);
             attn_partial += s_shard[r] * q_reg[r];
         }
         FLOAT_TYPE attn_col = reduce_partial(attn_partial);
+
+        if ((flags & FLAG_LAZY) != 0u) {
+            const int slot = int(t) - int(n_tokens - m);
+            if (slot >= 0) {
+                const uint fb = fo_base + uint(slot) * 3u * SH;
+                if (col == 0u) {
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_state_out[fb + head_id * S_V + row_index(r, lane)] = k_reg[r];
+                    }
+                }
+                if (lane == 0u) {
+                    data_state_out[fb + SH + head_id * S_V + col] = delta_col;
+                    if (col == 0u) {
+                        data_state_out[fb + 2u * SH + head_id] = g_val;
+                    }
+                }
+            } else if (t + 1u == n_tokens - m) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    data_state_out[state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+                }
+            }
+        }
 
         if (lane == 0) {
             data_dst[attn_off + col] = attn_col * scale;
@@ -180,20 +308,20 @@ void main() {
 
         attn_off += S_V * H;
 
-        if (K > 1u) {
+        if (K > 1u && (flags & FLAG_LAZY) == 0u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+                const uint slot_base = uint(target_slot) * so_slot + state_out_base;
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                    data_dst[slot_base + col * S_V + row_index(r, lane)] = s_shard[r];
+                    data_state_out[slot_base + col * S_V + row_index(r, lane)] = s_shard[r];
                 }
             }
         }
     }
 
-    if (K == 1u) {
+    if (K == 1u && (flags & FLAG_LAZY) == 0u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[s_off + state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+            data_state_out[state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
         }
     }
 }

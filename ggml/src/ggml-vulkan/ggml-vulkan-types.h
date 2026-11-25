@@ -77,6 +77,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixMaintenance1FeaturesEXT {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -894,6 +895,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_concat_transpose_i8, pipeline_concat_transpose_i16, pipeline_concat_transpose_i32;
+    vk_pipeline pipeline_concat_t_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_scale[3];
@@ -994,6 +996,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
+    vk_pipeline pipeline_reduce_long[2][2];  // SUM / ARGMAX of a few long rows, by mode and pass
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1037,6 +1040,31 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+    // RDNA4 prefill / verification flash attention (flash_attn_pf_rdna4.comp), keyed by
+    // G | QB << 8 | SPLIT << 16 | (head size / 64) << 20 | q8_0 K/V << 24, and the reduce of its KV splits
+    std::map<uint32_t, vk_pipeline> pipeline_fa_pf_rdna4;
+    vk_pipeline pipeline_fa_pf_rdna4_reduce;
+    // flash_attn_dec_rdna4.comp, key: row tiles | (head size / 64) << 8
+    std::map<uint32_t, vk_pipeline> pipeline_fa_dec_rdna4;
+    // RDNA4 prefill GEMM (mul_mm_rdna4.comp) and its split-K reduce
+    vk_pipeline pipeline_mm_rdna4_q4_k, pipeline_mm_rdna4_q5_k, pipeline_mm_rdna4_q6_k, pipeline_mm_rdna4_iq4_xs,
+                pipeline_mm_rdna4_iq4_nl, pipeline_mm_rdna4_q8_0, pipeline_mm_rdna4_q3_k, pipeline_mm_rdna4_iq3_s,
+                pipeline_mm_rdna4_bf16;
+    vk_pipeline pipeline_mm_rdna4_reduce;
+    std::array<vk_pipeline, 3> pipeline_add_rms_norm_mul_f32;   // by rms_norm block size
+    // the same, also writing the f16 B operand of mul_mmv_rdna4 (rms_norm: by block size)
+    std::array<vk_pipeline, 3> pipeline_add_rms_norm_mul_f16out_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f16out_f32;
+    vk_pipeline pipeline_swiglu_to_f16;
+    vk_pipeline pipeline_mul_to_f16;
+    // f32 -> the f16 B operand of the RDNA4 GEMMs, with a power-of-two scale per row against f16 overflow
+    vk_pipeline pipeline_b_to_f16_rowscale;
+    vk_pipeline pipeline_dflash_conv_f32;
+    vk_pipeline pipeline_cpy_multi_f32;
+    // rms_norm_fused.comp: [mode: RMS_NORM+SCALE, RMS_NORM+MUL+MUL][rms_norm block size]
+    std::array<vk_pipeline, 3> pipeline_rms_norm_fused[2];
+    vk_pipeline pipeline_mmv_rdna4_q2_k, pipeline_mmv_rdna4_q4_k, pipeline_mmv_rdna4_q5_k, pipeline_mmv_rdna4_q6_k, pipeline_mmv_rdna4_iq4_xs,
+                pipeline_mmv_rdna4_iq4_nl, pipeline_mmv_rdna4_q8_0;
 
     vk_pipeline pipeline_fa_sparse_compact;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
@@ -1205,6 +1233,10 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    // a transfer command (copy / fill) was recorded since the last barrier, or the command buffer is new and earlier
+    // ones in the queue may hold some: the next barrier then also waits for the transfer stage
+    bool transfer_unsynced = true;
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1327,9 +1359,36 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+    // the rows the f16 B of mul_mm_rdna4 / mul_mmv_rdna4 is laid out for (ggml_vk_rdna4_b_scale_off)
+    uint32_t prealloc_y_last_rows_alloc {};
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
+
+    // GATED_DELTA_NET fused with the GET_ROWS loading s0 from the recurrent cache and/or the CPY
+    // storing its states back (ggml_vk_find_gdn_fusions); the absorbed nodes are skipped
+    struct vk_gdn_fusion {
+        const ggml_tensor * state_rows = nullptr; // absorbed GET_ROWS (cache rows -> s0)
+        const ggml_tensor * state_cpy  = nullptr; // absorbed CPY (snapshots -> cache)
+        // absorbed gate ops: g = softplus(alpha + dt) * a, beta = sigmoid(beta_raw)
+        const ggml_tensor * alpha = nullptr, * dt = nullptr, * a = nullptr, * beta_raw = nullptr;
+        // lazy snapshots: absorbed GET_ROWS (cache rows -> factors in) and SET_ROWS (factors out -> cache rows)
+        const ggml_tensor * fin_rows = nullptr;
+        const ggml_tensor * fout_rows = nullptr;
+    };
+    std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
+    std::unordered_set<const ggml_tensor *> fused_skip;
+    // runs of CPY nodes done in one dispatch by the first (ggml_vk_find_cpy_groups); the rest are in
+    // fused_skip
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> cpy_groups;
+    // SWIGLU nodes writing the f16 B operand of the following mul_mm_rdna4 into prealloc_y;
+    // value: whether the f32 result is written too
+    std::unordered_map<const ggml_tensor *, bool> glu_to_f16;
+    // ... whose consumer is a mul_mmv_rdna4 matmul (always writing the f32 result): its B (glu or a reshape of it)
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> glu_to_f16_b;
+    // the last node of an RMS_NORM + MUL / ADD + RMS_NORM + MUL whose next compute node is a mul_mmv_rdna4 matmul
+    // reading its result (ggml_vk_find_norm_to_f16): it also writes the matmul's f16 B operand into prealloc_y
+    std::unordered_set<const ggml_tensor *> norm_to_f16;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
@@ -1367,6 +1426,12 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // residual ADD + RMS_NORM + MUL in one dispatch (add_rms_norm_mul.comp)
+    bool fused_add_rms_norm_mul {};
+    // ... in two dispatches: the output may overlap the inputs of the add
+    bool fused_add_rms_norm_mul_split {};
+    // rms_norm_fused.comp: 1 = RMS_NORM + SCALE, 2 = RMS_NORM + MUL + MUL
+    int fused_rms_norm_ext {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

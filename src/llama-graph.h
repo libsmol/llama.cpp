@@ -328,6 +328,12 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // lazy recurrent snapshots: I32 [4 * n_seqs], see llama_memory_recurrent_context::lazy_info
+    ggml_tensor * lz_info = nullptr;
+
+    void set_input_lazy(const llama_memory_recurrent_context * mctx);
+    bool can_reuse_lazy(const llama_memory_recurrent_context * mctx, int64_t n_seqs) const;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

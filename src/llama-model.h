@@ -424,6 +424,10 @@ struct llama_layer {
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
+    // DSpine code bridge, per layer: code read [n_embd -> code] and feature write [rank -> n_embd]
+    struct ggml_tensor * dspine_read  = nullptr;
+    struct ggml_tensor * dspine_write = nullptr;
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -940,6 +944,13 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
 
+    // DSpine code bridge (shared by every layer)
+    struct ggml_tensor * dspine_codebook  = nullptr; // [code, n_vocab]
+    struct ggml_tensor * dspine_gate      = nullptr; // [code, rank] own-code gate
+    struct ggml_tensor * dspine_gate_b    = nullptr; // [rank]
+    struct ggml_tensor * dspine_pred_gate = nullptr; // [code, rank] predecessor gate
+    struct ggml_tensor * dspine_prev      = nullptr; // [code, rank] predecessor value
+
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;
     struct ggml_tensor * res_scale_in_b = nullptr;
@@ -947,6 +958,8 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+    // DFlash2: low-precision copy of the target lm_head, ranks the vocabulary before the exact rescoring
+    struct ggml_tensor * dflash_output_approx = nullptr;
 
     struct ggml_tensor * lilicorr_token_proj          = nullptr;
     struct ggml_tensor * lilicorr_token_proj_b        = nullptr;
@@ -1088,6 +1101,9 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // adds a tensor (and its buffer) the model then owns
+    friend bool llama_model_dflash_build_approx_head(llama_model * model_dft, const llama_model * model_tgt);
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

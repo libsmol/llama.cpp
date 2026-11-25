@@ -1104,6 +1104,12 @@ class GGUFWriter:
     def add_selector_top_k(self, value: int) -> None:
         self.add_uint32(Keys.LLM.SELECTOR_TOP_K.format(arch=self.arch), value)
 
+    def add_dspine_head_top_k(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DSPINE_HEAD_TOP_K.format(arch=self.arch), value)
+
+    def add_dspine_bridge_eps(self, value: float) -> None:
+        self.add_float32(Keys.LLM.DSPINE_BRIDGE_EPS.format(arch=self.arch), value)
+
     def add_sample_from_anchor(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SAMPLE_FROM_ANCHOR.format(arch=self.arch), value)
 

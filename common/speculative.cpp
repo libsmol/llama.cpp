@@ -208,6 +208,9 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // optional, see common_speculative_set_prompt_end
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -980,6 +983,47 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// DSpine draft sampling filter over the K candidates of one lattice row (dspine_mlx/propose.py filter_probs):
+// a candidate is kept if fewer than top_k candidates rank ahead of it and the mass ranked ahead of it is at
+// most top_p (ties rank by id), and if p >= min_p * max(p); the kept probabilities are renormalized in place.
+// lane[r] is the candidate with the r-th smallest token id (the reference's lane order).
+static void dspine_filter(std::vector<float> & p, const std::vector<int32_t> & lane, int32_t top_k, float top_p, float min_p) {
+    const int32_t K = (int32_t) p.size();
+    const int32_t k_eff = top_k <= 0 ? K : std::min(std::max(top_k, 1), K);
+
+    std::vector<int32_t> pos(K);
+    for (int32_t r = 0; r < K; ++r) {
+        pos[lane[r]] = r;
+    }
+    const float p_max = *std::max_element(p.begin(), p.end());
+
+    std::vector<float> w(K, 0.0f);
+    float sum = 0.0f;
+    for (int32_t c = 0; c < K; ++c) {
+        int32_t rank   = 0;
+        float   before = 0.0f;
+        // the mass ahead is summed in lane order, as the reference does, so ties with top_p resolve the same way
+        for (int32_t r = 0; r < K; ++r) {
+            const int32_t d = lane[r];
+            if (p[d] > p[c] || (p[d] == p[c] && pos[d] < pos[c])) {
+                rank   += 1;
+                before += p[d];
+            }
+        }
+        // the top candidate (rank 0) is always kept, whatever the request asks (top_p <= 0 or NaN, min_p > 1), as
+        // the target's samplers keep at least one token; so sum > 0
+        const bool keep = rank == 0 ||
+            (rank < k_eff && before <= top_p && (!(min_p > 0.0f) || p[c] >= min_p * p_max));
+        if (keep) {
+            w[c] = p[c];
+            sum += p[c];
+        }
+    }
+    for (int32_t c = 0; c < K; ++c) {
+        p[c] = w[c] / sum;
+    }
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1030,6 +1074,31 @@ protected:
         bool    dev_features;     // the target features can come from the target's device buffer
         bool    nextn_masked;     // h_nextn is only read at the output rows
     };
+    // If every draft layer is windowed (n_swa_all), drafting after a prompt that ends at E only
+    // attends positions > E - n_swa_all, and an injected row depends only on its own target
+    // features. Earlier prompt rows are not injected, and target feature extraction is turned off
+    // for prompt batches that end before them.
+    int32_t   n_swa_all   = 0;     // 0: not every layer is windowed, inject everything
+    llama_pos prompt_end  = -1;    // seq 0, set by the server per prompt
+    bool      extract_on  = true;  // target layer-input extraction is enabled
+    int32_t   n_batch_tgt = 0;
+
+    llama_pos inject_from() const {
+        // a little slack past the window
+        return prompt_end - n_swa_all - 64;
+    }
+
+    void set_extract(bool on) {
+        // with the device buffer, extraction is a device copy per layer, while toggling it reallocates
+        // the buffer (llama_context::layer_inp_dev_alloc): keep it on, the rows are still skipped below
+        if (use_dev_features || on == extract_on) {
+            return;
+        }
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            llama_set_embeddings_layer_inp(this->params.ctx_tgt, (uint32_t) target_layer_ids[k], on);
+        }
+        extract_on = on;
+    }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type)
@@ -1063,6 +1132,18 @@ protected:
             }
         }
 
+        {
+            const int32_t n_swa = llama_model_n_swa(model_dft);
+            bool all_swa = n_swa > 0 && llama_model_n_layer(model_dft) > 0;
+            for (int32_t il = 0; all_swa && il < llama_model_n_layer(model_dft); ++il) {
+                all_swa = llama_model_layer_is_swa(model_dft, il);
+            }
+            if (all_swa && n_seq == 1) {
+                n_swa_all = n_swa;
+                LOG_INF("%s: - every draft layer uses a %d-token window: prompt rows before it are not injected\n", __func__, n_swa);
+            }
+            n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
@@ -1177,8 +1258,33 @@ public:
         }
     }
 
+    void set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) override {
+        if (n_swa_all <= 0 || seq_id != 0) {
+            return;
+        }
+        prompt_end = pos_end;
+        // the first prompt batch is decoded before process() can decide anything
+        set_extract(true);
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
+            return true;
+        }
+
+        // windowed draft: this batch was decoded with extraction = extract_on; set it for the next
+        // batch, which holds at most n_batch_tgt rows
+        const bool extracted = extract_on;
+        llama_pos  skip_below = -1;
+        if (n_swa_all > 0 && prompt_end >= 0) {
+            llama_pos pos_last = -1;
+            for (int32_t k = 0; k < batch_in.size(); ++k) {
+                pos_last = std::max(pos_last, batch_in.tokens[k].pos[0]);
+            }
+            skip_below = inject_from();
+            set_extract(pos_last + n_batch_tgt >= skip_below);
+        }
+        if (!extracted) {
             return true;
         }
 
@@ -1216,6 +1322,14 @@ public:
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
+            }
+            if (skip_below >= 0) {
+                while (i_batch_beg[seq_id] <= i_batch_end[seq_id] && batch_in.tokens[i_batch_beg[seq_id]].pos[0] < skip_below) {
+                    i_batch_beg[seq_id]++;
+                }
+                if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                    continue;
+                }
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
@@ -1462,9 +1576,12 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            // bonus-anchor drafts read the mask positions only, like DFlash
+            // bonus-anchor drafts read the mask positions only, like DFlash; the block keeps its size (its attention is not
+            // causal), a sequence reads at most its own limit of it (dp.n_max, e.g. --spec-draft-adaptive)
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            const int32_t n_read      = dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
+            const int32_t i_draft_end = std::min(n_block_tokens, i_draft_beg + n_read);
+            for (int32_t i = i_draft_beg; i < i_draft_end; ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -1496,8 +1613,12 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 };
 
 // DFlash2: walks the lattice of the selector over the top-k candidates of the block
+// DFlash2, and DSpine (whose refined last write is packed as the same candidate lattice)
 struct common_speculative_impl_draft_dflash2 final : public common_speculative_impl_draft_dflash {
     int32_t selector_top_k = 0;
+
+    // DSpine: samples under the request's top-k / top-p / min-p (dspine_filter)
+    bool is_dspine = false;
 
     // probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
     std::vector<std::mt19937> dflash2_rng;
@@ -1506,9 +1627,26 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
     common_speculative_impl_draft_dflash2(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2)
     {
-        selector_top_k = llama_model_dflash_selector_top_k(llama_get_model(this->params.ctx_dft));
+        const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
+        const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
+
+        selector_top_k = llama_model_dflash_selector_top_k(model_dft);
+        is_dspine      = llama_model_dflash_variant(model_dft) == LLAMA_DFLASH_VARIANT_DSPINE;
+        if (is_dspine) {
+            if (!causal_attn) {
+                throw std::runtime_error("DSpine draft requires causal block attention (dflash.attention.causal)");
+            }
+            // the lattice candidates are target-head rows and index the draft's codebook (one row per token)
+            if (llama_vocab_n_tokens(llama_model_get_vocab(model_dft)) < llama_vocab_n_tokens(llama_model_get_vocab(model_tgt))) {
+                throw std::runtime_error("DSpine draft vocabulary is smaller than the target's");
+            }
+        }
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
+
+        // the lattice ranks the full vocabulary every draft step: rank with a Q2_K copy of the target head
+        // and rescore the best candidates with the original weights
+        llama_model_dflash_build_approx_head(const_cast<llama_model *>(model_dft), model_tgt);
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits
         init({
@@ -1627,6 +1765,12 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                         sorted_idx[k] = k;
                     }
                     std::sort(sorted_idx.begin(), sorted_idx.end(), [row](int32_t a, int32_t b) { return row[a] < row[b]; });
+
+                    if (is_dspine) {
+                        // DSpine samples under the request's filters (dspine_mlx serial_sample_chain / filter_probs):
+                        // joint top-k / top-p on the candidates in id order, then min-p, renormalized
+                        dspine_filter(probs, sorted_idx, dp.top_k, dp.top_p, dp.min_p);
+                    }
 
                     // a round-off overshoot keeps the argmax, which has q > 0
                     double u = std::uniform_real_distribution<double>(0.0, 1.0)(dflash2_rng[seq_id]);
@@ -2771,9 +2915,7 @@ static common_ngram_map get_common_ngram_map(
 static std::unique_ptr<common_speculative_impl_ngram_cache> create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq) {
-    uint16_t n_draft = 8; // TODO get from config?
-
-    return std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, n_draft);
+    return std::make_unique<common_speculative_impl_ngram_cache>(config.params, n_seq, common_params_speculative_ngram_cache::n_draft);
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -2939,6 +3081,41 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     }
 
     return n_max;
+}
+
+bool common_speculative_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int32_t common_speculative_n_max_of(const common_speculative * spec, bool ngram) {
+    int32_t n_max = 0;
+
+    if (spec == nullptr) {
+        return n_max;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (common_speculative_type_is_ngram(impl->type) == ngram) {
+            n_max = std::max(n_max, std::max(0, impl->n_max));
+        }
+    }
+
+    return n_max;
+}
+
+common_speculative_type common_speculative_last_type(const common_speculative * spec, llama_seq_id seq_id) {
+    const common_speculative_impl * impl = spec ? spec->impl_last[seq_id] : nullptr;
+
+    return impl ? impl->type : COMMON_SPECULATIVE_TYPE_NONE;
 }
 
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {
@@ -3253,6 +3430,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     case LLAMA_DFLASH_VARIANT_DFLASH2:  type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2;  break;
                     case LLAMA_DFLASH_VARIANT_DSPARK:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;   break;
                     case LLAMA_DFLASH_VARIANT_LILICORR: type_model = COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR; break;
+                    // DSpine is walked by the DFlash2 driver: its lattice has the same layout
+                    case LLAMA_DFLASH_VARIANT_DSPINE:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2;  break;
                     case LLAMA_DFLASH_VARIANT_NONE:     break;
                 }
                 if (type_model == COMMON_SPECULATIVE_TYPE_NONE) {
@@ -3429,6 +3608,16 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     return result;
 }
 
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, pos_end);
+    }
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3452,7 +3641,25 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // the limits of the calls: n_max, and n_max_ngram for the n-gram drafters; a limit of 0 skips the drafter
+    std::vector<int32_t> n_max_call(dparams.size());
+    for (size_t s = 0; s < dparams.size(); ++s) {
+        n_max_call[s] = dparams[s].n_max;
+    }
+
     for (auto & impl : spec->impls) {
+        const bool ngram = common_speculative_type_is_ngram(impl->type);
+
+        std::vector<bool> skipped(dparams.size(), false);
+        for (size_t s = 0; s < dparams.size(); ++s) {
+            auto & dp = dparams[s];
+            dp.n_max = ngram && dp.n_max_ngram >= 0 ? dp.n_max_ngram : n_max_call[s];
+            if (dp.drafting && dp.n_max == 0) {
+                dp.drafting = false;
+                skipped[s]  = true;
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3463,6 +3670,12 @@ void common_speculative_draft(common_speculative * spec) {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
+
+            if (skipped[seq_id]) {
+                dp.drafting = true;
+                n_drafting++;
+                continue;
+            }
 
             if (!dp.drafting) {
                 continue;
@@ -3507,6 +3720,10 @@ void common_speculative_draft(common_speculative * spec) {
         if (n_drafting == 0) {
             break;
         }
+    }
+
+    for (size_t s = 0; s < dparams.size(); ++s) {
+        dparams[s].n_max = n_max_call[s];
     }
 
     // these sequences failed to generate a draft

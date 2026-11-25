@@ -1,0 +1,372 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Flash attention for few query rows on a long context (decode and speculative verification), RDNA4 wave32 WMMA,
+// q8_0 K/V, head size D = 128 or 256, one KV split per workgroup (combined by flash_attn_pf_rdna4_reduce.comp).
+//
+// The rows are the (position, query head) pairs of one KV head, packed into 16-wide tiles (row r: position r / G,
+// head r % G). A workgroup has NG groups of DS = D / 64 waves; group g takes NRT tiles (a workgroup NG * NRT, the
+// x % n_rg-th of them), and wave w of a group owns head dimensions [64 w, 64 w + 64) of its tiles: its part of
+// S^T = K Q^T, which the group's waves sum through LDS (each sums a quarter of every lane's values and all read the
+// sums), and O^T = V^T P^T for its dimensions. K and V are read from memory straight into the WMMA operands and
+// dequantized in registers; with two groups each dequantizes the V of half the keys and they swap the halves
+// through LDS (the V operand is the larger: three dwords per key and lane, K one and a half). Two barriers per 16 keys.
+//
+// Layouts (RDNA4, 16x16x16): A element e of lane l is row l % 16, column (l / 16) * 8 + e; B and the accumulator,
+// row (l / 16) * 8 + e, column l % 16. So S^T converts element-wise into the B operand P^T, and every element of a
+// lane belongs to row l % 16, which keeps the online softmax lane-local.
+//   K tile t (A, keys x d): lane = key, 8 consecutive d: 8 int8 of one q8_0 block.
+//   V^T tile j (A, d x keys): row m of local tile j is d = 64 w + 4 m + j, so a lane reads 4 consecutive int8 (one
+//   dword) per key for its 4 tiles. O^T keeps that order: lane l, element e of tile j is d = 64 w + 4 (8 (l / 16) + e) + j.
+// The f16 K and V are d * q rounded once from the exact product, the coopmat1 path's dequantization (see dq8x2).
+
+layout (constant_id = 0) const uint NRT = 1;     // 16-row tiles
+layout (constant_id = 1) const uint D = 256;     // head size
+layout (constant_id = 2) const uint WG_SIZE = 128;
+layout (constant_id = 3) const uint NG = 1;      // row tile groups per workgroup (waves: NG groups of DS d slices)
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+const uint DS = D / 64;   // waves: d slices
+
+layout (push_constant) uniform parameter {
+    uint32_t N;
+    uint32_t KV;
+
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+
+    uint32_t neq2;
+    uint32_t neq3;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nev2;
+    uint32_t nev3;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t nb21;
+    uint32_t nb22;
+    uint32_t nb23;
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+
+    uint32_t mask_n_head_log2;
+    float m0;
+    float m1;
+
+    uint32_t gqa_ratio;
+    uint32_t split_kv;
+    uint32_t k_num;
+} p;
+
+layout (binding = 0) readonly buffer Q  {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer K  {uint data_k[];};     // q8_0 rows, dwords (rows and heads on 8 bytes)
+layout (binding = 2) readonly buffer V  {uint data_v[];};
+layout (binding = 3) readonly buffer M  {uvec4 data_m8[];};   // f16 mask, 8 per element (KV a multiple of 8)
+layout (binding = 4) writeonly buffer PO {vec4 data_po4[];};  // [batch][split][head][N][D] O, then [batch][split][head][N] (M, L)
+layout (binding = 4) writeonly buffer PL {vec2 data_pml[];};
+
+// the partial S^T of the waves, [group][wave][row tile][value pair][lane], their sums, [group][row tile][pair][lane]
+// (8-byte lane stride: no bank conflicts), and with two groups their halves of the V operands, [parity][wave][2][lane]
+shared vec2  Sx[NG * DS * NRT * 4 * 32];
+shared vec2  Sr[NG * NRT * 4 * 32];
+shared uvec4 Vx[NG == 2 ? 2 * 2 * DS * 2 * 32 : 1];
+
+const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+const float LOG2E = 1.4426950408889634f;
+const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f*LOG2E;
+
+// q8_0 -> f16, two values at a time in packed f16 math. With the int8 q biased to q + 128 (x ^ 0x80), the byte under
+// the high byte 0x64 is the f16 1024 + q + 128 (exact); minus 1152 it is q, and times d the product d q rounded once to
+// f16 -- the f32 product d q is exact, so the value the coopmat1 path's f32 multiply and f16 conversion give.
+// pair: biased bytes in bits 0-7 and 16-23
+f16vec2 dq8x2(const uint pair, const f16vec2 d2) {
+    return (unpackFloat2x16(pair | 0x64006400u) - f16vec2(float16_t(1152.0))) * d2;
+}
+
+void main() {
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint w     = gl_SubgroupID % DS;      // d slice [64 w, 64 w + 64)
+    const uint g     = gl_SubgroupID / DS;      // row tile group
+    const uint c     = lane % 16;               // column of B / accumulator, row of A
+    const uint h     = lane / 16;
+    const uint G     = p.gqa_ratio;
+
+    // the row groups of a KV split are neighbours in x, so they run together and the later ones read K/V from the cache
+    const uint n_rg   = (p.N * G + 16 * NRT * NG - 1) / (16 * NRT * NG);
+    const uint isplit = gl_WorkGroupID.x / n_rg;
+    const uint ik2    = gl_WorkGroupID.y;
+    const uint iq3    = gl_WorkGroupID.z;
+    const uint r0     = ((gl_WorkGroupID.x % n_rg) * NG + g) * NRT * 16;   // first row of this group
+    const uint ik3    = iq3 / (p.neq3 / p.nek3);
+    const uint iv3    = iq3 / (p.neq3 / p.nev3);
+
+    const uint k_begin = isplit * p.split_kv;
+    const uint k_end   = min(p.KV, k_begin + p.split_kv);
+
+    // ---- Q^T (B): element e of lane l = Q[pos][head][64 w + 16 t + 8 h + e] * scale, rows past N zero ---------
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qb[NRT][4];
+    uint  row_pos[NRT];
+    bool  row_ok[NRT];
+    [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+        const uint r = r0 + rt * 16 + c;
+        row_pos[rt] = r / G;
+        row_ok[rt]  = row_pos[rt] < p.N;
+        const uint iq2 = ik2 * G + r % G;
+        const uint q_base4 = (iq2 * p.nb02 + iq3 * p.nb03) / 16 + row_pos[rt] * (p.nb01 / 4);
+        [[unroll]] for (uint t = 0; t < 4; ++t) {
+            vec4 a = vec4(0), b = vec4(0);
+            if (row_ok[rt]) {
+                a = data_qv4[q_base4 + (64 * w + 16 * t + 8 * h) / 4] * p.scale;
+                b = data_qv4[q_base4 + (64 * w + 16 * t + 8 * h) / 4 + 1] * p.scale;
+            }
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                Qb[rt][t][e]     = float16_t(a[e]);
+                Qb[rt][t][e + 4] = float16_t(b[e]);
+            }
+        }
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oacc[NRT][4];
+    float Mf[NRT], Lf[NRT];
+    [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            Oacc[rt][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+        Mf[rt] = NEG_FLT_MAX_OVER_2;
+        Lf[rt] = 0.0;   // this lane's 8 keys of each step; combined with lane ^ 16 at the end
+    }
+    const uint keep_bits = floatBitsToUint(p.max_bias);   // 0: a runtime zero
+
+    // ---- addresses, in dwords; the d slice is q8_0 blocks 2 w (even, at a dword) and 2 w + 1 -------------------
+    const uint k_base = (ik2 * p.nb12 + ik3 * p.nb13) / 4;
+    const uint v_base = (ik2 * p.nb22 + iv3 * p.nb23) / 4;
+    const uint k_row  = p.nb11 / 4;
+    const uint v_row  = p.nb21 / 4;
+    const uint blk0   = 17 * w;   // dword of block 2 w: its scale in the low half, then the int8 from byte 2
+    // K, lane (key c, half h): block 2 w bytes [2 + 8 h, 10 + 8 h) and [18 + 8 h, 26 + 8 h), from dwords
+    // 2 h .. 2 h + 2 and 4 + 2 h .. 6 + 2 h; block 2 w + 1 (scale in the high half of dword 8, int8 from dword 9)
+    // bytes [2 + 8 h, 10 + 8 h) and [18 + 8 h, 26 + 8 h), dwords 9 + 2 h, 10 + 2 h, 13 + 2 h, 14 + 2 h
+    // V, lane (row m = c, keys 8 h .. 8 h + 7): int8 4 (m % 8) .. 4 (m % 8) + 3 of block 2 w + m / 8
+    const bool v_odd = c >= 8;
+    const uint v_w0  = blk0 + (v_odd ? 9 + (c - 8) : c);   // the dword with the first int8 (and the next one if even)
+    const uint v_ws  = blk0 + (v_odd ? 8 : 0);             // the scale's dword
+    const uint m_base8 = ((iq3 % p.nem3) * p.nem1 * p.KV) / 8;
+
+    // the V keys of this wave: keys 8 h + e for e in [ve0, ve0 + VE)
+    const uint VE  = 8 / NG;
+    const uint ve0 = g * VE;
+
+    uint par = 0;
+    [[dont_unroll]]
+    for (uint k0 = k_begin; k0 < k_end; k0 += 16) {
+        // ---- loads: K of this wave's d slice; V of its keys --------------------------------------------------------
+        uint kw[12], vx0[VE], vx1[VE], vs[VE];
+        {
+            const uint kb = k_base + min(k0 + c, p.KV - 1) * k_row + blk0;
+            [[unroll]] for (uint i = 0; i < 7; ++i) {
+                kw[i] = data_k[kb + (i == 0 ? 0 : (i < 4 ? 2 * h + i - 1 : 2 * h + i))];
+            }
+            [[unroll]] for (uint i = 0; i < 5; ++i) {
+                kw[7 + i] = data_k[kb + (i == 0 ? 8 : (i < 3 ? 8 + 2 * h + i : 10 + 2 * h + i))];
+            }
+            [[unroll]] for (uint e = 0; e < VE; ++e) {
+                const uint vb = v_base + min(k0 + 8 * h + ve0 + e, p.KV - 1) * v_row;
+                vx0[e] = data_v[vb + v_w0];
+                vx1[e] = data_v[vb + v_w0 + (v_odd ? 0 : 1)];
+                vs[e]  = data_v[vb + v_ws];
+            }
+        }
+
+        // ---- K -> A operands, partial S^T over this wave's d ----------------------------------------------
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Sp[NRT];
+        {
+            const f16vec2 kd0 = unpackFloat2x16((kw[0] & 0xFFFFu) * 0x10001u);   // the scales, in both halves
+            const f16vec2 kd1 = unpackFloat2x16((kw[7] >> 16) * 0x10001u);
+            [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+                Sp[rt] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            }
+            [[unroll]] for (uint t = 0; t < 4; ++t) {
+                uint q0, q1;
+                f16vec2 d;
+                if (t < 2) {
+                    const uint o = t == 0 ? 1 : 4;   // kw index of the first of the three dwords
+                    q0 = (kw[o] >> 16) | (kw[o + 1] << 16);
+                    q1 = (kw[o + 1] >> 16) | (kw[o + 2] << 16);
+                    d = kd0;
+                } else {
+                    const uint o = t == 2 ? 8 : 10;
+                    q0 = kw[o];
+                    q1 = kw[o + 1];
+                    d = kd1;
+                }
+                q0 ^= 0x80808080u;
+                q1 ^= 0x80808080u;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Ka;
+                [[unroll]] for (uint e = 0; e < 8; e += 2) {
+                    const uint q  = e < 4 ? q0 : q1;
+                    const uint sh = 8 * (e % 4);
+                    const f16vec2 v = dq8x2(((q >> sh) & 0xFFu) | (((q >> (sh + 8)) & 0xFFu) << 16), d);
+                    Ka[e]     = v.x;
+                    Ka[e + 1] = v.y;
+                }
+                [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+                    Sp[rt] = coopMatMulAdd(Ka, Qb[rt][t], Sp[rt]);
+                }
+            }
+        }
+
+        // ---- V -> the halves of the A operands of this wave's keys: vh[j][i] = (e, e + 1) = (ve0 + 2 i, + 1) ----------
+        uint vh[4][VE / 2];
+        {
+            uint vq[VE];
+            [[unroll]] for (uint e = 0; e < VE; ++e) {
+                vq[e] = (v_odd ? vx0[e] : (vx0[e] >> 16) | (vx1[e] << 16)) ^ 0x80808080u;
+            }
+            [[unroll]] for (uint i = 0; i < VE / 2; ++i) {
+                const uint s0 = v_odd ? vs[2 * i] >> 16 : vs[2 * i] & 0xFFFFu;
+                const uint s1 = v_odd ? vs[2 * i + 1] >> 16 : vs[2 * i + 1] & 0xFFFFu;
+                const f16vec2 d2 = unpackFloat2x16(s0 | (s1 << 16));
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    vh[j][i] = packFloat2x16(dq8x2(((vq[2 * i] >> (8 * j)) & 0xFFu) | (((vq[2 * i + 1] >> (8 * j)) & 0xFFu) << 16), d2));
+                }
+            }
+        }
+        if (NG == 2) {
+            // this wave's halves to the wave of the other group with the same d slice (read after the next barrier)
+            const uint o = ((par * NG + g) * DS + w) * 2 * 32 + lane;
+            Vx[o]      = uvec4(vh[0][0], vh[0][1], vh[1][0], vh[1][1]);
+            Vx[o + 32] = uvec4(vh[2][0], vh[2][1], vh[3][0], vh[3][1]);
+        }
+
+        // ---- S^T = sum of the group's partials: wave w sums pairs [4 w / DS, 4 (w + 1) / DS) of every lane's 8 values
+        // (in wave order) and stores them, then every wave of the group reads the sums. Single buffers: the next step
+        // writes Sx after this step's second barrier and Sr after its own first one, both after every wave's last read
+        // of them here; Vx is double-buffered (read after the second barrier).
+        [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                Sx[(((g * DS + w) * NRT + rt) * 4 + q) * 32 + lane] = vec2(Sp[rt][2 * q], Sp[rt][2 * q + 1]);
+            }
+        }
+        barrier();
+        [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+            [[unroll]] for (uint qq = 0; qq < 4 / DS; ++qq) {
+                const uint q = w * (4 / DS) + qq;
+                vec2 sum = Sx[(((g * DS + 0) * NRT + rt) * 4 + q) * 32 + lane];
+                [[unroll]] for (uint ws = 1; ws < DS; ++ws) {
+                    sum += Sx[(((g * DS + ws) * NRT + rt) * 4 + q) * 32 + lane];
+                }
+                Sr[((g * NRT + rt) * 4 + q) * 32 + lane] = sum;
+            }
+        }
+        barrier();
+        float S[NRT][8];
+        [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                const vec2 v = Sr[((g * NRT + rt) * 4 + q) * 32 + lane];
+                S[rt][2 * q]     = v.x;
+                S[rt][2 * q + 1] = v.y;
+            }
+        }
+
+        // ---- mask, online softmax (lane-local per row), P^T ------------------------------------------------
+        const bool tail = k0 + 16 > p.KV;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Pb[NRT];
+        [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+            // (clamped in a partial last tile: the keys past KV are overwritten below)
+            const uvec4 m8 = row_ok[rt] ? data_m8[m_base8 + (row_pos[rt] * p.KV + min(k0 + 8 * h, p.KV - 8)) / 8] : uvec4(0);
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const vec2 m2 = unpackHalf2x16(m8[e / 2]);
+                S[rt][e] = fma(e % 2 == 0 ? m2.x : m2.y, LOG2E, S[rt][e] * LOG2E);
+            }
+            [[dont_flatten]] if (tail) {
+                [[unroll]] for (uint e = 0; e < 8; ++e) {
+                    if (k0 + 8 * h + e >= p.KV) {
+                        S[rt][e] = NEG_FLT_MAX_OVER_2;
+                    }
+                }
+            }
+            float rowmax = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                rowmax = max(rowmax, S[rt][e]);
+            }
+            rowmax = max(rowmax, subgroupShuffleXor(rowmax, 16));
+            rowmax += FATTN_KQ_MAX_OFFSET;
+            const float Mold = Mf[rt];
+            Mf[rt] = max(rowmax, Mold);
+            const float eM = exp2(Mold - Mf[rt]);
+            Lf[rt] *= eM;
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                // L sums the f16 P that multiplies V (see flash_attn_pf_rdna4.comp)
+                const float16_t ph = float16_t(exp2(S[rt][e] - Mf[rt]));
+                Lf[rt] += float(unpackFloat2x16(packFloat2x16(f16vec2(ph, float16_t(0.0))) | keep_bits).x);
+                Pb[rt][e] = ph;
+            }
+            // (only when a row max of the wave changed: in a long context it settles, and eM is exactly 1 otherwise)
+            if (subgroupAny(eM != 1.0)) {
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    Oacc[rt][j] = Oacc[rt][j] * eM;
+                }
+            }
+        }
+
+        // ---- V^T A operands (with two groups: the other half from the other group), O^T += V^T P^T ------------------
+        uint vo[4][VE / 2];   // the other group's halves: keys (8 - VE - ve0) + 2 i ... (unused with one group)
+        if (NG == 2) {
+            const uint o = ((par * NG + (1 - g)) * DS + w) * 2 * 32 + lane;
+            const uvec4 a = Vx[o], b = Vx[o + 32];
+            vo[0][0] = a.x; vo[0][1] = a.y; vo[1][0] = a.z; vo[1][1] = a.w;
+            vo[2][0] = b.x; vo[2][1] = b.y; vo[3][0] = b.z; vo[3][1] = b.w;
+        }
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Va;
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                // element pair (2 i, 2 i + 1): keys 8 h + 2 i, from this wave if 2 i is in [ve0, ve0 + VE)
+                const uint ii   = NG == 2 ? i % (VE / 2) : i;
+                const bool mine = NG == 1 || (2 * i >= ve0 && 2 * i < ve0 + VE);
+                const f16vec2 v = unpackFloat2x16(mine ? vh[j][ii] : vo[j][ii]);
+                Va[2 * i]     = v.x;
+                Va[2 * i + 1] = v.y;
+            }
+            [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+                Oacc[rt][j] = coopMatMulAdd(Va, Pb[rt], Oacc[rt][j]);
+            }
+        }
+        par ^= 1;
+    }
+
+    // ---- partials: O^T relative to M, and (M, L); an empty split leaves L == 0 ----------------------------------------
+    const uint ml_base = (p.ne3 * p.k_num * p.ne1 * p.N * D) / 2;
+    [[unroll]] for (uint rt = 0; rt < NRT; ++rt) {
+        Lf[rt] += subgroupShuffleXor(Lf[rt], 16);
+        if (row_ok[rt]) {
+            const uint iq2  = ik2 * G + (r0 + rt * 16 + c) % G;
+            const uint slot = ((iq3 * p.k_num + isplit) * p.ne1 + iq2) * p.N + row_pos[rt];
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                data_po4[slot * (D / 4) + 16 * w + 8 * h + e] = vec4(Oacc[rt][0][e], Oacc[rt][1][e], Oacc[rt][2][e], Oacc[rt][3][e]);
+            }
+            if (w == 0 && h == 0) {
+                data_pml[ml_base + slot] = vec2(Mf[rt], Lf[rt]);
+            }
+        }
+    }
+}

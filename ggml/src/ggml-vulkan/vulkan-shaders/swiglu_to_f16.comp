@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// SwiGLU (OP_MUL: the product) of two contiguous f32 tensors, written as f16 into the B staging buffer of the
+// consuming mul_mm_rdna4 / mul_mmv_rdna4 matmul, and as f32 unless nothing else reads it. Same expression as
+// swiglu.comp (mul.comp). One workgroup per row; the f16 rows are followed by a scale per row, as
+// b_to_f16_rowscale.comp writes them (a row that would overflow f16 is stored times 2^-e and gets the scale 2^e,
+// every other row the scale 1).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;       // elements per row, a multiple of 4
+    uint write_f32;
+    uint scale_off;   // first scale, in floats from the start of binding 3
+} p;
+
+layout (binding = 0) readonly buffer G {vec4 data_g[];};
+layout (binding = 1) readonly buffer U {vec4 data_u[];};
+layout (binding = 2) buffer D {vec4 data_d[];};   // read back by the f16 overflow pass
+layout (binding = 3) writeonly buffer H {f16vec4 data_h[];};
+layout (binding = 3) writeonly buffer HS {float data_hs[];};
+
+#include "f16_rowscale.glsl"
+
+shared float smax[256];
+
+#if OP_MUL
+// mul.comp's expression (mul_to_f16: the B operand of a skinny matmul on the product of two tensors)
+float op(float a, float b) {
+    return a * b;
+}
+#else
+float op(float a, float b) {
+    return a / (1.0f + exp(-a)) * b;
+}
+#endif
+
+vec4 op4(const uint i) {
+    const vec4 g = data_g[i];
+    const vec4 u = data_u[i];
+    return vec4(op(g.x, u.x), op(g.y, u.y), op(g.z, u.z), op(g.w, u.w));
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n4  = p.ncols / 4;
+    const uint b0  = row * n4;
+    // a runtime zero: OR-ing it in keeps the f32 result rounded before the f16 conversion (otherwise the
+    // compiler may fuse the last multiply and the conversion into one rounding)
+    const uvec4 z = uvec4(p.write_f32 >> 16);
+
+    float amax = 0.0;
+    for (uint i = tid; i < n4; i += 256) {
+        const vec4 r = op4(b0 + i);
+        data_h[b0 + i] = f16vec4(uintBitsToFloat(floatBitsToUint(r) | z));
+        if (p.write_f32 != 0) {
+            data_d[b0 + i] = r;
+        }
+        const vec4 a = abs(r);
+        amax = max(amax, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+    smax[tid] = amax;
+    barrier();
+    [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            smax[tid] = max(smax[tid], smax[tid + s]);
+        }
+        barrier();
+    }
+    amax = smax[0];
+
+    float scale = 1.0;
+    if (amax >= F16_OVERFLOW) {
+        const uint  e    = f16_row_exp(amax);
+        const float down = f16_row_down(e);
+        scale = f16_row_scale(e);
+        // with the f32 result stored, read it back: g or u may be the same memory (in-place)
+        for (uint i = tid; i < n4; i += 256) {
+            data_h[b0 + i] = f16vec4((p.write_f32 != 0 ? data_d[b0 + i] : op4(b0 + i)) * down);
+        }
+    }
+    if (tid == 0) {
+        data_hs[p.scale_off + row] = scale;
+    }
+}

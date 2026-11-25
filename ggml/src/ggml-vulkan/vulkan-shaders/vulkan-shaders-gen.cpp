@@ -825,7 +825,7 @@ void process_shaders() {
 
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {
+        if (is_legacy_quant(tname) || tname == "mxfp4" || tname == "nvfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
@@ -873,6 +873,7 @@ void process_shaders() {
         string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_f32" + suffix, "rms_norm.comp", merge_maps(rms_bf16_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_bf16_bf16" + suffix, "rms_norm.comp", merge_maps({{"C_TYPE", "uint16_t"}, {"DATA_C_BF16", "1"}, {"RMS_NORM_ADD_FUSION", "1"}}, rms_bf16_dict));
+        string_to_spv("rms_norm_mul_f16out_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_F16_OUT", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
@@ -958,6 +959,24 @@ void process_shaders() {
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4", "flash_attn_pf_rdna4.comp", {}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4_q8_0", "flash_attn_pf_rdna4.comp", {{"KV_Q8_0", "1"}}, true, true, false, false);
+    string_to_spv("flash_attn_pf_rdna4_reduce", "flash_attn_pf_rdna4_reduce.comp", {});
+    string_to_spv("flash_attn_dec_rdna4", "flash_attn_dec_rdna4.comp", {}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q4_k", "mul_mm_rdna4.comp", {{"DATA_A_Q4_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q5_k", "mul_mm_rdna4.comp", {{"DATA_A_Q5_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q6_k", "mul_mm_rdna4.comp", {{"DATA_A_Q6_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq4_xs", "mul_mm_rdna4.comp", {{"DATA_A_IQ4_XS", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq4_nl", "mul_mm_rdna4.comp", {{"DATA_A_IQ4_NL", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q8_0", "mul_mm_rdna4.comp", {{"DATA_A_Q8_0", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_q3_k", "mul_mm_rdna4.comp", {{"DATA_A_Q3_K", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_iq3_s", "mul_mm_rdna4.comp", {{"DATA_A_IQ3_S", "1"}}, true, true, false, false);
+    string_to_spv("mul_mm_rdna4_bf16", "mul_mm_rdna4.comp", {{"DATA_A_BF16", "1"}}, true, true, false, false);
+    for (const char * t : {"q2_k", "q4_k", "q5_k", "q6_k", "iq4_xs", "iq4_nl", "q8_0"}) {
+        std::string def = std::string("DATA_A_") + t;
+        std::transform(def.begin(), def.end(), def.begin(), ::toupper);
+        string_to_spv(std::string("mul_mmv_rdna4_") + t, "mul_mmv_rdna4.comp", {{def, "1"}}, true, true, false, false);
+    }
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
 #endif
@@ -987,6 +1006,19 @@ void process_shaders() {
     string_to_spv("concat_i8", "concat.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("concat_t_i32", "concat_t.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("mul_mm_rdna4_reduce", "mul_mm_rdna4_reduce.comp", {});
+    for (const std::string suffix : {"", "_subgroup"}) {
+        const std::string sg = suffix.empty() ? "0" : "1";
+        string_to_spv("add_rms_norm_mul_f32" + suffix, "add_rms_norm_mul.comp", {{"USE_SUBGROUP_ADD", sg}});
+        string_to_spv("add_rms_norm_mul_f16out_f32" + suffix, "add_rms_norm_mul.comp", {{"F16_OUT", "1"}, {"USE_SUBGROUP_ADD", sg}});
+        string_to_spv("rms_norm_fused_f32" + suffix, "rms_norm_fused.comp", {{"USE_SUBGROUP_ADD", sg}});
+    }
+    string_to_spv("mul_to_f16", "swiglu_to_f16.comp", {{"OP_MUL", "1"}});
+    string_to_spv("swiglu_to_f16", "swiglu_to_f16.comp", {});
+    string_to_spv("b_to_f16_rowscale", "b_to_f16_rowscale.comp", {});
+    string_to_spv("dflash_conv_f32", "dflash_conv.comp", {});
+    string_to_spv("cpy_multi_f32", "cpy_multi.comp", {});
     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
     string_to_spv("concat_transpose_i8", "concat_transpose.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_transpose_i16", "concat_transpose.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
@@ -1083,6 +1115,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
+    string_to_spv("reduce_long_f32", "reduce_long.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1324,7 +1357,7 @@ void write_output_files() {
 
     for (const std::string& btype : btypes) {
     for (const auto& tname : type_names) {
-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs") {
+        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && tname != "nvfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs") {
             continue;
         }
         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";

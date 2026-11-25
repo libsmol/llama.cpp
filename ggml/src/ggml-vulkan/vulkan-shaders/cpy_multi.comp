@@ -1,0 +1,29 @@
+#version 450
+
+// Up to 8 CPYs of equally shaped f32 regions in one dispatch, z = copy index:
+//   dst[doff[c] + i0 + ne0 * i1 + i2 * dnb1] = src[soff[c] + i0 + i1 * snb1 + i2 * snb2]
+// (a 3D strided source flattened into rows of a 2D destination, as ggml_cpy does).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ne0; uint ne1; uint ne2;
+    uint snb1; uint snb2; uint dnb1;   // strides in elements
+    uint ncopy;
+    uint soff[8]; uint doff[8];        // element offsets of each copy within the bound buffers
+} p;
+
+layout (binding = 0) readonly buffer S {float data_s[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i  = gl_GlobalInvocationID.x;   // i0 + ne0 * i1
+    const uint i2 = gl_GlobalInvocationID.y;
+    const uint c  = gl_GlobalInvocationID.z;
+    if (i >= p.ne0 * p.ne1 || i2 >= p.ne2 || c >= p.ncopy) {
+        return;
+    }
+    const uint i0 = i % p.ne0;
+    const uint i1 = i / p.ne0;
+    data_d[p.doff[c] + i + i2 * p.dnb1] = data_s[p.soff[c] + i0 + i1 * p.snb1 + i2 * p.snb2];
+}

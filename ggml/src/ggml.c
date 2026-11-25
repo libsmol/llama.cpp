@@ -1099,6 +1099,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "DFLASH_CONV",
+    "GATED_DELTA_NET_LAZY",
 
     "UNARY",
 
@@ -1120,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGMOID_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1218,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "dflash_conv(x, dynamic, base)",
+    "gated_delta_net_lazy(q, k, v, g, beta, s, f, n)",
 
     "unary(x)",
 
@@ -1237,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sigmoid_back(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6346,7 +6350,7 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -6354,7 +6358,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        int64_t               K,
+        bool                  lazy) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6384,19 +6389,61 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
-    const int64_t state_rows = K * S_v * n_seqs;
+    // lazy: the base state, then the factors (3 rows of S_v * H per slot)
+    const int64_t state_rows = lazy ? S_v * n_seqs + 3 * K * n_seqs : K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
 
-    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->op     = lazy ? GGML_OP_GATED_DELTA_NET_LAZY : GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, K, false);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_lazy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * f_in,
+        struct ggml_tensor  * replay,
+        int64_t               K) {
+    const int64_t S_v    = v->ne[0];
+    const int64_t H      = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+
+    GGML_ASSERT(K >= 1);
+    GGML_ASSERT(g->ne[0] == 1);
+    GGML_ASSERT(f_in->type == GGML_TYPE_F32 && ggml_is_contiguous(f_in));
+    GGML_ASSERT(f_in->ne[0] == 3*K*S_v*H && f_in->ne[1] == n_seqs && f_in->ne[2] == 1 && f_in->ne[3] == 1);
+    GGML_ASSERT(replay->type == GGML_TYPE_I32 && ggml_is_contiguous(replay) && ggml_nelements(replay) == n_seqs);
+
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, K, true);
+
+    result->src[6] = f_in;
+    result->src[7] = replay;
 
     return result;
 }
@@ -6629,6 +6676,44 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_dflash_conv
+
+struct ggml_tensor * ggml_dflash_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dynamic,
+        struct ggml_tensor  * base,
+        int                   side,
+        int                   n_blocks) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dynamic) && ggml_is_contiguous(base));
+    GGML_ASSERT(side == 0 || side == 1);
+
+    const int64_t C = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t K = base->ne[1];
+
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == C && base->ne[2] == 2 && base->ne[3] == 1);
+    GGML_ASSERT(dynamic->ne[1] == T && dynamic->ne[2] == 1 && dynamic->ne[3] == 1);
+    GGML_ASSERT(K > 0 && dynamic->ne[0] % (2 * K) == 0);
+    const int64_t G = dynamic->ne[0] / (2 * K);
+    GGML_ASSERT(G > 0 && C % G == 0);
+    GGML_ASSERT(n_blocks > 0 && T % n_blocks == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+
+    const int32_t params[] = { side, n_blocks };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DFLASH_CONV;
+    result->src[0] = x;
+    result->src[1] = dynamic;
+    result->src[2] = base;
 
     return result;
 }

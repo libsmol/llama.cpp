@@ -1490,7 +1490,10 @@ static void llama_sampler_top_k_backend_apply(
 
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
-    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k);
+    // a request may ask for more than there are (top_k up to INT32_MAX): keep them all, as the CPU sampler does,
+    // instead of tripping ggml_top_k's assert and taking the server down
+    const int32_t k = (int32_t) std::min<int64_t>(sctx->k, logits->ne[0]);
+    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, k);
     ggml_set_name(top_k, "top_k");
 
     if (data->candidates) {

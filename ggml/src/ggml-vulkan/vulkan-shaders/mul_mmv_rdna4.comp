@@ -1,0 +1,324 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Decode GEMM for RDNA4 (wave32 WMMA), N <= 16 columns: D[n][m] = sum_k A[m][k] * B[n][k]
+// Streams A once like a mat-vec; the WMMAs provide the reuse across columns, so the cost is flat in N.
+//
+// Each wave owns 16 rows and walks its K slice in 256-wide steps, with no cross-wave reduction. For
+// each 16-wide K chunk, lane l dequantizes the 8 weights of row l%16 at K half l/16 directly into its
+// A fragment (the RDNA4 layout); B fragments come from the caches. Each z-slice covers k_slice; with
+// several, the results go to scratch for a split-K reduce. Row n of B was stored times 1 / scale[n] if it
+// would otherwise have overflowed f16 (b_to_f16_rowscale.comp); output column n is multiplied by scale[n].
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a;   // A row stride in elements
+    uint stride_b;   // B row stride in elements (f16)
+    uint stride_d;   // D row stride in elements
+    uint k_slice;    // k per z-slice, a multiple of 256
+    uint d_slice;    // floats between the outputs of consecutive z-slices (scratch), 0 when unsplit
+    uint bs_off;     // the per-row scales of B in binding 1, in floats (b_to_f16_rowscale.comp)
+} p;
+
+layout (binding = 1) readonly buffer B {uvec4 data_b[];};
+layout (binding = 1) readonly buffer BS {float data_bs[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+layout (binding = 0) readonly buffer A  {uvec4 data_a[];};
+layout (binding = 0) readonly buffer A2 {uvec2 data_a2[];};
+#if defined(DATA_A_Q4_K)
+const uint QBYTES = 144;
+const uint QS = 16;       // qs byte offset
+#else
+const uint QBYTES = 176;
+const uint QH = 16;       // qh byte offset
+const uint QS = 48;
+#endif
+#elif defined(DATA_A_IQ4_XS)
+layout (binding = 0) readonly buffer A2 {uvec2 data_a2[];};
+const uint QBYTES = 136;  // d, scales_h, scales_l[4], qs[128]
+#elif defined(DATA_A_Q6_K)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 210;  // ql[128], qh[64], scales[16], d: only 2-byte aligned
+#elif defined(DATA_A_Q2_K)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 84;   // scales[16], qs[64], d, dmin: 4-byte aligned
+#elif defined(DATA_A_IQ4_NL)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES32 = 18; // per 32 weights: d, qs[16]; only 2-byte aligned
+#elif defined(DATA_A_Q8_0)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES32 = 34; // per 32 weights: d, qs[32]; only 2-byte aligned
+#else
+#error unsupported
+#endif
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// 6-bit scale and min of sub-block j (ggml get_scale_min_k4) from the 12 scale bytes
+void scale_min(const uvec3 sc, const uint j, out uint d, out uint m) {
+    const uint b0  = (sc[j / 4] >> (8 * (j % 4))) & 0xFF;
+    const uint b4  = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 0xFF;
+    if (j < 4) {
+        d = b0 & 63;
+        m = b4 & 63;
+    } else {
+        const uint bm4 = (sc[(j - 4) / 4] >> (8 * ((j - 4) % 4))) & 0xFF;
+        d = (b4 & 0xF) | ((bm4 >> 6) << 4);
+        m = (b4 >> 4)  | ((b0 >> 6) << 4);
+    }
+}
+#endif
+
+#if defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+// kvalues_iq4nl[n]: four packed int8 words, two selects and a sign-extending extract
+float kv_iq4nl(const uint n) {
+    const uint w = (n & 8) != 0 ? ((n & 4) != 0 ? 0x71594535u : 0x26190D01u)
+                                : ((n & 4) != 0 ? 0xF6EADDCFu : 0xBFAD9881u);
+    return float(bitfieldExtract(int(w), int((n & 3) * 8), 8));
+}
+// byte b of qs -> (kvalues[b & 15], kvalues[b >> 4])
+shared vec2 kv_lut[256];
+#endif
+
+#if defined(DATA_A_Q6_K) || defined(DATA_A_IQ4_NL) || defined(DATA_A_Q8_0)
+// 8 bytes at byte offset o (2-byte aligned) of the A buffer
+uvec2 load8(const uint o) {
+    const uint w = o / 4;
+    const uint a = data_a1[w], b = data_a1[w + 1];
+    if ((o & 2) == 0) {
+        return uvec2(a, b);
+    }
+    const uint c = data_a1[w + 2];
+    return uvec2((a >> 16) | (b << 16), (b >> 16) | (c << 16));
+}
+uint load2(const uint o) {
+    return (data_a1[o / 4] >> ((o & 2) * 8)) & 0xFFFF;
+}
+#endif
+
+const uint NWAVES = 4;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wave = gl_SubgroupID;
+    const uint r    = lane % 16;     // row within the wave's 16
+    const uint h    = lane / 16;     // k half of each 16-wide chunk
+
+#if defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+    for (uint i = gl_LocalInvocationIndex; i < 256; i += 32 * NWAVES) {
+        kv_lut[i] = vec2(kv_iq4nl(i & 15), kv_iq4nl(i >> 4));
+    }
+    barrier();
+#endif
+
+    const uint rg = gl_WorkGroupID.x * NWAVES + wave;
+    if (rg * 16 >= p.M) {
+        return;
+    }
+    const uint row  = rg * 16 + r;
+    const uint arow = min(row, p.M - 1);
+    const uint k0   = gl_WorkGroupID.z * p.k_slice;
+    const uint k1   = min(k0 + p.k_slice, p.K);
+#if defined(DATA_A_IQ4_NL) || defined(DATA_A_Q8_0)
+    const uint row_byte = arow * (p.stride_a / 32) * QBYTES32;
+#else
+    const uint nb_row = p.stride_a / 256;   // superblocks per row
+#endif
+
+    // B fragment of column r (zero past N): 8 halves at k = c * 16 + h * 8
+    const bool bcol = r < p.N;
+    const uint b_base = r * (p.stride_b / 8) + h;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2];
+    acc[0] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc[1] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    [[dont_unroll]]
+    for (uint kb = k0; kb < k1; kb += 256) {
+#if !defined(DATA_A_IQ4_NL) && !defined(DATA_A_Q8_0)
+        const uint blk = arow * nb_row + kb / 256;
+#endif
+        // B fragments first: their (cache) latency then overlaps the weight loads and dequantization
+        uvec4 bv[16];
+        [[unroll]] for (uint c = 0; c < 16; ++c) {
+            bv[c] = bcol ? data_b[b_base + (kb + c * 16) / 8] : uvec4(0);
+        }
+
+        // ---- dequantize each 16-wide chunk straight into an A fragment and multiply it --------------
+#define MMA(c, AF) { \
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf; \
+            [[unroll]] for (uint e_ = 0; e_ < 4; ++e_) { \
+                const f16vec2 b2 = unpackFloat2x16(bv[c][e_]); \
+                bf[2 * e_]     = b2.x; \
+                bf[2 * e_ + 1] = b2.y; \
+            } \
+            acc[(c) & 1] = coopMatMulAdd(AF, bf, acc[(c) & 1]); \
+        }
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+        const uvec4 hdr = data_a[blk * (QBYTES / 16)];
+        const vec2  dm  = unpackHalf2x16(hdr.x);
+        // pieces: for j (sub-block pair) and p, the 8 bytes at qs + 32 j + 16 p + 8 h
+        uvec2 qs[4][2];
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            [[unroll]] for (uint pp = 0; pp < 2; ++pp) {
+                qs[j][pp] = data_a2[(blk * QBYTES + QS + 32 * j + 16 * pp + 8 * h) / 8];
+            }
+        }
+#if defined(DATA_A_Q5_K)
+        // qh byte i (i = 16 p + 8 h + e) holds the high bit of weight i of every sub-block
+        uvec2 qh[2];
+        [[unroll]] for (uint pp = 0; pp < 2; ++pp) {
+            qh[pp] = data_a2[(blk * QBYTES + QH + 16 * pp + 8 * h) / 8];
+        }
+#endif
+        [[unroll]] for (uint sb = 0; sb < 8; ++sb) {
+            uint sci, mni;
+            scale_min(hdr.yzw, sb, sci, mni);
+            const float d1 = dm.x * float(sci);
+            const float m1 = dm.y * float(mni);
+            [[unroll]] for (uint pp = 0; pp < 2; ++pp) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+                [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                    uint v = (qs[sb / 2][pp][hw] >> (4 * (sb % 2))) & 0x0F0F0F0F;
+#if defined(DATA_A_Q5_K)
+                    v |= ((qh[pp][hw] >> sb) & 0x01010101) << 4;
+#endif
+                    [[unroll]] for (uint e = 0; e < 4; ++e) {
+                        af[hw * 4 + e] = float16_t(fma(d1, float((v >> (8 * e)) & 0xFF), -m1));
+                    }
+                }
+                MMA(sb * 2 + pp, af)
+            }
+        }
+#elif defined(DATA_A_IQ4_XS)
+        const uvec2 hdr = data_a2[blk * (QBYTES / 8)];
+        const float d   = unpackHalf2x16(hdr.x).x;
+        [[unroll]] for (uint ib = 0; ib < 8; ++ib) {
+            const uint  ls = ((hdr.y >> (4 * ib)) & 0xF) | (((hdr.x >> (16 + 2 * ib)) & 3) << 4);
+            const float dl = d * float(int(ls) - 32);
+            // bytes 8 h .. 8 h + 7 of the sub-block: low nibbles -> chunk 2 ib, high -> chunk 2 ib + 1
+            const uvec2 q = data_a2[blk * (QBYTES / 8) + 1 + 2 * ib + h];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af0, af1;
+            [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    const vec2 kv = kv_lut[(q[hw] >> (8 * e)) & 0xFF];
+                    af0[hw * 4 + e] = float16_t(dl * kv.x);
+                    af1[hw * 4 + e] = float16_t(dl * kv.y);
+                }
+            }
+            MMA(2 * ib, af0)
+            MMA(2 * ib + 1, af1)
+        }
+#elif defined(DATA_A_IQ4_NL)
+        // block i: byte j of qs holds weight j (low nibble) and weight j + 16 (high nibble);
+        // chunk 2 i takes the low nibbles of bytes 8 h .. 8 h + 7, chunk 2 i + 1 the high ones
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint  bb = row_byte + (kb / 32 + i) * QBYTES32;
+            const float d  = unpackHalf2x16(load2(bb)).x;
+            const uvec2 q  = load8(bb + 2 + 8 * h);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af0, af1;
+            [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    const vec2 kv = kv_lut[(q[hw] >> (8 * e)) & 0xFF];
+                    af0[hw * 4 + e] = float16_t(d * kv.x);
+                    af1[hw * 4 + e] = float16_t(d * kv.y);
+                }
+            }
+            MMA(2 * i, af0)
+            MMA(2 * i + 1, af1)
+        }
+#elif defined(DATA_A_Q8_0)
+        // chunk c: block c / 2, bytes 16 (c & 1) + 8 h .. + 7 of its qs
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint  bb = row_byte + (kb / 32 + i) * QBYTES32;
+            const float d  = unpackHalf2x16(load2(bb)).x;
+            [[unroll]] for (uint pp = 0; pp < 2; ++pp) {
+                const uvec2 q = load8(bb + 2 + 16 * pp + 8 * h);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+                [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                    [[unroll]] for (uint e = 0; e < 4; ++e) {
+                        af[hw * 4 + e] = float16_t(d * float(bitfieldExtract(int(q[hw]), int(8 * e), 8)));
+                    }
+                }
+                MMA(2 * i + pp, af)
+            }
+        }
+#elif defined(DATA_A_Q2_K)
+        // chunk c: n = c / 8, shift group j = (c % 8) / 2, half = c % 2; the lane's 8 weights are the
+        // bytes qs[32 n + 16 half + 8 h .. + 7] >> 2 j, scale/min byte 8 n + 2 j + half
+        const uint  bw  = blk * (QBYTES / 4);
+        const uvec4 sc4 = uvec4(data_a1[bw], data_a1[bw + 1], data_a1[bw + 2], data_a1[bw + 3]);
+        const vec2  dm  = unpackHalf2x16(data_a1[bw + 20]);
+        [[unroll]] for (uint n = 0; n < 2; ++n) {
+            [[unroll]] for (uint hf = 0; hf < 2; ++hf) {
+                const uint  qo = bw + 4 + (32 * n + 16 * hf + 8 * h) / 4;
+                const uvec2 q  = uvec2(data_a1[qo], data_a1[qo + 1]);
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    const uint  si = 8 * n + 2 * j + hf;
+                    const uint  sc = (sc4[si / 4] >> (8 * (si % 4))) & 0xFF;
+                    const float dl = dm.x * float(sc & 0xF);
+                    const float ml = dm.y * float(sc >> 4);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+                    [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                        const uint v = (q[hw] >> (2 * j)) & 0x03030303;
+                        [[unroll]] for (uint e = 0; e < 4; ++e) {
+                            af[hw * 4 + e] = float16_t(fma(dl, float((v >> (8 * e)) & 0xFF), -ml));
+                        }
+                    }
+                    MMA(n * 8 + j * 2 + hf, af)
+                }
+            }
+        }
+#elif defined(DATA_A_Q6_K)
+        const uint  bb = blk * QBYTES;
+        const float d  = unpackHalf2x16(load2(bb + 208)).x;
+        // chunk c: half n = c / 8, quarter q = (c % 8) / 2, l = 16 (c & 1) + 8 h + e
+        //   ql byte 64 n + 32 (q & 1) + l, nibble q >> 1; qh byte 32 n + l, bits 2 q; scale 8 n + 2 q + (c & 1)
+        [[unroll]] for (uint n = 0; n < 2; ++n) {
+            [[unroll]] for (uint c1 = 0; c1 < 2; ++c1) {
+                const uvec2 qh = load8(bb + 128 + 32 * n + 16 * c1 + 8 * h);
+                [[unroll]] for (uint q1 = 0; q1 < 2; ++q1) {
+                    const uvec2 ql = load8(bb + 64 * n + 32 * q1 + 16 * c1 + 8 * h);
+                    [[unroll]] for (uint q2 = 0; q2 < 2; ++q2) {
+                        const uint q = q2 * 2 + q1;
+                        const uint sw = load2(bb + 192 + ((8 * n + 2 * q + c1) & ~1u));
+                        const float dsc = d * float(bitfieldExtract(int(sw), int(((8 * n + 2 * q + c1) & 1) * 8), 8));
+                        const float m32 = -32.0 * dsc;
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+                        [[unroll]] for (uint hw = 0; hw < 2; ++hw) {
+                            const uint v = ((ql[hw] >> (4 * q2)) & 0x0F0F0F0F) | (((qh[hw] >> (2 * q)) & 0x03030303) << 4);
+                            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                                af[hw * 4 + e] = float16_t(fma(dsc, float((v >> (8 * e)) & 0xFF), m32));
+                            }
+                        }
+                        MMA(n * 8 + q * 2 + c1, af)
+                    }
+                }
+            }
+        }
+#endif
+#undef MMA
+    }
+
+    // ---- acc element e of lane l is D[n = l % 16][rg * 16 + (l / 16) * 8 + e]
+    if (bcol) {
+        const uint m0 = rg * 16 + h * 8;
+        const uint di = gl_WorkGroupID.z * p.d_slice + r * p.stride_d + m0;
+        const float sc = data_bs[p.bs_off + r];
+        [[unroll]] for (uint e = 0; e < 8; ++e) {
+            if (m0 + e < p.M) {
+                data_d[di + e] = (acc[0][e] + acc[1][e]) * sc;
+            }
+        }
+    }
+}

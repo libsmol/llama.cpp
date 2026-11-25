@@ -1,0 +1,118 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+// ADD + RMS_NORM + MUL, one workgroup per row:
+//   s = a + b,   d = s * inversesqrt(mean(s^2) + eps) * w
+// The expressions and the sum of squares are rms_norm.comp's at its block size for the row length. mode 0 writes s
+// and d in one dispatch; where d may overlap a or b, mode 1 (s only) and then mode 2 (d from s) compute the same bits
+// in two dispatches.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint a_row; uint b_row; uint s_row; uint d_row;        // row strides, in elements
+    uint a_off; uint b_off; uint s_off; uint d_off; uint w_off; // misalignment, in elements
+    float eps;
+    uint mode;
+} p;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) readonly buffer W {float data_w[];};
+layout (binding = 3) buffer S {float data_s[];};
+layout (binding = 4) buffer D {float data_d[];};   // read back by the f16 overflow pass
+
+#if F16_OUT
+// d also as the f16 B operand of the consuming mul_mmv_rdna4 in binding 5, in the layout of b_to_f16_rowscale.comp
+// for rows_alloc = the rows of this dispatch (see rms_norm.comp, RMS_NORM_F16_OUT)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout (binding = 5) writeonly buffer H {float16_t data_h[];};
+layout (binding = 5) writeonly buffer HS {float data_hs[];};
+#include "f16_rowscale.glsl"
+shared uint amax_bits;
+#endif
+
+shared float sumsh[BLOCK_SIZE];
+#include "rms_norm_sum.glsl"
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint a0 = p.a_off + row * p.a_row;
+    const uint b0 = p.b_off + row * p.b_row;
+    const uint s0 = p.s_off + row * p.s_row;
+    const uint d0 = p.d_off + row * p.d_row;
+
+#if F16_OUT
+    if (tid == 0) {
+        amax_bits = 0;   // ordered before the atomics by the barriers of the reduction
+    }
+#endif
+    float sum = 0.0f;
+    if (p.mode == 2) {
+        for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+            const float v = data_s[s0 + col];
+            sum += v * v;
+        }
+    } else {
+        for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+            const float v = data_a[a0 + col] + data_b[b0 + col];
+            data_s[s0 + col] = v;
+            sum += v * v;
+        }
+        if (p.mode == 1) {
+            return;
+        }
+    }
+
+    sum = rms_norm_sum(sum);
+
+    const float mean  = sum / float(p.ncols);
+    const float scale = inversesqrt(mean + p.eps);
+
+    // each thread re-reads only the sums it wrote
+#if F16_OUT
+    // a runtime zero (the eps is positive): keeps d rounded to f32 before the f16 conversion
+    const uint f16_zero = floatBitsToUint(p.eps) & 0x80000000u;
+    const uint h0 = row * p.ncols;
+    float amax = 0.0;
+    for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        const float dv = scale * data_s[s0 + col] * data_w[p.w_off + col];
+        data_d[d0 + col] = dv;
+        const float hv = uintBitsToFloat(floatBitsToUint(dv) | f16_zero);
+        data_h[h0 + col] = float16_t(hv);
+        amax = max(amax, abs(hv));
+    }
+    if (amax >= F16_OVERFLOW) {
+        atomicMax(amax_bits, floatBitsToUint(amax));
+    }
+    barrier();
+    const float gmax = uintBitsToFloat(amax_bits);
+    float hscale = 1.0;
+    if (gmax >= F16_OVERFLOW) {
+        const uint  e    = f16_row_exp(gmax);
+        const float down = f16_row_down(e);
+        hscale = f16_row_scale(e);
+        // the f32 results this invocation stored above: s and w may be the same memory as d (in-place)
+        for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+            data_h[h0 + col] = float16_t(data_d[d0 + col] * down);
+        }
+    }
+    if (tid == 0) {
+        data_hs[(((gl_NumWorkGroups.x * p.ncols * 2) + 15) & ~15u) / 4 + row] = hscale;
+    }
+#else
+    for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        data_d[d0 + col] = scale * data_s[s0 + col] * data_w[p.w_off + col];
+    }
+#endif
+}

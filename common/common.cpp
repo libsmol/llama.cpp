@@ -1396,6 +1396,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    // a grammar checks each backend-sampled token, a rejected one is sampled again from the raw logits
+    if (params.sampling.backend_sampling) {
+        for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+            llama_set_sampler_raw_logits(lctx, i, common_sampler_has_grammar(pimpl->samplers[i].get()));
+        }
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1745,7 +1752,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // the ubatch split keeps the last n_rs_seq + 1 tokens of a sequence together, which needs n_ubatch > n_rs_seq + 1
+    // (llama_batch_allocr); a longer draft uses a checkpoint instead
+    cparams.n_rs_seq          = std::min<uint32_t>(params.speculative.need_n_rs_seq(),
+                                                   (uint32_t) std::max(std::min(params.n_batch, params.n_ubatch), 2) - 2);
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

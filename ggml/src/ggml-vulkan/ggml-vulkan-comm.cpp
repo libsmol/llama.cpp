@@ -548,7 +548,9 @@ bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tenso
         ggml_vk_sync_buffers(ctx, c);
         if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
             c->s->buffer->buf.fillBuffer(hbuf->buffer, slot_offs, GGML_PAD(slot_size, 4), 0);
+            c->transfer_unsynced = true;
             c->s->buffer->buf.fillBuffer(tbuf->buffer, toffs, nbytes, 0);
+            c->transfer_unsynced = true;
         } else if (wire == GGML_TYPE_F32) {
             ggml_vk_buffer_copy_async(c, hbuf, slot_offs, tbuf, toffs, nbytes);
         } else {

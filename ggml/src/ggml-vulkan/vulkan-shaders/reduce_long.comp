@@ -1,0 +1,96 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// SUM / ARGMAX of a few long rows (e.g. the vocabulary): pass 1 reduces chunks of each row in parallel workgroups to
+// partials (value bits, index), pass 2 reduces the partials of each row in one workgroup. ARGMAX returns the last
+// index of the maximum, like the CPU (ggml_vec_argmax_f32), n - 1 for a row of -inf.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint MODE = 0; // 0: sum, 1: argmax
+layout (constant_id = 1) const uint PASS = 1;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) buffer T {uint data_t[];};
+layout (binding = 2) writeonly buffer D {uint data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n_cols;
+    uint row_stride;
+    uint a_offset;
+    uint d_offset;
+    uint chunk;
+    uint n_chunks;
+} p;
+
+shared float sv[256];
+shared uint  si[256];
+
+void combine(const uint tid, const uint s) {
+    if (MODE == 0) {
+        sv[tid] += sv[tid + s];
+    } else {
+        const float vb = sv[tid + s];
+        const uint  ib = si[tid + s];
+        if (vb > sv[tid] || (vb == sv[tid] && ib > si[tid])) {
+            sv[tid] = vb;
+            si[tid] = ib;
+        }
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.y;
+
+    float v   = MODE == 0 ? 0.0 : uintBitsToFloat(0xFF800000u);
+    uint  idx = 0u;
+
+    if (PASS == 1) {
+        const uint beg = gl_WorkGroupID.x * p.chunk;
+        const uint end = min(beg + p.chunk, p.n_cols);
+        const uint base = p.a_offset + row * p.row_stride;
+        // an invocation without elements keeps -inf at index 0, below every element of the chunk on a tie
+        for (uint i = beg + tid; i < end; i += 256u) {
+            const float x = data_a[base + i];
+            if (MODE == 0) {
+                v += x;
+            } else if (x >= v) {
+                v   = x;
+                idx = i;
+            }
+        }
+    } else {
+        for (uint c = tid; c < p.n_chunks; c += 256u) {
+            const uint  o  = (row * p.n_chunks + c) * 2u;
+            const float vc = uintBitsToFloat(data_t[o]);
+            const uint  ic = data_t[o + 1u];
+            if (MODE == 0) {
+                v += vc;
+            } else if (vc > v || (vc == v && ic > idx)) {
+                v   = vc;
+                idx = ic;
+            }
+        }
+    }
+
+    sv[tid] = v;
+    si[tid] = idx;
+    barrier();
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            combine(tid, s);
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        if (PASS == 1) {
+            const uint o = (row * p.n_chunks + gl_WorkGroupID.x) * 2u;
+            data_t[o]      = floatBitsToUint(sv[0]);
+            data_t[o + 1u] = si[0];
+        } else {
+            data_d[p.d_offset + row] = MODE == 0 ? floatBitsToUint(sv[0]) : si[0];
+        }
+    }
+}

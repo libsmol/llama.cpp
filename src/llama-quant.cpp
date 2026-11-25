@@ -386,6 +386,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("hc_")            == std::string::npos;
     }
 
+    // dspine: the code bridge (codebook, read/write and gate projections) stays at its trained precision,
+    // as the reference does (dspine_mlx quantize_draft keeps selected_prefix_bridge BF16): its codes and
+    // writes steer every draft row and the refinement compares them per candidate
+    if (arch == LLM_ARCH_DFLASH) {
+        quantize &= name.find("dspine") == std::string::npos;
+    }
+
     // kimi-k31: the indexer picks the top-k cells, so keep its projections accurate
     if (arch == LLM_ARCH_KIMI_K31) {
         quantize &= name.find("indexer.attn_q_b") == std::string::npos;

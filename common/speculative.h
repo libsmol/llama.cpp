@@ -79,15 +79,36 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // the target's top-k / top-p / min-p, applied by the DSpine drafter when it samples
+    int32_t top_k = 0;
+    float   top_p = 1.0f;
+    float   min_p = 0.0f;
+
+    // the limit of the n-gram drafters instead of n_max (-1: n_max)
+    int32_t n_max_ngram = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+
+// an n-gram drafter: drafts from the token history, without a model
+bool common_speculative_type_is_ngram(enum common_speculative_type type);
+
+// the longest draft of the n-gram drafters (ngram = true) or of the drafters with a model
+int32_t common_speculative_n_max_of(const common_speculative * spec, bool ngram);
+
+// the type of the implementation that made the last draft of the sequence (COMMON_SPECULATIVE_TYPE_NONE before any)
+enum common_speculative_type common_speculative_last_type(const common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+
+// the prompt about to be processed for seq_id ends at position pos_end (exclusive). A draft whose
+// layers all use a sliding window uses this to skip the prompt rows it can never attend.
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

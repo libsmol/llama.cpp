@@ -352,6 +352,8 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    bool adaptive = false; // server: per step, the draft length (up to n_max, 0: none) with the highest expected throughput
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -386,6 +388,8 @@ struct common_params_speculative_ngram_map {
 };
 
 struct common_params_speculative_ngram_cache {
+    static constexpr int32_t n_draft = 8; // draft length of the lookup cache
+
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
@@ -414,6 +418,25 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
+    // the longest draft of the enabled n-gram drafters (0 without one)
+    int32_t ngram_n_max() const {
+        int32_t n = 0;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  n = std::max<int32_t>(n, ngram_simple.size_m);  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   n = std::max<int32_t>(n, ngram_map_k.size_m);   break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n = std::max<int32_t>(n, ngram_map_k4v.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     n = std::max<int32_t>(n, ngram_mod.n_max);      break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   n = std::max<int32_t>(n, ngram_cache.n_draft);  break;
+                default: break;
+            }
+        }
+        return n;
+    }
+
+    // the recurrent snapshots of the target with a draft model: one per token of its longest draft, and with
+    // --spec-draft-adaptive (which limits the n-gram drafts to them in the server) of the n-gram drafters' too, so that a
+    // partly accepted draft rolls back without a replay
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
@@ -423,8 +446,11 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
+        if (!needs_rs_seq) {
+            return 0u;
+        }
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        return (uint32_t) (draft.adaptive ? std::max(draft.n_max, ngram_n_max()) : draft.n_max);
     }
 };
 

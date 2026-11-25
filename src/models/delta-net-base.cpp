@@ -115,6 +115,40 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    if (inp->lz_info && mctx_cur->is_lazy_state(ssm_states_all)) {
+        GGML_ASSERT(g->ne[0] == 1);
+        // lazy snapshots (llama_memory_recurrent::lazy): s is the base state; replay the kept tokens of the
+        // last ubatch from its factor set, write the new base and this ubatch's factors to the other set
+        const int64_t F = 3 * K * S_v * H_v;
+        auto const info = [&](int i) {
+            return ggml_view_1d(ctx0, inp->lz_info, n_seqs, i * n_seqs * ggml_element_size(inp->lz_info));
+        };
+        ggml_tensor * factors = ggml_view_2d(ctx0, ssm_states_all, F, ssm_states_all->ne[1], ssm_states_all->nb[1], 0);
+        ggml_tensor * f_in    = ggml_get_rows(ctx0, factors, info(1));
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_lazy(ctx0, q, k, v, g, b, s, f_in, info(3), K);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t attn_bytes = ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs);
+        ggml_tensor * base = ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), attn_bytes);
+        ggml_tensor * fac  = ggml_view_2d(ctx0, gdn_out, F, n_seqs, ggml_row_size(gdn_out->type, F),
+                                          attn_bytes + ggml_row_size(gdn_out->type, D * n_seqs));
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, base,
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], (size_t) kv_head * row_size)));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, factors, fac, info(2)));
+
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;

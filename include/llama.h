@@ -235,6 +235,7 @@ extern "C" {
         LLAMA_DFLASH_VARIANT_DFLASH2  = 1,
         LLAMA_DFLASH_VARIANT_DSPARK   = 2,
         LLAMA_DFLASH_VARIANT_LILICORR = 3,
+        LLAMA_DFLASH_VARIANT_DSPINE   = 4, // DFlash with causal blocks, a code bridge and a refined last write (lattice)
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -596,6 +597,14 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+
+    // whether layer il uses sliding-window attention
+    LLAMA_API bool    llama_model_layer_is_swa (const struct llama_model * model, int32_t il);
+
+    // DFlash2 draft: build a Q2_K copy of the target's output projection on the same device, used to
+    // rank the vocabulary before the best candidates are rescored with the original weights.
+    // Returns false if not applicable.
+    LLAMA_API bool    llama_model_dflash_build_approx_head(struct llama_model * model_dft, const struct llama_model * model_tgt);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1462,6 +1471,16 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    // [EXPERIMENTAL]
+    // also copy the raw logits of a sequence that has a backend sampler, for a CPU fallback (e.g. a grammar that
+    // rejects the backend-sampled token)
+    LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool keep);
+
+    // [EXPERIMENTAL]
+    // the raw logits of output i, also for a sequence with a backend sampler (llama_get_logits_ith gives the logits of
+    // its chain then); NULL when they were not copied (llama_set_sampler_raw_logits)
+    LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);

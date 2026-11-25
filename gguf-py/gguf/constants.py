@@ -175,6 +175,8 @@ class Keys:
         CONV_GROUP_SIZE                   = "{arch}.conv_group_size"
         SELECTOR_RANK                     = "{arch}.selector_rank"
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
+        DSPINE_HEAD_TOP_K                 = "{arch}.dspine.head_top_k"
+        DSPINE_BRIDGE_EPS                 = "{arch}.dspine.bridge_eps"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
@@ -1545,6 +1547,12 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DSPINE_CODEBOOK        = auto()  # dspine code bridge: token codes [vocab, code]
+    DSPINE_BRIDGE_GATE     = auto()  # dspine: gate of the row's own code (+ bias)
+    DSPINE_BRIDGE_PGATE    = auto()  # dspine: gate of the predecessor code
+    DSPINE_BRIDGE_PREV     = auto()  # dspine: value of the predecessor code
+    DSPINE_BRIDGE_READ     = auto()  # dspine: per-layer code read [hidden -> code]
+    DSPINE_BRIDGE_WRITE    = auto()  # dspine: per-layer feature write [rank -> hidden]
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -2599,6 +2607,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DSPINE_CODEBOOK:           "dspine.codebook",
+    MODEL_TENSOR.DSPINE_BRIDGE_GATE:        "dspine.gate",
+    MODEL_TENSOR.DSPINE_BRIDGE_PGATE:       "dspine.pred_gate",
+    MODEL_TENSOR.DSPINE_BRIDGE_PREV:        "dspine.prev",
+    MODEL_TENSOR.DSPINE_BRIDGE_READ:        "blk.{bid}.dspine_read",
+    MODEL_TENSOR.DSPINE_BRIDGE_WRITE:       "blk.{bid}.dspine_write",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -6519,6 +6533,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DSPINE_CODEBOOK,
+        MODEL_TENSOR.DSPINE_BRIDGE_GATE,
+        MODEL_TENSOR.DSPINE_BRIDGE_PGATE,
+        MODEL_TENSOR.DSPINE_BRIDGE_PREV,
+        MODEL_TENSOR.DSPINE_BRIDGE_READ,
+        MODEL_TENSOR.DSPINE_BRIDGE_WRITE,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,

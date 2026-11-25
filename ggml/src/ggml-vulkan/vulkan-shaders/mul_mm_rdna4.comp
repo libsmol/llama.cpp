@@ -1,0 +1,666 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+// Prefill GEMM for RDNA4 (wave32 WMMA): D[n][m] = sum_k A[m][k] * B[n][k]
+// A: Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS/IQ4_NL/Q8_0, dequantized to f16 (round to nearest) into LDS, or BF16, converted to
+// f16 (exact for 2^-14 <= |w| < 65520: smaller weights become f16 subnormals, BF16 weights past the f16 range are not
+// supported). B: f16. f32 accumulation.
+// Row n of B was stored times 1 / scale[n] to keep it finite as f16 (b_to_f16_rowscale.comp), and output column n
+// is multiplied by scale[n].
+//
+// Warp-specialized: 8 consumer waves run the WMMAs on 64x64 slices of the 128x256 tile, 4 producer
+// waves load and dequantize. LDS is double-buffered in 32-deep K stages, and the producers keep two
+// more stages in flight in registers.
+
+layout(local_size_x = 384, local_size_y = 1, local_size_z = 1) in;
+
+// Workgroups [0, n_full) compute whole tiles. Each later tile (the partial last wave) is split along K
+// over n_parts workgroups of k_part stages: part 0 writes D, the others write partial sums to S, which
+// mul_mm_rdna4_reduce.comp adds into D.
+layout (push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint d_aligned16; // D is 16-byte aligned (vec4 stores)
+    uint n_full;
+    uint n_parts;
+    uint k_part;
+    uint bs_off;     // the scales of B in binding 1, in floats
+} p;
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};
+layout (binding = 1) readonly buffer B {uvec4 data_b[];};
+layout (binding = 1) readonly buffer BS {float data_bs[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};  // only if d_aligned16
+layout (binding = 3) writeonly buffer S {vec4 data_s4[];};   // split-tile partial sums, [tile][part - 1][n][m]
+
+#if defined(DATA_A_Q4_K)
+const uint QBLK16 = 9;    // 144-byte blocks, in uvec4
+const uint QS_OFF = 1;    // qs starts at byte 16
+#elif defined(DATA_A_Q5_K)
+const uint QBLK16 = 11;   // 176-byte blocks
+const uint QH_OFF = 1;    // qh at byte 16
+const uint QS_OFF = 3;    // qs at byte 48
+#elif defined(DATA_A_IQ4_XS)
+layout (binding = 0) readonly buffer A2 {uvec2 data_a2[];};
+const uint QBLK8 = 17;    // 136-byte blocks, in uvec2: d, scales_h, scales_l[4], qs[128]
+#elif defined(DATA_A_Q6_K)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 210;  // ql[128], qh[64], scales[16], d: blocks are only 2-byte aligned
+#elif defined(DATA_A_Q3_K)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 110;  // hmask[32], qs[64], scales[12], d: blocks are only 2-byte aligned
+#elif defined(DATA_A_IQ3_S)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 110;  // d, qs[64], qh[8], signs[32], scales[4]: blocks are only 2-byte aligned
+#elif defined(DATA_A_IQ4_NL)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 18;   // d, qs[16]: one 32-weight block per stage, only 2-byte aligned
+const uint QWORDS = 5;    // dwords covering a block at either alignment
+#elif defined(DATA_A_Q8_0)
+layout (binding = 0) readonly buffer A1 {uint data_a1[];};
+const uint QBYTES = 34;   // d, qs[32]: one 32-weight block per stage, only 2-byte aligned
+const uint QWORDS = 9;
+#elif defined(DATA_A_BF16)
+// 32 weights per stage: 64 bytes, 4 uvec4 of data_a
+#else
+#error unsupported
+#endif
+
+const uint BM = 128;
+const uint BN = 256;
+const uint BK = 32;
+const uint RS = 5;         // LDS row stride in uvec4 (32 halves + 8 padding)
+const uint NCONS = 8;      // consumer waves
+
+shared uvec4 Ash[2 * BM * RS];
+shared uvec4 Bsh[2 * BN * RS];
+
+// 6-bit scale and min of sub-block j (ggml get_scale_min_k4) from the 12 scale bytes
+void scale_min(const uvec3 sc, const uint j, out uint d, out uint m) {
+    const uint b0  = (sc[j / 4] >> (8 * (j % 4))) & 0xFF;
+    const uint b4  = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 0xFF;
+    if (j < 4) {
+        d = b0 & 63;
+        m = b4 & 63;
+    } else {
+        const uint bm4 = (sc[(j - 4) / 4] >> (8 * ((j - 4) % 4))) & 0xFF;
+        d = (b4 & 0xF) | ((bm4 >> 6) << 4);
+        m = (b4 >> 4)  | ((b0 >> 6) << 4);
+    }
+}
+
+// the scale of output column n: 1 unless row n of B would have overflowed f16
+float b_scale(const uint n) {
+    return n < p.N ? data_bs[p.bs_off + n] : 1.0f;
+}
+// (a select, so that a column with the scale 1 is stored exactly as computed)
+vec4 b_scaled(const vec4 v, const float sc) {
+    return sc == 1.0f ? v : v * sc;
+}
+
+// two f32 weights to packed f16, rounded to nearest (packHalf2x16 may round toward zero)
+uint pk16(const vec2 v) {
+    return packFloat2x16(f16vec2(v));
+}
+
+#if defined(DATA_A_IQ3_S)
+const uint iq3s_grid_const[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+shared uint iq3s_grid[512];
+#endif
+
+#if defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+// kvalues_iq4nl[n]: four packed int8 words, two selects and a sign-extending extract
+float kv_iq4nl(const uint n) {
+    const uint w = (n & 8) != 0 ? ((n & 4) != 0 ? 0x71594535u : 0x26190D01u)
+                                : ((n & 4) != 0 ? 0xF6EADDCFu : 0xBFAD9881u);
+    return float(bitfieldExtract(int(w), int((n & 3) * 8), 8));
+}
+// byte b of qs -> (kvalues[b & 15], kvalues[b >> 4])
+shared vec2 kv_lut[256];
+#endif
+
+void main() {
+    const uint wave = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const bool consumer = wave < NCONS;
+
+    // this workgroup's tile and k stages [st0, st0 + nstages)
+    const uint w    = gl_WorkGroupID.x;
+    const bool split = w >= p.n_full;
+    const uint tile = split ? p.n_full + (w - p.n_full) / p.n_parts : w;
+    const uint part = split ? (w - p.n_full) % p.n_parts : 0;
+    const uint tiles_n = (p.N + BN - 1) / BN;
+    // tiles numbered along N first: the workgroups in flight share the rows of A and read the same few column blocks
+    // of B, which stay in L2
+    const uint m0 = (tile / tiles_n) * BM;
+    const uint n0 = (tile % tiles_n) * BN;
+    const uint st0 = part * p.k_part;
+    const uint nstages = split ? min(p.k_part, p.K / BK - st0) : p.K / BK;
+
+    // ---- producer state: thread pt owns A row pt (one 32-weight sub-block per stage) and B rows
+    //      2*pt and 2*pt+1
+    const uint pt = gl_LocalInvocationIndex - NCONS * 32;
+    const uint am = min(m0 + pt, p.M - 1);
+    const uint b_row_base = (n0 + 2 * pt) * (p.stride_b / 8);
+    const uint b_row_step = p.stride_b / 8;
+    uvec4 r_b[2][8];
+
+    #define FETCH_B(st, set) \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            r_b[set][c]     = data_b[b_row_base + (st) * BK / 8 + c]; \
+            r_b[set][4 + c] = data_b[b_row_base + b_row_step + (st) * BK / 8 + c]; \
+        }
+    #define STORE_B(set, buf) \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            Bsh[(buf) * BN * RS + (2 * pt) * RS + c]     = r_b[set][c]; \
+            Bsh[(buf) * BN * RS + (2 * pt + 1) * RS + c] = r_b[set][4 + c]; \
+        }
+    // FETCH results are unused until the next iteration, so the compiler sinks the loads past the
+    // barriers to the loop latch, serializing them with their STORE. A use under a branch that is
+    // never taken (n_parts is small) keeps them where they are issued.
+    #define PIN_B(set) uvec4 pin = r_b[set][0]; [[unroll]] for (uint i = 1; i < 8; ++i) { pin ^= r_b[set][i]; }
+    #define PIN(set) if (p.n_parts == 0xFFFFFFFFu) { PIN_B(set) PIN_A(set) Bsh[0] = pin; }
+
+    // dequantized row pt of the stage: 32 halves in outw[16] -> Ash
+    #define STORE_A(buf) \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            Ash[(buf) * BM * RS + pt * RS + c] = uvec4(outw[4 * c], outw[4 * c + 1], outw[4 * c + 2], outw[4 * c + 3]); \
+        }
+
+#if defined(DATA_A_BF16)
+    const uint a_row_base = am * (p.stride_a / 8);
+    uvec4 r_a[2][4];
+    #define PIN_A(set) [[unroll]] for (uint i = 0; i < 4; ++i) { pin ^= r_a[set][i]; }
+    #define FETCH(st, set) { \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            r_a[set][c] = data_a[a_row_base + (st) * BK / 8 + c]; \
+        } \
+        FETCH_B(st, set) \
+    }
+    // a bf16 pair is two f32 with their low 16 bits cleared, then rounded to f16
+    #define STORE(st, set, buf) { \
+        uint outw[16]; \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            [[unroll]] for (uint e = 0; e < 4; ++e) { \
+                const uint w = r_a[set][c][e]; \
+                outw[c * 4 + e] = pk16(vec2(uintBitsToFloat(w << 16), uintBitsToFloat(w & 0xFFFF0000u))); \
+            } \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    const uint a_row_base = am * (p.stride_a / 256) * QBLK16;
+    uvec4 r_hdr[2], r_qs[2][2];
+#if defined(DATA_A_Q5_K)
+    uvec4 r_qh[2][2];
+    #define FETCH_QH(set) r_qh[set][0] = data_a[blk + QH_OFF]; r_qh[set][1] = data_a[blk + QH_OFF + 1];
+    #define PIN_QH(set) ^ r_qh[set][0] ^ r_qh[set][1]
+    #define DEQ_QH(set, h, c) v |= ((r_qh[set][h][c] >> sub) & 0x01010101) << 4;
+#else
+    #define FETCH_QH(set)
+    #define PIN_QH(set)
+    #define DEQ_QH(set, h, c)
+#endif
+    #define PIN_A(set) pin ^= r_hdr[set] ^ r_qs[set][0] ^ r_qs[set][1] PIN_QH(set);
+    #define FETCH(st, set) { \
+        const uint ks  = (st) * BK; \
+        const uint blk = a_row_base + (ks / 256) * QBLK16; \
+        const uint sub = (ks % 256) / 32; \
+        r_hdr[set]   = data_a[blk]; \
+        r_qs[set][0] = data_a[blk + QS_OFF + (sub / 2) * 2]; \
+        r_qs[set][1] = data_a[blk + QS_OFF + (sub / 2) * 2 + 1]; \
+        FETCH_QH(set) \
+        FETCH_B(st, set) \
+    }
+    #define STORE(st, set, buf) { \
+        const uint sub = (((st) * BK) % 256) / 32; \
+        const vec2 dm = unpackHalf2x16(r_hdr[set].x); \
+        uint sci, mni; \
+        scale_min(r_hdr[set].yzw, sub, sci, mni); \
+        const float d1 = dm.x * float(sci); \
+        const float m1 = dm.y * float(mni); \
+        uint outw[16]; \
+        [[unroll]] for (uint h = 0; h < 2; ++h) { \
+            [[unroll]] for (uint c = 0; c < 4; ++c) { \
+                uint v = (r_qs[set][h][c] >> (4 * (sub % 2))) & 0x0F0F0F0F; \
+                DEQ_QH(set, h, c) \
+                const float w0 = fma(d1, float( v        & 0xFF), -m1); \
+                const float w1 = fma(d1, float((v >>  8) & 0xFF), -m1); \
+                const float w2 = fma(d1, float((v >> 16) & 0xFF), -m1); \
+                const float w3 = fma(d1, float( v >> 24        ), -m1); \
+                outw[h * 8 + c * 2]     = pk16(vec2(w0, w1)); \
+                outw[h * 8 + c * 2 + 1] = pk16(vec2(w2, w3)); \
+            } \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_IQ4_XS)
+    const uint a_row_base = am * (p.stride_a / 256) * QBLK8;
+    uvec2 r_hdr[2], r_qs[2][2];
+    #define PIN_A(set) pin.xy ^= r_hdr[set] ^ r_qs[set][0] ^ r_qs[set][1];
+    #define FETCH(st, set) { \
+        const uint ks  = (st) * BK; \
+        const uint blk = a_row_base + (ks / 256) * QBLK8; \
+        const uint sub = (ks % 256) / 32; \
+        r_hdr[set]   = data_a2[blk]; \
+        r_qs[set][0] = data_a2[blk + 1 + sub * 2]; \
+        r_qs[set][1] = data_a2[blk + 2 + sub * 2]; \
+        FETCH_B(st, set) \
+    }
+    // sub-block of 32: byte j of qs holds weight j (low nibble) and weight j + 16 (high nibble)
+    #define STORE(st, set, buf) { \
+        const uint sub = (((st) * BK) % 256) / 32; \
+        const uint ls  = ((r_hdr[set].y >> (4 * sub)) & 0xF) | (((r_hdr[set].x >> (16 + 2 * sub)) & 3) << 4); \
+        const float dl = unpackHalf2x16(r_hdr[set].x).x * float(int(ls) - 32); \
+        const uint q[4] = { r_qs[set][0].x, r_qs[set][0].y, r_qs[set][1].x, r_qs[set][1].y }; \
+        uint outw[16]; \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            const vec2 k0 = kv_lut[ q[c]        & 0xFF] * dl; \
+            const vec2 k1 = kv_lut[(q[c] >>  8) & 0xFF] * dl; \
+            const vec2 k2 = kv_lut[(q[c] >> 16) & 0xFF] * dl; \
+            const vec2 k3 = kv_lut[ q[c] >> 24        ] * dl; \
+            outw[c * 2]         = pk16(vec2(k0.x, k1.x)); \
+            outw[c * 2 + 1]     = pk16(vec2(k2.x, k3.x)); \
+            outw[8 + c * 2]     = pk16(vec2(k0.y, k1.y)); \
+            outw[8 + c * 2 + 1] = pk16(vec2(k2.y, k3.y)); \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_Q6_K)
+    const uint a_row_byte = am * (p.stride_a / 256) * QBYTES;
+    // raw dwords around the 2-byte aligned fields; shifted into place when storing
+    uint r_ql[2][9], r_qh[2][9], r_sc[2], r_d[2], r_base[2];
+    #define PIN_A(set) [[unroll]] for (uint i = 0; i < 9; ++i) { pin.x ^= r_ql[set][i] ^ r_qh[set][i]; } pin.y ^= r_sc[set] ^ r_d[set];
+    #define FETCH(st, set) { \
+        const uint ks  = (st) * BK; \
+        const uint bb  = a_row_byte + (ks / 256) * QBYTES; \
+        const uint sub = (ks % 256) / 32; \
+        const uint ql0 = (bb + 64 * (sub / 4) + 32 * (sub % 2)) / 4; \
+        const uint qh0 = (bb + 128 + 32 * (sub / 4)) / 4; \
+        [[unroll]] for (uint i = 0; i < 9; ++i) { \
+            r_ql[set][i] = data_a1[ql0 + i]; \
+            r_qh[set][i] = data_a1[qh0 + i]; \
+        } \
+        r_sc[set]   = data_a1[(bb + 192 + 8 * (sub / 4) + 2 * (sub % 4)) / 4]; \
+        r_d[set]    = data_a1[(bb + 208) / 4]; \
+        r_base[set] = bb; \
+        FETCH_B(st, set) \
+    }
+    // weight l of the sub-block: ((ql[l] >> 4*(sub/2 % 2)) & 15) | ((qh[l] >> 2*(sub % 4)) & 3) << 4, scale sc[2*(sub%4) + l/16]
+    #define STORE(st, set, buf) { \
+        const uint sub = (((st) * BK) % 256) / 32; \
+        const uint bb  = r_base[set]; \
+        const uint sh  = (bb & 2) * 8; \
+        const uint scw = r_sc[set] >> (((bb + 192 + 8 * (sub / 4) + 2 * (sub % 4)) & 2) * 8); \
+        const float d  = unpackHalf2x16(r_d[set] >> (((bb + 208) & 2) * 8)).x; \
+        const float ds0 = d * float(bitfieldExtract(int(scw), 0, 8)); \
+        const float ds1 = d * float(bitfieldExtract(int(scw), 8, 8)); \
+        uint outw[16]; \
+        [[unroll]] for (uint i = 0; i < 8; ++i) { \
+            const uint ql = sh == 0 ? r_ql[set][i] : (r_ql[set][i] >> 16) | (r_ql[set][i + 1] << 16); \
+            const uint qh = sh == 0 ? r_qh[set][i] : (r_qh[set][i] >> 16) | (r_qh[set][i + 1] << 16); \
+            const uint v  = ((ql >> (4 * ((sub / 2) % 2))) & 0x0F0F0F0F) | (((qh >> (2 * (sub % 4))) & 0x03030303) << 4); \
+            const float dsc = i < 4 ? ds0 : ds1; \
+            const float m32 = -32.0 * dsc;  /* exact: fma(dsc, q, -32 dsc) == dsc * (q - 32) */ \
+            outw[2 * i]     = pk16(vec2(fma(dsc, float( v        & 0xFF), m32), fma(dsc, float((v >>  8) & 0xFF), m32))); \
+            outw[2 * i + 1] = pk16(vec2(fma(dsc, float((v >> 16) & 0xFF), m32), fma(dsc, float( v >> 24        ), m32))); \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_Q3_K)
+    // sub-block sub of 32 weights: weight e (half h = e / 16, l = e % 16) is
+    //   d * (scale[8 (sub / 4) + 2 (sub % 4) + h] - 32) * (((qs[32 (sub / 4) + 16 h + l] >> 2 (sub % 4)) & 3) - (hmask bit ? 0 : 4))
+    // with hmask bit (hmask[16 h + l] >> (sub)) & 1 (ggml dequantize_row_q3_K). The raw dwords around
+    // hmask, the half of qs and scales + d are shifted into place when storing.
+    const uint a_row_byte = am * (p.stride_a / 256) * QBYTES;
+    uint r_hm[2][9], r_q3[2][9], r_sc[2][5], r_base[2];
+    #define PIN_A(set) [[unroll]] for (uint i = 0; i < 9; ++i) { pin.x ^= r_hm[set][i] ^ r_q3[set][i]; } \
+                       [[unroll]] for (uint i = 0; i < 5; ++i) { pin.y ^= r_sc[set][i]; } pin.z ^= r_base[set];
+    #define FETCH(st, set) { \
+        const uint ks  = (st) * BK; \
+        const uint bb  = a_row_byte + (ks / 256) * QBYTES; \
+        const uint sub = (ks % 256) / 32; \
+        [[unroll]] for (uint i = 0; i < 9; ++i) { \
+            r_hm[set][i] = data_a1[bb / 4 + i]; \
+            r_q3[set][i] = data_a1[(bb + 32 + 32 * (sub / 4)) / 4 + i]; \
+        } \
+        [[unroll]] for (uint i = 0; i < 5; ++i) { \
+            r_sc[set][i] = data_a1[(bb + 96) / 4 + i]; \
+        } \
+        r_base[set] = bb; \
+        FETCH_B(st, set) \
+    }
+    // dword i of a region that starts 2 bytes into its first loaded dword when odd
+    #define AW(arr, i, odd) ((odd) ? ((arr[i] >> 16) | (arr[(i) + 1] << 16)) : arr[i])
+    #define STORE(st, set, buf) { \
+        const uint sub = (((st) * BK) % 256) / 32; \
+        const uint n = sub / 4, j = sub % 4; \
+        const bool odd = (r_base[set] & 2) != 0; \
+        const uint aux0 = AW(r_sc[set], 0, odd), aux1 = AW(r_sc[set], 1, odd), tmp = AW(r_sc[set], 2, odd); \
+        const float d = unpackHalf2x16(AW(r_sc[set], 3, odd)).x; \
+        const uint idx = 2 * n + j / 2; \
+        const uint scw = ((((idx & 1) != 0 ? aux1 : aux0) >> (4 * (idx >> 1))) & 0x0F0F0F0F) | \
+                         (((tmp >> (2 * idx)) & 0x03030303) << 4); \
+        const uint bsh = 16 * (j % 2); \
+        const float dl0 = d * float(int((scw >> bsh) & 63) - 32); \
+        const float dl1 = d * float(int((scw >> (bsh + 8)) & 63) - 32); \
+        uint outw[16]; \
+        [[unroll]] for (uint h = 0; h < 2; ++h) { \
+            const float dl = h == 0 ? dl0 : dl1; \
+            [[unroll]] for (uint c = 0; c < 4; ++c) { \
+                const uint qw = AW(r_q3[set], h * 4 + c, odd); \
+                const uint hw = AW(r_hm[set], h * 4 + c, odd); \
+                float w[4]; \
+                [[unroll]] for (uint b = 0; b < 4; ++b) { \
+                    const int q2 = int((qw >> (8 * b + 2 * j)) & 3); \
+                    const int hb = int((hw >> (8 * b + 4 * n + j)) & 1); \
+                    w[b] = dl * float(q2 - (hb != 0 ? 0 : 4)); \
+                } \
+                outw[h * 8 + c * 2]     = pk16(vec2(w[0], w[1])); \
+                outw[h * 8 + c * 2 + 1] = pk16(vec2(w[2], w[3])); \
+            } \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_IQ3_S)
+    // sub-block sb of 32 weights, weight e (l = e / 8, k = e % 8, k < 4: first grid entry):
+    //   d * (1 + 2 * (scales[sb / 2] >> 4 (sb % 2) & 15)) * byte (k % 4) of iq3s_grid[qs[8 sb + 2 l + k / 4] |
+    //   (bit 2 l + k / 4 of qh[sb]) << 8], negated if bit k of signs[4 sb + l] (ggml dequantize_row_iq3_s)
+    const uint a_row_byte = am * (p.stride_a / 256) * QBYTES;
+    // per set: d, qs (3 dwords around 8 bytes), qh, signs (2 around 4 bytes), scales; base byte
+    uint r_d[2], r_qs[2][3], r_qh[2], r_sg[2][2], r_sc[2], r_base[2];
+    #define PIN_A(set) pin.x ^= r_d[set] ^ r_qs[set][0] ^ r_qs[set][1] ^ r_qs[set][2]; \
+                       pin.y ^= r_qh[set] ^ r_sg[set][0] ^ r_sg[set][1] ^ r_sc[set]; pin.z ^= r_base[set];
+    #define FETCH(st, set) { \
+        const uint ks  = (st) * BK; \
+        const uint bb  = a_row_byte + (ks / 256) * QBYTES; \
+        const uint sb  = (ks % 256) / 32; \
+        r_d[set] = data_a1[bb / 4]; \
+        [[unroll]] for (uint i = 0; i < 3; ++i) { r_qs[set][i] = data_a1[(bb + 2 + 8 * sb) / 4 + i]; } \
+        r_qh[set] = data_a1[(bb + 66 + sb) / 4]; \
+        [[unroll]] for (uint i = 0; i < 2; ++i) { r_sg[set][i] = data_a1[(bb + 74 + 4 * sb) / 4 + i]; } \
+        r_sc[set] = data_a1[(bb + 106 + sb / 2) / 4]; \
+        r_base[set] = bb; \
+        FETCH_B(st, set) \
+    }
+    // the dword starting 0 or 2 bytes into a[i]
+    #define AL(a, i, odd) ((odd) ? ((a[i] >> 16) | (a[(i) + 1] << 16)) : a[i])
+    #define STORE(st, set, buf) { \
+        const uint sb  = (((st) * BK) % 256) / 32; \
+        const uint bb  = r_base[set]; \
+        const float d  = unpackHalf2x16(r_d[set] >> ((bb & 2) * 8)).x; \
+        const uint nib = (r_sc[set] >> (8 * ((bb + 106 + sb / 2) & 3) + 4 * (sb % 2))) & 15; \
+        const float db = d * float(1 + 2 * nib); \
+        const uint qh  = (r_qh[set] >> (8 * ((bb + 66 + sb) & 3))) & 0xFF; \
+        const bool odd = ((bb + 2) & 2) != 0;   /* qs and signs start 2 bytes off the block's alignment */ \
+        const uint qs0 = AL(r_qs[set], 0, odd), qs1 = AL(r_qs[set], 1, odd); \
+        const uint sg  = AL(r_sg[set], 0, odd); \
+        uint outw[16]; \
+        [[unroll]] for (uint l = 0; l < 4; ++l) { \
+            const uint qw = l < 2 ? qs0 : qs1; \
+            [[unroll]] for (uint h = 0; h < 2; ++h) { \
+                const uint qb = (qw >> (16 * (l % 2) + 8 * h)) & 0xFF; \
+                const uint g  = iq3s_grid[qb | (((qh >> (2 * l + h)) & 1) << 8)]; \
+                const uint sl = sg >> (8 * l + 4 * h); \
+                float w[4]; \
+                [[unroll]] for (uint k = 0; k < 4; ++k) { \
+                    const float v = db * float((g >> (8 * k)) & 0xFF); \
+                    w[k] = ((sl >> k) & 1) != 0 ? -v : v; \
+                } \
+                outw[l * 4 + h * 2]     = pk16(vec2(w[0], w[1])); \
+                outw[l * 4 + h * 2 + 1] = pk16(vec2(w[2], w[3])); \
+            } \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#elif defined(DATA_A_IQ4_NL) || defined(DATA_A_Q8_0)
+    // the block of stage st starts at byte bb, 2-byte aligned: QWORDS dwords from bb & ~3 cover it;
+    // QW(i) is the dword at bb + 4 i, QSW(j) the dword of qs[4 j .. 4 j + 3] (qs follows the f16 d)
+    const uint a_row_byte = am * (p.stride_a / 32) * QBYTES;
+    uint r_q[2][QWORDS], r_base[2];
+    #define PIN_A(set) [[unroll]] for (uint i = 0; i < QWORDS; ++i) { pin.x ^= r_q[set][i]; } pin.y ^= r_base[set];
+    #define FETCH(st, set) { \
+        const uint bb = a_row_byte + (st) * QBYTES; \
+        [[unroll]] for (uint i = 0; i < QWORDS; ++i) { \
+            r_q[set][i] = data_a1[bb / 4 + i]; \
+        } \
+        r_base[set] = bb; \
+        FETCH_B(st, set) \
+    }
+    #define QW(set, i) (((r_base[set] & 2) == 0) ? r_q[set][i] : \
+                        ((r_q[set][i] >> 16) | (r_q[set][min((i) + 1, QWORDS - 1)] << 16)))
+    #define QSW(set, j) ((QW(set, j) >> 16) | (QW(set, (j) + 1) << 16))
+#if defined(DATA_A_IQ4_NL)
+    // byte j of qs holds weight j (low nibble) and weight j + 16 (high nibble)
+    #define STORE(st, set, buf) { \
+        const float dl = unpackHalf2x16(QW(set, 0)).x; \
+        uint outw[16]; \
+        [[unroll]] for (uint c = 0; c < 4; ++c) { \
+            const uint q = QSW(set, c); \
+            const vec2 k0 = kv_lut[ q        & 0xFF] * dl; \
+            const vec2 k1 = kv_lut[(q >>  8) & 0xFF] * dl; \
+            const vec2 k2 = kv_lut[(q >> 16) & 0xFF] * dl; \
+            const vec2 k3 = kv_lut[ q >> 24        ] * dl; \
+            outw[c * 2]         = pk16(vec2(k0.x, k1.x)); \
+            outw[c * 2 + 1]     = pk16(vec2(k2.x, k3.x)); \
+            outw[8 + c * 2]     = pk16(vec2(k0.y, k1.y)); \
+            outw[8 + c * 2 + 1] = pk16(vec2(k2.y, k3.y)); \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#else
+    // weight j is the signed byte j of qs
+    #define STORE(st, set, buf) { \
+        const float d = unpackHalf2x16(QW(set, 0)).x; \
+        uint outw[16]; \
+        [[unroll]] for (uint c = 0; c < 8; ++c) { \
+            const int q = int(QSW(set, c)); \
+            outw[c * 2]     = pk16(vec2(d * float(bitfieldExtract(q, 0, 8)),  d * float(bitfieldExtract(q, 8, 8)))); \
+            outw[c * 2 + 1] = pk16(vec2(d * float(bitfieldExtract(q, 16, 8)), d * float(bitfieldExtract(q, 24, 8)))); \
+        } \
+        STORE_A(buf) \
+        STORE_B(set, buf) \
+    }
+#endif
+#endif
+
+    // ---- consumer state
+    const uint wm = wave % 2;     // 64-row slice
+    const uint wn = wave / 2;     // 64-column slice
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][4];
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+#if defined(DATA_A_IQ3_S)
+    for (uint i = gl_LocalInvocationIndex; i < 512; i += 384) {
+        iq3s_grid[i] = iq3s_grid_const[i];
+    }
+    barrier();
+#endif
+#if defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+    if (gl_LocalInvocationIndex < 256) {
+        kv_lut[gl_LocalInvocationIndex] = vec2(kv_iq4nl(gl_LocalInvocationIndex & 15), kv_iq4nl(gl_LocalInvocationIndex >> 4));
+    }
+    barrier();
+#endif
+
+    // The two roles run separate loops with the same number of barriers (the role is wave-uniform),
+    // so the producers' in-flight registers never count against the consumers' accumulators.
+    // Barrier t (t = 0 .. nstages): stage t is in LDS buffer t & 1, stage t - 1 is consumed.
+    // (barriers in wave-uniform but workgroup-divergent control flow: SPIR-V leaves them undefined, RADV/ACO emits
+    // plain s_barrier instructions, which pair up by count; this pipeline is only created for RDNA4)
+    if (consumer) {
+        barrier();
+        [[dont_unroll]]
+        for (uint s = 0; s < nstages; ++s) {
+            const uint buf = s & 1;
+            [[unroll]] for (uint kk = 0; kk < BK; kk += 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[4];
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf[4];
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    coopMatLoad(af[i], Ash, buf * BM * RS + (wm * 64 + i * 16) * RS + kk / 8, RS, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    coopMatLoad(bf[j], Bsh, buf * BN * RS + (wn * 64 + j * 16) * RS + kk / 8, RS, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    [[unroll]] for (uint j = 0; j < 4; ++j) {
+                        acc[i][j] = coopMatMulAdd(af[i], bf[j], acc[i][j]);
+                    }
+                }
+            }
+            barrier();
+        }
+    } else {
+        // two stages in flight in registers: stage t lives in set t & 1 until it is stored. Fetches
+        // past the end reload the last stage (unconditional, so the load counters stay exact).
+        const uint last = st0 + nstages - 1;
+        FETCH(st0, 0);
+        FETCH(min(st0 + 1, last), 1);
+        STORE(st0, 0, 0);
+        FETCH(min(st0 + 2, last), 0);
+        barrier();
+        [[dont_unroll]]
+        for (uint s = 0; s < nstages; s += 2) {
+            if (s + 1 < nstages) {
+                STORE(st0 + s + 1, 1, 1);
+            }
+            FETCH(min(st0 + s + 3, last), 1);
+            PIN(1)
+            barrier();
+            if (s + 1 < nstages) {
+                if (s + 2 < nstages) {
+                    STORE(st0 + s + 2, 0, 0);
+                }
+                FETCH(min(st0 + s + 4, last), 0);
+                PIN(0)
+                barrier();
+            }
+        }
+        return;
+    }
+
+    // ---- store: acc[i][j] element e of lane l is D[n0 + wn*64 + j*16 + l%16][m0 + wm*64 + i*16 + (l/16)*8 + e]
+    const uint half_ = lane / 16;
+    if (part > 0) {
+        // partial sum of a split tile: the whole tile, [n][m] within the tile
+        const uint sbase = ((tile - p.n_full) * (p.n_parts - 1) + part - 1) * (BM * BN / 4);
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            const float sc = b_scale(n0 + wn * 64 + j * 16 + lane % 16);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                const uint si = sbase + ((wn * 64 + j * 16 + lane % 16) * BM + wm * 64 + i * 16 + half_ * 8) / 4;
+                data_s4[si]     = b_scaled(vec4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]), sc);
+                data_s4[si + 1] = b_scaled(vec4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]), sc);
+            }
+        }
+        return;
+    }
+    const bool d_vec4 = p.d_aligned16 != 0 && (p.stride_d % 4) == 0;
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint n = n0 + wn * 64 + j * 16 + lane % 16;
+        if (n >= p.N) {
+            continue;
+        }
+        const float sc = b_scale(n);
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const uint m = m0 + wm * 64 + i * 16 + half_ * 8;
+            if (m + 8 <= p.M) {
+                const uint di = n * p.stride_d + m;
+                const vec4 v0 = b_scaled(vec4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]), sc);
+                const vec4 v1 = b_scaled(vec4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]), sc);
+                if (d_vec4) {
+                    data_d4[di / 4]     = v0;
+                    data_d4[di / 4 + 1] = v1;
+                } else {
+                    [[unroll]] for (uint e = 0; e < 4; ++e) {
+                        data_d[di + e]     = v0[e];
+                        data_d[di + 4 + e] = v1[e];
+                    }
+                }
+            }
+        }
+    }
+}

@@ -45,6 +45,80 @@ struct vk_mat_mat_stream_k_fixup_push_constants {
 
 static_assert(sizeof(vk_mat_mat_push_constants) <= 128);
 
+// dflash_conv.comp (GGML_OP_DFLASH_CONV)
+struct vk_op_dflash_conv_push_constants {
+    uint32_t C; uint32_t T; uint32_t K; uint32_t G; uint32_t gs; uint32_t bs; uint32_t n_taps; uint32_t side;
+    uint32_t x_off; uint32_t dyn_off; uint32_t base_off; uint32_t d_off;
+    uint32_t dyn_row; uint32_t d_row;
+};
+
+// cpy_multi.comp: up to 8 equally shaped strided f32 copies
+struct vk_op_cpy_multi_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t snb1, snb2, dnb1;
+    uint32_t ncopy;
+    uint32_t soff[8], doff[8];
+};
+
+// rms_norm_fused.comp
+struct vk_op_rms_norm_fused_push_constants {
+    uint32_t ncols;
+    uint32_t ne1, ne2;
+    uint32_t xnb1, xnb2, xnb3;
+    uint32_t x_off, w_off, c_off, d_off;
+    float eps, s, b;
+};
+
+// add_rms_norm_mul.comp
+struct vk_op_add_rms_norm_mul_push_constants {
+    uint32_t ncols;
+    uint32_t a_row; uint32_t b_row; uint32_t s_row; uint32_t d_row;
+    uint32_t a_off; uint32_t b_off; uint32_t s_off; uint32_t d_off; uint32_t w_off;
+    float eps;
+    uint32_t mode;   // 0: s and d, 1: s only, 2: d from s
+};
+
+// mul_mm_rdna4.comp: n_full whole tiles, then tiles split along K into n_parts of k_part steps
+struct vk_mm_rdna4_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t d_aligned16;
+    uint32_t n_full;
+    uint32_t n_parts;
+    uint32_t k_part;
+    uint32_t bs_off;     // the per-row scales of B (b_to_f16_rowscale.comp), in floats
+};
+
+struct vk_mm_rdna4_reduce_push_constants {
+    uint32_t M; uint32_t N; uint32_t stride_d;
+    uint32_t n_full;
+    uint32_t n_parts;
+};
+
+// mul_mmv_rdna4.comp
+struct vk_mmv_rdna4_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t k_slice;    // k per z-slice, a multiple of 256
+    uint32_t d_slice;    // floats between the outputs of consecutive z-slices (scratch), 0 when unsplit
+    uint32_t bs_off;     // the per-row scales of B, in floats
+};
+
+// b_to_f16_rowscale.comp
+struct vk_b_to_f16_rowscale_push_constants {
+    uint32_t K; uint32_t src_row; uint32_t src_off; uint32_t scale_off;
+};
+
+// swiglu_to_f16.comp
+struct vk_swiglu_to_f16_push_constants {
+    uint32_t ncols; uint32_t write_f32; uint32_t scale_off;
+};
+
+// flash_attn_pf_rdna4_reduce.comp
+struct vk_flash_attn_pf_reduce_push_constants {
+    uint32_t H; uint32_t N; uint32_t BQ; uint32_t k_num; uint32_t ne3; uint32_t D4;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -230,6 +304,15 @@ struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t d_offset;
 
     float scale;
+};
+
+struct vk_op_reduce_long_push_constants {
+    uint32_t n_cols;
+    uint32_t row_stride;
+    uint32_t a_offset;
+    uint32_t d_offset;
+    uint32_t chunk;
+    uint32_t n_chunks;
 };
 
 struct vk_op_dsv4_hc_post_push_constants {
@@ -794,7 +877,25 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // scalar scan only (gated_delta_net.comp): snapshot/state output (binding 7) at so_off, per-seq and per-slot strides
+    uint32_t so_off, so_seq, so_slot;
+    // GGML_VK_GDN_FLAG_USE_IDX: the state input is row idx[seq] (binding 8, at si_off) of si_row elements
+    uint32_t si_row, flags;
+    // lazy snapshots: factors in at fi_off (binding 11, or the cache in binding 5 with GGML_VK_GDN_FLAG_FI_ROWS: row
+    // idx[seq] of f_row elements, the index at fii_off), factors out likewise at fo_off / foi_off; replay counts at rp_off
+    uint32_t fi_off, fii_off;
+    uint32_t fo_off, foi_off;
+    uint32_t f_row;
+    uint32_t rp_off, si_off;
 };
+
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+
+#define GGML_VK_GDN_FLAG_USE_IDX   1u
+#define GGML_VK_GDN_FLAG_GATES_RAW 2u
+#define GGML_VK_GDN_FLAG_LAZY      4u
+#define GGML_VK_GDN_FLAG_FI_ROWS   8u
+#define GGML_VK_GDN_FLAG_FO_ROWS   16u
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;

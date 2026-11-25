@@ -143,6 +143,25 @@ See:
 
 - #25173
 
+### DSpine (`draft-dflash`)
+
+[DSpine](https://arxiv.org/abs/2609.36173) extends DFlash with causal block attention, a code bridge write after every
+draft layer and the serial refinement of the last write over the target head's top-k candidates. Its refinement is
+packed as a DFlash2 candidate lattice, so `draft-dflash` runs it with the DFlash2 driver. Convert with
+`--target-model-dir`; the converter refuses checkpoint options the graph does not compute:
+
+```bash
+python convert_hf_to_gguf.py <dspine-draft-dir> \
+    --target-model-dir <target-model-dir> --outtype bf16 --outfile Qwen3.8-27B-DSpine.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DSpine.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-sampling probabilistic -fa on --jinja
+```
+
+With `--spec-draft-sampling probabilistic` the draft samples each lattice row under the request's top-k / top-p / min-p
+and the target verifies by rejection sampling. The candidates are ranked by a Q2_K copy of the target head (built at
+load) and rescored with the original weights; the code bridge tensors stay at their trained precision when quantizing.
+
 ### LiliCorr (`draft-lilicorr`)
 
 [LiliCorr](https://arxiv.org/pdf/2608.20530) puts a _candidate scorer_ on the DFlash block: a small transformer over the top-k candidates
